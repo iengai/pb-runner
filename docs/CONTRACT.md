@@ -32,7 +32,7 @@ Reference: `E:\projects\pbtb-rust\deploy\passivbot-image\{Dockerfile.ecs,entrypo
 | Memory reservation | 400 MB per task | to be measured; target <= 64 MB |
 | Task-def family | `scalable-cluster-dev-passivbot` (7), `…-passivbot-v8` (8) | new families per line, selection per D7 |
 | Egress | NAT instance fixed EIP (Bybit keys are IP-whitelisted) | unchanged |
-| Write-back | none known (pbtb-rust observes ECS task state via EventBridge; balances via Bybit API from its own Lambda) | none. **Verify in P6** by grepping pbtb-rust for anything it reads that the container writes. |
+| Write-back | none known (pbtb-rust observes ECS task state via EventBridge; balances via Bybit API from its own Lambda) | none (verified 2026-09-08, PLAN P6.4: the Python entrypoint only downloads; pbtb-rust reads ECS events and the exchange, never the container's files). |
 
 ## 3. Config contract
 
