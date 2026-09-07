@@ -6,9 +6,10 @@
 //! cancel and to create exactly as `calc_orders_to_cancel_and_create` does:
 //! conversion with reduce-only trimming, open-order normalisation, exact
 //! 8-key matching, mode filters, tolerance matching (maximum-cardinality),
-//! market-distance sorting, batch limits, cancel-first barrier and the
-//! recent-execution guard.
+//! market-distance sorting, batch limits, cancel-first barrier, the
+//! recent-execution guard and (optionally) the order churn gate admission.
 
+use crate::churn::ChurnGate;
 use crate::live::PlannedOrder;
 use passivbot_rust::types::OrderType;
 use pb_exchange_bybit::{OpenOrder, PositionSide, Side};
@@ -32,6 +33,8 @@ pub struct OrderRec {
     /// Snake order type from the custom id / engine, `"unknown"` otherwise.
     pub pb_order_type: String,
     pub risk_critical: bool,
+    /// `_churn_evidence` set by `ChurnGate::evaluate` (planned creates only).
+    pub churn_evidenced: bool,
     /// Exchange id (open orders only).
     pub id: Option<String>,
     pub custom_id: Option<String>,
@@ -135,6 +138,7 @@ pub fn to_executable(
             limit: !o.market,
             pb_order_type: o.order_type.clone(),
             risk_critical: o.risk_critical,
+            churn_evidenced: false,
             id: None,
             custom_id: Some(format_custom_id(&o.order_type)),
         })
@@ -211,6 +215,7 @@ pub fn normalize_open_order(o: &OpenOrder, hedge_mode: bool) -> OrderRec {
         limit: true,
         pb_order_type: pb_order_type_from_custom_id(o.client_id.as_deref()),
         risk_critical: false,
+        churn_evidenced: false,
         id: Some(o.id.clone()),
         custom_id: o.client_id.clone(),
     }
@@ -257,6 +262,8 @@ pub struct Plan {
     pub matched_tolerance: usize,
     pub deferred_by_barrier: usize,
     pub deferred_recent: usize,
+    /// Creates deferred by the churn gate admission (SPEC 2.9).
+    pub deferred_churn: usize,
     pub deferred_capacity: usize,
 }
 
@@ -318,8 +325,13 @@ fn max_matching(cur: &[OrderRec], prev: &[OrderRec], tol: f64) -> Vec<(usize, us
         .collect()
 }
 
-/// SPEC 2.2-2.8. `modes` maps `(symbol, pside)` to the current `PB_mode`;
-/// `last_price` supplies the market price for sorting.
+/// SPEC 2.2-2.9. `modes` maps `(symbol, pside)` to the current `PB_mode`;
+/// `last_price` supplies the market price for sorting and for the churn
+/// gate's market distance. `churn` is the gate (already fed this cycle's
+/// ideal orders through `ChurnGate::evaluate`) with the cycle's monotonic
+/// time in seconds; its admission runs after the recent-execution guard and
+/// before the creation capacity, and the creates left in the plan are
+/// recorded as attempts (the executor submits `plan.creates` as-is).
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile(
     ideal: &[OrderRec],
@@ -329,6 +341,7 @@ pub fn reconcile(
     recent: &[RecentExecution],
     now_ms: u64,
     params: &ReconcileParams,
+    mut churn: Option<(&mut ChurnGate, f64)>,
 ) -> Plan {
     let mut plan = Plan::default();
     let symbols: HashSet<&str> = ideal
@@ -467,6 +480,16 @@ pub fn reconcile(
         })
     });
     plan.deferred_recent += before - to_create.len();
+    // 2.9 churn gate admission.
+    if let Some((gate, now_s)) = churn.as_mut() {
+        let market_dist = |o: &OrderRec| {
+            let m = last_price(&o.symbol);
+            (m.is_finite() && m > 0.0).then(|| order_market_diff(o.side, o.price, m))
+        };
+        let (admitted, deferred) = gate.admit(to_create, &market_dist, *now_s);
+        to_create = admitted;
+        plan.deferred_churn += deferred;
+    }
     // 2.6 create capacity: risk-critical first (stable), then truncate.
     if to_create.len() > params.max_creates_per_batch {
         let (mut rc, rest): (Vec<OrderRec>, Vec<OrderRec>) =
@@ -475,6 +498,10 @@ pub fn reconcile(
         plan.deferred_capacity += rc.len() - params.max_creates_per_batch;
         rc.truncate(params.max_creates_per_batch);
         to_create = rc;
+    }
+    // 2.9 every submitted create is an attempt, exempt ones included.
+    if let Some((gate, now_s)) = churn.as_mut() {
+        gate.record_attempts(to_create.len(), *now_s);
     }
     plan.cancels = to_cancel;
     plan.creates = to_create;
@@ -504,6 +531,7 @@ mod tests {
             limit: true,
             pb_order_type: t.into(),
             risk_critical: false,
+            churn_evidenced: false,
             id: id.map(str::to_string),
             custom_id: None,
         }
@@ -574,6 +602,7 @@ mod tests {
             &[],
             0,
             &params(),
+            None,
         );
         assert_eq!(plan.matched_exact, 1);
         assert!(plan.creates.is_empty());
@@ -631,6 +660,7 @@ mod tests {
             &[],
             0,
             &params(),
+            None,
         );
         assert_eq!(plan.matched_tolerance, 1);
         assert_eq!(plan.cancels.len(), 1); // the 1.3 close
@@ -649,6 +679,7 @@ mod tests {
             &[],
             0,
             &hedged,
+            None,
         );
         assert!(plan.creates.is_empty()); // same (symbol, pside) scope still deferred
     }
@@ -692,6 +723,7 @@ mod tests {
             &[],
             0,
             &params(),
+            None,
         );
         assert!(plan.cancels.is_empty()); // manual entry kept under tp_only (not reduce-only)
         assert_eq!(plan.creates.len(), 1);
@@ -704,6 +736,7 @@ mod tests {
             &[],
             0,
             &params(),
+            None,
         );
         assert!(plan.cancels.is_empty() && plan.creates.is_empty());
     }
@@ -731,6 +764,7 @@ mod tests {
             &[],
             0,
             &params(),
+            None,
         );
         assert_eq!(plan.creates.len(), 3);
         assert!(plan.creates[0].risk_critical);

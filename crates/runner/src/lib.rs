@@ -6,6 +6,8 @@
 
 #[cfg(feature = "engine-v8")]
 pub mod bot_params;
+#[cfg(feature = "engine-v8")]
+pub mod churn;
 pub mod config;
 #[cfg(feature = "engine-v8")]
 pub mod emas;

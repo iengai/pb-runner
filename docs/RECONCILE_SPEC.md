@@ -755,8 +755,9 @@ bot given the same engine output and the same open-orders snapshot.
 - **Order churn gate** (2.9). It only *defers* far, unstable, non-critical
   limit creates after >10 creates in 10 min. In steady state with a grid
   config it is inactive (evidence is `no_history`/`stable_tight_prefix`).
-  Add it once the port runs for hours against a live market; its state
-  machine is ~500 lines and has its own tests (`tests/test_order_churn_gate.py`).
+  Ported 2026-09-07 (`crates/runner/src/churn.rs`, wired into
+  `reconcile()`; clock per DECISIONS D13) after it turned out to be the
+  only source of plan differences on the seeded iter7 fake run.
 - **Pre-create market snapshot freshness** and the
   `limit_order_create_max_market_dist_pct` filter (3.1 step 8). Needed
   before real money (protects against stale tickers producing absurd limit

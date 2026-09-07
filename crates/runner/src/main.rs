@@ -147,7 +147,10 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
                     cancels = p.cancels.len(),
                     creates = p.creates.len(),
                     matched = p.matched_exact + p.matched_tolerance,
-                    deferred = p.deferred_by_barrier + p.deferred_recent + p.deferred_capacity,
+                    deferred = p.deferred_by_barrier
+                        + p.deferred_recent
+                        + p.deferred_churn
+                        + p.deferred_capacity,
                     warnings = cycle.output.diagnostics.warnings.len(),
                     "planned"
                 );

@@ -4,9 +4,11 @@
 //!
 //! Cross-cycle state kept here (docs/SNAPSHOT_SPEC.md section 8): the
 //! hysteresis-snapped balance, 1m/1h candle buffers, fills since warmup
-//! (trailing anchors), and the engine's previous `symbol_states`.
+//! (trailing anchors), the engine's previous `symbol_states` and the order
+//! churn gate history (docs/RECONCILE_SPEC.md 2.9).
 
 use crate::bot_params::{ConfigView, PSIDES};
+use crate::churn::{self, ChurnGate, ChurnParams};
 use crate::emas::{aggregate_1h, Candle, ONE_HOUR_MS, ONE_MIN_MS};
 use crate::reconcile::{self, OrderRec, PbMode, Plan, RecentExecution, ReconcileParams};
 use crate::snapshot::{
@@ -22,7 +24,7 @@ use pb_exchange_bybit::{
     ClosedPnl, ExchangeClient, Fill, MarketSpec, OpenOrder, Position, PositionSide, Side, Ticker,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -109,6 +111,8 @@ pub struct LiveRunner {
     warmup_1h_hours: u64,
     /// `PB_modes[(symbol, pside)]` from the previous engine output (SPEC 1.6).
     pb_modes: HashMap<(String, PositionSide), PbMode>,
+    /// Order churn gate history and create-attempt window (SPEC 2.9).
+    churn: ChurnGate,
     pub cycles: u64,
 }
 
@@ -118,6 +122,7 @@ impl LiveRunner {
             .live("balance_hysteresis_snap_pct")
             .and_then(Value::as_f64)
             .unwrap_or(0.02);
+        let churn = ChurnGate::new(ChurnParams::from_config(&cfg));
         Ok(Self {
             cfg,
             client,
@@ -130,6 +135,7 @@ impl LiveRunner {
             warmup_1m_minutes: 0,
             warmup_1h_hours: 0,
             pb_modes: HashMap::new(),
+            churn,
             cycles: 0,
         })
     }
@@ -532,18 +538,32 @@ impl LiveRunner {
                 .map_or(0.0, |p| p.size)
         };
         let last = |symbol: &str| -> f64 { tickers.get(symbol).map_or(0.0, |t| t.last) };
-        let ideal: Vec<OrderRec> = reconcile::to_executable(&planned, &pos_size, &last);
+        let mut ideal: Vec<OrderRec> = reconcile::to_executable(&planned, &pos_size, &last);
+        // Churn evidence (SPEC 2.9) on the executable ideals, before reconciliation.
+        let mono = churn::monotonic_seconds();
+        let risk_pairs = risk_active_pairs(&out, &snap.symbols);
+        self.churn.evaluate(&symbols, &mut ideal, &risk_pairs, mono);
         let open: Vec<OrderRec> = orders
             .iter()
             .map(|o| reconcile::normalize_open_order(o, hedge_mode))
             .collect();
+        let pb_modes = &self.pb_modes;
         let modes = |symbol: &str, pside: PositionSide| -> PbMode {
-            self.pb_modes
+            pb_modes
                 .get(&(symbol.to_string(), pside))
                 .copied()
                 .unwrap_or(PbMode::Normal)
         };
-        let plan = reconcile::reconcile(&ideal, &open, &modes, &last, recent, now, &params);
+        let plan = reconcile::reconcile(
+            &ideal,
+            &open,
+            &modes,
+            &last,
+            recent,
+            now,
+            &params,
+            Some((&mut self.churn, mono)),
+        );
         self.cycles += 1;
         Ok(CyclePlan {
             planned,
@@ -561,6 +581,39 @@ impl LiveRunner {
             .unwrap_or(2.0);
         Duration::from_secs_f64(s.max(0.5))
     }
+}
+
+/// `order_churn_risk_active_pairs_from_rust_output`: `(symbol, pside)` pairs
+/// with a risk-critical order or a `loss_gate_blocks` entry this cycle.
+pub fn risk_active_pairs(
+    out: &OrchestratorOutput,
+    symbols: &[String],
+) -> HashSet<(String, PositionSide)> {
+    let pside_of = |p: &passivbot_rust::orchestrator::PositionSide| match serde_json::to_value(p)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+    {
+        Some(s) if s == "long" => PositionSide::Long,
+        _ => PositionSide::Short,
+    };
+    let mut pairs = HashSet::new();
+    for o in &out.orders {
+        let critical = serde_json::to_value(o.execution_priority)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s == "risk_critical"))
+            .unwrap_or(false);
+        if critical {
+            if let Some(symbol) = symbols.get(o.symbol_idx) {
+                pairs.insert((symbol.clone(), pside_of(&o.pside)));
+            }
+        }
+    }
+    for b in &out.diagnostics.loss_gate_blocks {
+        if let Some(symbol) = symbols.get(b.symbol_idx) {
+            pairs.insert((symbol.clone(), pside_of(&b.pside)));
+        }
+    }
+    pairs
 }
 
 /// Engine order -> exchange action (side from the qty sign; closes are

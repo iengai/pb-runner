@@ -14,6 +14,15 @@
 //! diagnostics, and `reconcile()` must produce the same create set and the
 //! same cancel set as the Python bot's requests at that step.
 //!
+//! The order churn gate (SPEC 2.9) runs per step in order, fed with the
+//! runner's own admitted creates. Its clock: the Python bot's gate uses
+//! `time.monotonic()`, which the fake harness does *not* pin to scenario
+//! time, so the bot's evidence and allowance windows ran on wall-clock time
+//! (about a second per step). The recorder names every recording
+//! `<wall_clock_ms>_<hash>` at the engine call, which is the same clock; the
+//! gate is driven from that stem (`--gate-clock cycle` uses the scenario
+//! timestamp instead, e.g. for runs that pin every clock).
+//!
 //!     cargo run -p pb-runner --bin pb-plancheck -- --config tests/fixtures/configs/fake_v8/grid_v7.json \
 //!       --recordings .local/fake_v8_public/grid_v7/recordings --artifacts .local/fake_v8_public/grid_v7/artifacts/<run>
 
@@ -21,12 +30,13 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use pb_exchange_bybit::{OpenOrder, PositionSide, Side};
 use pb_runner::bot_params::ConfigView;
+use pb_runner::churn::{ChurnGate, ChurnParams};
 use pb_runner::jsonexact::parse_exact;
 use pb_runner::live::PlannedOrder;
 use pb_runner::reconcile::{self, OrderRec, PbMode, ReconcileParams};
 use pb_runner::snapshot::{MarketParams, SideState, SnapshotBuilder, SymbolState};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -41,6 +51,19 @@ struct Args {
     limit: usize,
     #[arg(long)]
     verbose: bool,
+    /// Clock for the churn gate: `wall` (recording file stem) or `cycle`
+    /// (scenario `timestamp_ms`).
+    #[arg(long, default_value = "wall")]
+    gate_clock: String,
+    /// Print the churn gate's per-step evidence reason counts and rolling
+    /// attempt count (`churn <wall_ms> rolling=<n> <reason>:<count> ...`).
+    #[arg(long)]
+    churn_trace: bool,
+}
+
+/// Wall-clock ms from a recording stem `<utc_ms>_<hash>.in.json`.
+fn stem_wall_ms(path: &std::path::Path) -> Option<u64> {
+    path.file_name()?.to_str()?.split('_').next()?.parse().ok()
 }
 
 fn num(v: &Value) -> f64 {
@@ -101,6 +124,12 @@ fn main() -> Result<()> {
             .unwrap_or(3) as usize,
     };
     let stop = PbMode::parse(builder.stop_mode());
+    let mut gate = ChurnGate::new(ChurnParams::from_config(&cfg));
+    let wall_clock = match args.gate_clock.as_str() {
+        "wall" => true,
+        "cycle" => false,
+        other => return Err(anyhow!("unknown --gate-clock {other:?} (wall|cycle)")),
+    };
 
     let calls: Vec<Value> = parse_exact(&std::fs::read_to_string(
         args.artifacts.join("remote_calls.json"),
@@ -195,6 +224,13 @@ fn main() -> Result<()> {
         let ts = rec["timestamp_ms"].as_u64().unwrap();
         apply_until(&mut book, ts, applied_ts);
         applied_ts = ts;
+        let gate_now = if wall_clock {
+            stem_wall_ms(file)
+                .with_context(|| format!("no wall-clock stem in {}", file.display()))?
+        } else {
+            ts
+        } as f64
+            / 1000.0;
 
         // State from the recording.
         let mut states: Vec<SymbolState> = Vec::new();
@@ -280,7 +316,44 @@ fn main() -> Result<()> {
         let pos =
             |s: &str, p: PositionSide| positions.get(&(s.to_string(), p)).copied().unwrap_or(0.0);
         let last = |s: &str| last_price.get(s).copied().unwrap_or(0.0);
-        let ideal: Vec<OrderRec> = reconcile::to_executable(&planned, &pos, &last);
+        let mut ideal: Vec<OrderRec> = reconcile::to_executable(&planned, &pos, &last);
+        // Churn evidence on the executable ideals (SPEC 2.9), universe = every
+        // symbol the bot tracks (all have a `symbol_states` row here).
+        let mut risk_pairs: HashSet<(String, PositionSide)> = HashSet::new();
+        for o in out["orders"].as_array().into_iter().flatten() {
+            if o["execution_priority"].as_str() == Some("risk_critical") {
+                let idx = o["symbol_idx"].as_u64().unwrap() as usize;
+                risk_pairs.insert((
+                    symbols[idx].clone(),
+                    pside_of(o["pside"].as_str().unwrap_or("long")),
+                ));
+            }
+        }
+        for b in out["diagnostics"]["loss_gate_blocks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let idx = b["symbol_idx"].as_u64().unwrap() as usize;
+            risk_pairs.insert((
+                symbols[idx].clone(),
+                pside_of(b["pside"].as_str().unwrap_or("long")),
+            ));
+        }
+        let decisions = gate.evaluate(&symbols, &mut ideal, &risk_pairs, gate_now);
+        if args.churn_trace {
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for d in &decisions {
+                *counts.entry(d.reason).or_default() += 1;
+            }
+            let reasons: Vec<String> = counts.iter().map(|(r, n)| format!("{r}:{n}")).collect();
+            println!(
+                "churn {} rolling={} {}",
+                (gate_now * 1000.0).round() as u64,
+                gate.attempt_count(gate_now),
+                reasons.join(" ")
+            );
+        }
         let open: Vec<OrderRec> = book
             .values()
             .map(|o| reconcile::normalize_open_order(o, hedge_mode))
@@ -291,7 +364,16 @@ fn main() -> Result<()> {
                 .copied()
                 .unwrap_or(PbMode::Normal)
         };
-        let plan = reconcile::reconcile(&ideal, &open, &mode_fn, &last, &[], ts, &params);
+        let plan = reconcile::reconcile(
+            &ideal,
+            &open,
+            &mode_fn,
+            &last,
+            &[],
+            ts,
+            &params,
+            Some((&mut gate, gate_now)),
+        );
 
         // Expected from the request log at this step.
         let mut exp_creates: Vec<String> = creates_at

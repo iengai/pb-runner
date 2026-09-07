@@ -261,3 +261,28 @@ applied by this repo's sessions).
 - Why not option 2 (swap the line's image wholesale): no per-bot opt-in, no
   instant rollback, and the Python and Rust runners would share a task-def
   family and memory limit although their RSS differs by an order of magnitude.
+
+## D13 (2026-09-07) Churn gate clock: caller-supplied monotonic seconds; plancheck replays the recorder's wall clock
+
+Facts: `live/order_churn_gate.py`, `prepare_order_churn_evidence` and
+`_apply_order_churn_admission` read `time.monotonic()`. `tools/fake_live_clock.py`
+pins `utc_ms` / `_utc_now_ms` but not `time.monotonic`, so in every recorded
+fake run the evidence window (10 min), the stability span (2 min), the
+sample gap limit (96 s) and the create-allowance window were wall-clock
+quantities while scenario time advanced 60 s per step (about 0.8 s of wall
+time). Evidence: `live_events.json` `monotonic_ms` deltas of ~780 ms per
+cycle, `rolling_usage=90` in iter7's `run.log` (impossible with 60 s steps
+and 3 creates per batch), and `pb-plancheck --gate-clock cycle` giving the
+pre-port 367/400 on iter7 while `--gate-clock wall` gives 400/400.
+
+Decision: `ChurnGate` takes seconds on a monotonic clock chosen by the
+caller. The live runner passes `churn::monotonic_seconds()` (an `Instant`
+since process start, the Rust equivalent of `time.monotonic()`); plancheck
+passes the recording stem `<utc_ms>_<hash>` (written by the recorder patch
+with `time.time()` at the engine call: the same clock as the bot's
+`time.monotonic()` up to a constant offset, and the only per-cycle wall
+clock in the artifacts since `live_events.json` keeps 2000 events).
+
+Consequences: parity on fake runs depends on the recorder's stem; a harness
+that pins `time.monotonic` as well would need `--gate-clock cycle`. On a
+real exchange both bots see the same clock, so nothing changes there.

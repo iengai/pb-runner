@@ -2,6 +2,38 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-07 (worktree agent) — order churn gate ported (RECONCILE_SPEC 2.9)
+
+**Changed:** `crates/runner/src/churn.rs` (`ChurnParams::from_config`,
+`ChurnGate`: evidence `evaluate`, admission `admit`, `record_attempts`,
+`monotonic_seconds`; 20 unit tests mirroring `tests/test_order_churn_gate.py`
+and the admission arithmetic). `OrderRec.churn_evidenced`; `reconcile()`
+takes `Option<(&mut ChurnGate, f64)>`: admission runs after the
+recent-execution guard and before the creation capacity, and the creates
+left in the plan are recorded as attempts (exempt ones too, as Python does
+for every submitted create; `execute.rs` submits `plan.creates` as-is).
+`LiveRunner` owns the gate, evaluates the executable ideals before
+reconciliation and derives the risk-phase pairs (`risk_active_pairs`:
+risk-critical orders + `loss_gate_blocks`). `pb-plancheck` runs the gate per
+step in order (`--gate-clock wall|cycle`, `--churn-trace`).
+
+**Verified:** `pb-plancheck` grid_v7 600/600, tm 600/600, seeded grid_v7
+400/400, tm 400/400, tm8 400/400, iter7 400/400 (was 367/400). Python's
+own `order.churn_evidence` reason counts and `order.churn_admission`
+rolling counts (the last 2000 events each run kept) equal the Rust trace
+cycle for cycle: iter7 50/50 evidence + 36/36 rolling, tm8 60/60,
+grid_v7 52/52 + 14/14. `cargo fmt`, clippy `-D warnings`,
+`cargo test --workspace`.
+
+**Fact (D13):** the fake harness does not pin `time.monotonic()`, so the
+Python gate ran on wall-clock time in every recorded run (~0.8 s per step,
+`rolling_usage=90` at the first deferral). plancheck feeds the recording
+stem's wall-clock ms as the gate clock; `--gate-clock cycle` (60 s per step)
+gives the old 367/400 on iter7.
+
+**Next action:** unchanged (P5.2 shadow run, P6); the market-distance
+filter (SPEC 4.3) is still open.
+
 ## 2026-09-07 (session 3, IN PROGRESS) — P2 recordings, P3.1 started
 
 Working notes so a fresh context can resume; finalize at session end.
@@ -92,8 +124,8 @@ gate deferred far grid entries. `jsonexact` module = exact float parser for
 recordings. P6: Dockerfile + buildspec written (unbuilt, Docker not running
 locally); pbtb-rust runtime-selection branch (D7 option 1) being written by a
 subagent in `E:\projects\pbtb-rust-pbrunner`.
-**Not done:** churn gate (RECONCILE_SPEC 2.9); live execution never exercised with a trading key (P5.3);
-churn gate / market-distance filter (SPEC 4.3); HSL modes; P5/P6. Detached recording jobs relaunched after a
+**Not done:** churn gate (RECONCILE_SPEC 2.9, ported later the same day, see the entry above); live execution never exercised with a trading key (P5.3);
+market-distance filter (SPEC 4.3); HSL modes; P5/P6. Detached recording jobs relaunched after a
 process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
 seeded grid_v7, tm, iter7, tm8).
 
