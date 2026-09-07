@@ -817,9 +817,16 @@ pub fn trailing_bundle(
     if rows.first()?[0] as u64 != first {
         return None;
     }
+    // The candle manager hands float32 candles to `update_trailing_bundle_py`.
+    let r = |x: f64| x as f32 as f64;
     let mut b = TrailingPriceBundle::default();
     for c in &rows {
-        passivbot_rust::trailing::update_trailing_bundle_with_candle(&mut b, c[2], c[3], c[4]);
+        passivbot_rust::trailing::update_trailing_bundle_with_candle(
+            &mut b,
+            r(c[2]),
+            r(c[3]),
+            r(c[4]),
+        );
     }
     Some(b)
 }

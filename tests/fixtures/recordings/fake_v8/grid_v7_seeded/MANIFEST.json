@@ -49,8 +49,8 @@
   "calls_recorded": 400,
   "unique_inputs_kept": 400,
   "duplicates_dropped": 0,
-  "harness_seconds": 458.6,
-  "recorded_utc": "2026-09-07T13:39:44Z",
+  "harness_seconds": 462.5,
+  "recorded_utc": "2026-09-07T14:05:28Z",
   "selection": {
     "source_recordings": 400,
     "transitions_available": 337,

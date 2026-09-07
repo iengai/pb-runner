@@ -493,7 +493,10 @@ fn main() -> Result<()> {
                 let size = num(&r["position"]["size"]);
                 let has_entry = incumbents.contains(&(idx, pside));
                 let anchor = anchors.get(&(symbol.clone(), pside.to_string())).copied();
-                let (trailing, avail) = match (size != 0.0, anchor) {
+                // `trailing_available == false` is fill-confirmation state the
+                // runner cannot derive from REST (SPEC 4.3): take it as input.
+                let recorded_avail = r["trailing_available"].as_bool().unwrap_or(true);
+                let (trailing, avail) = match (size != 0.0 && recorded_avail, anchor) {
                     (true, Some(a)) => match trailing_bundle(&candles, a, ts) {
                         Some(b) => (b, true),
                         None => (TrailingPriceBundle::default(), false),
