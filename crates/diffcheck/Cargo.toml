@@ -10,11 +10,12 @@ name = "diffcheck"
 path = "src/main.rs"
 
 [features]
-# Enabled in P1.2 once the rlib branch of passivbot_rust exists.
-engine = []
+# Replays recordings through the pinned engine (docs/PLAN.md P1.2).
+engine = ["dep:passivbot_rust"]
 
 [dependencies]
 pb-snapshot = { path = "../snapshot" }
+passivbot_rust = { workspace = true, optional = true }
 serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true

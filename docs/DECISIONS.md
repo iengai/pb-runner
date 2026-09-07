@@ -90,3 +90,61 @@ Options, to be decided at P6 with the user:
 2. Replace the image of an engine line wholesale once the shadow run passes.
 Option 1 is safer (per-bot opt-in, instant rollback by flipping the
 attribute). Nothing in this repo depends on the choice.
+
+## D8 (2026-09-07) Recordings are compared as JSON *text*; engine inputs are parsed from raw text; `serde_json` pinned to the wheel's version, no `float_roundtrip`
+
+- Finding (P1.2): `serde_json`'s default float parsing is best-effort, not
+  correctly rounded. Literals such as `929.9999999999999` or
+  `-1.0010000000000001` parse one ulp off (to `930.0` / `-1.001`). The first
+  diffcheck run reported 7/153 "mismatches" that were entirely this parser
+  artefact: the engine output was byte-identical to the recording.
+- Serialisation is exact: `serde_json::to_string` uses ryu (shortest
+  round-trip), so identical f64s give identical bytes when the same
+  serde_json version serialises the same struct.
+- Therefore diffcheck (a) parses the engine input with
+  `serde_json::from_str(&input_text)`, the same call `compute_ideal_orders_json`
+  makes in `python.rs`, so the engine sees bit-identical inputs, and
+  (b) compares `serde_json::to_string(&output)` with the recorded `.out.json`
+  bytes. Value-level diffs are only used to *explain* a failure.
+- Rule: pb-runner's `Cargo.lock` keeps `serde_json` at the version in the
+  pinned tag's `passivbot-rust/Cargo.lock` (1.0.151 at v8.1.0) and never
+  enables `float_roundtrip` or `arbitrary_precision` (cargo feature
+  unification would silently change the engine's parsing). Checked in the
+  upgrade procedure.
+- Consequence for P4: the Python bot's engine sees values that went
+  Python float -> `json.dumps` -> best-effort parse. To be bit-faithful the
+  runner should feed the engine through the same round trip
+  (`to_string` -> `from_str`) rather than constructing `OrchestratorInput`
+  natively; decide at P4.2 with a measurement (cost is a few hundred us).
+- Also found: the input validators that `compute_ideal_orders_json` runs
+  before `compute_ideal_orders` (`validate_orchestrator_account_risk_inputs`,
+  `validate_forager_score_weights_pair`, `validate_hsl_*`) live in
+  `python.rs` behind the `python` feature. They only reject inputs, so
+  diffcheck is unaffected (recordings with an `.out.json` passed them). The
+  runner must replicate them (P4.3), or a later revision of the rlib branch
+  moves them out of `python.rs` (moving code is build plumbing, allowed by D2).
+
+## D9 (2026-09-07) P1.3: `passivbot_rust` exposes the target types, not the config mapping
+
+- Exposed (serde, `deny_unknown_fields`): `types::BotParams`,
+  `BotParamsPair`, `ExchangeParams`, the strategy param structs, and
+  `strategies::registry::strategy_spec(kind)` (per-strategy param spec with
+  defaults). `OrchestratorInput` round-trips through JSON unchanged.
+- Not exposed: the resolution from a live config file to those structs.
+  In v8.1.0 that is Python: `Passivbot._bot_params_to_rust_dict` (40 fields;
+  global-vs-per-symbol lookup through `bot_value`/`bp` with `coin_overrides`;
+  renames `forager_*_ema_span_1m` -> `filter_*_ema_span_1m`; int/bool/string
+  coercions; `normalize_twel_enforcer_policy`,
+  `normalize_we_excess_allowance_mode`), `_strategy_params_to_rust_dict`
+  (`get_active_strategy_side` + `build_runtime_strategy_side`),
+  `_equity_hard_stop_config`, and the defaults/template in
+  `src/config/schema.py` (588 lines).
+- Decision: port only the *resolved-value mapping* into `crates/runner`
+  (module `bot_params`), targeting the Rust types directly. Do not port
+  schema migrations: the runner refuses configs of another line (D6) and
+  configs arrive already migrated from the control plane.
+- Verification: record `_bot_params_to_rust_dict` / `global` outputs for each
+  committed config with the plugin approach of RECORDER.md section C and
+  compare field-by-field; this folds into the P4.2 acceptance. Budget
+  1-2 days inside P4.
+

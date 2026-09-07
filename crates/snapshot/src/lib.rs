@@ -30,6 +30,14 @@ pub struct RecordedCall {
     pub input_hash: String,
     pub input: serde_json::Value,
     pub output: Option<serde_json::Value>,
+    /// Raw `.in.json` text, byte-exact as it crossed the Python->Rust boundary.
+    /// Parse the engine input from THIS (serde_json's default float parsing is
+    /// best-effort, so text -> f64 must go through the same call the Python
+    /// extension uses: `serde_json::from_str`).
+    pub input_text: String,
+    /// Raw `.out.json` text, byte-exact as the engine serialised it.
+    /// Comparisons must be done on this text, not on `output` (see above).
+    pub output_text: Option<String>,
 }
 
 pub fn input_hash(input_json: &str) -> String {
@@ -77,10 +85,16 @@ pub fn load(in_path: &Path) -> Result<RecordedCall> {
     let input: serde_json::Value = serde_json::from_str(&input_text)
         .with_context(|| format!("{name}: input is not valid JSON"))?;
     let out_path = in_path.with_file_name(format!("{stem}{OUT_SUFFIX}"));
-    let output = if out_path.exists() {
-        Some(serde_json::from_str(&std::fs::read_to_string(&out_path)?)?)
+    let output_text = if out_path.exists() {
+        Some(std::fs::read_to_string(&out_path)?)
     } else {
         None
+    };
+    let output = match &output_text {
+        Some(t) => Some(
+            serde_json::from_str(t).with_context(|| format!("{stem}: output is not valid JSON"))?,
+        ),
+        None => None,
     };
     Ok(RecordedCall {
         stem,
@@ -88,6 +102,8 @@ pub fn load(in_path: &Path) -> Result<RecordedCall> {
         input_hash: hash,
         input,
         output,
+        input_text,
+        output_text,
     })
 }
 

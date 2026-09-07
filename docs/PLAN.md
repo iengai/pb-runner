@@ -15,7 +15,8 @@ Effort guesses are for orientation only.
 
 ## P1 — Engine as a library (line 8)  ~1 day
 
-- [ ] **P1.1 rlib branch.** In the `iengai/passivbot` fork (check it exists:
+- [x] **P1.1 rlib branch.** (done 2026-09-07: commit `52638d38d` on
+      `iengai/passivbot`, branch pushed; upstream PR not opened yet.) In the `iengai/passivbot` fork (check it exists:
       `gh repo view iengai/passivbot`; fork if not), branch
       `pb-runner/rlib-v8.1.0` from tag `v8.1.0`. Changes in `passivbot-rust/`:
       - `Cargo.toml`: `crate-type = ["cdylib", "rlib"]`; make `pyo3`, `numpy`
@@ -32,7 +33,11 @@ Effort guesses are for orientation only.
         `pip wheel . --no-deps` still builds; `pytest tests/test_coin_filtering.py tests/test_candle_interval.py -q` passes in the checkout.
       - Push the branch (account `iengai`). Optionally open an upstream PR
         titled "passivbot-rust: optional pyo3 feature + rlib crate-type".
-- [ ] **P1.2 diffcheck engine replay.** Enable the commented `passivbot_rust`
+- [ ] **P1.2 diffcheck engine replay.** (implemented 2026-09-07; 0 failures on
+      `tests/fixtures/recordings/synthetic_v8` = 153 calls recorded from
+      passivbot's own orchestrator tests, RECORDER.md section C. Comparison is
+      byte-exact on the output JSON text, see D8. Box stays open until the P2
+      fixtures exist.) Enable the commented `passivbot_rust`
       git dependency in `Cargo.toml` (branch `pb-runner/rlib-v8.1.0`,
       `default-features = false`), implement `replay()` under feature
       `engine` in `crates/diffcheck/src/main.rs`: deserialize
@@ -41,7 +46,9 @@ Effort guesses are for orientation only.
       equal), print the first differing order.
       - Acceptance: `cargo run -p pb-diffcheck --features engine -- --dir <recordings>`
         reports 0 failures on recordings produced by P2.
-- [ ] **P1.3 config types.** Decide whether `passivbot_rust` exposes enough
+- [x] **P1.3 config types.** (2026-09-07: D9 - the Rust crate exposes the
+      target types; the config -> `BotParams` resolution is Python and must be
+      ported inside P4.) Decide whether `passivbot_rust` exposes enough
       (`BotParams`, `BotParamsPair`, `ExchangeParams`, strategy params) to
       parse the live config without re-implementing `config/schema.py`.
       Record the finding in DECISIONS (D8).
@@ -101,5 +108,8 @@ Effort guesses are for orientation only.
 2. Re-record fake-exchange fixtures with the new Python version; run diffcheck.
 3. Diff `OrchestratorInput`/`OrchestratorOutput` and PORT_INVENTORY section 2 between tags; port the delta in the snapshot builder; P4.2 acceptance must pass again.
 4. Shadow run (P5.2) for at least 3 days.
-5. Bump version `0.x.y+pb<newtag>`, new image tag, DECISIONS entry.
+5. Check `serde_json` version/features against the new tag's
+   `passivbot-rust/Cargo.lock` (D8); re-pin with
+   `cargo update -p serde_json --precise <ver>` if it moved.
+6. Bump version `0.x.y+pb<newtag>`, new image tag, DECISIONS entry.
 Skipping any step is a decision to record, not an oversight.

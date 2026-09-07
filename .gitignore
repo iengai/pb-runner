@@ -4,6 +4,9 @@
 /tests/fixtures/recordings/*
 !/tests/fixtures/recordings/.gitkeep
 !/tests/fixtures/recordings/README.md
+# committable sets: produced by passivbot's own tests / the fake exchange (no account data)
+!/tests/fixtures/recordings/synthetic_v8/
+!/tests/fixtures/recordings/fake_v8/
 /.env
 *.log
 /configs/*.json

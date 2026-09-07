@@ -79,6 +79,46 @@ dev box (AGENTS.md). Two workable options:
 Prefer A for correctness fixtures and B.1 for a final parity check before
 P5.
 
+### C. Synthetic: passivbot's own orchestrator tests (offline, committed)
+
+`tools/pb_recorder_plugin.py` is a pytest plugin that wraps
+`compute_ideal_orders_json` (same wrapper as the patch above) and discards
+calls that raise. Run it from the checkout that has the freshly built
+extension in `src/` (P1.1 worktree `E:\projects\passivbot-rlib-v8.1.0`):
+
+```bash
+cd E:/projects/passivbot-rlib-v8.1.0
+PYTHONPATH=E:/projects/pb-runner/tools \
+PB_RUNNER_RECORD_DIR=E:/projects/pb-runner/tests/fixtures/recordings/synthetic_v8 \
+  E:/projects/passivbot/.venv/Scripts/python.exe -m pytest -p pb_recorder_plugin \
+  tests/test_orchestrator_json_api.py tests/test_orchestrator_integration.py \
+  tests/test_unstucking_safeguards.py tests/test_missing_ema_fix.py \
+  tests/test_order_churn_gate.py tests/test_passivbot_balance_split.py -q
+```
+
+Result on 2026-09-07: 154 calls recorded (153 unique), 50 discarded. The
+plugin also writes `MANIFEST.json` (passivbot commit, extension path and
+source fingerprint). These inputs are hand-built by the tests (no account
+data) and are committed. They exercise the JSON schema and many strategy
+branches but are not a substitute for A/B recordings.
+
+## Pitfalls (learned the hard way)
+
+1. **Stale extension.** `import passivbot_rust` resolves to
+   `.venv/Lib/site-packages` unless `src/` is first on `sys.path`; that copy
+   can be an older build (its `runtime_build_info()["source_fingerprint"]`
+   differed from `rust_utils.source_fingerprint()` on 2026-09-07). Always
+   check the fingerprint in `MANIFEST.json` against the checkout, and never
+   trust `tests/conftest.py` to fix the path for a plugin loaded with `-p`.
+2. **Float text, not float values.** Compare recordings as bytes; parse the
+   input with `serde_json::from_str`. See DECISIONS D8.
+3. **Building the wheel.** `pip wheel . --no-deps` works on Windows with
+   `PYO3_PYTHON=<venv>/Scripts/python.exe` and
+   `PASSIVBOT_RUST_SOURCE_FINGERPRINT=$(python -c 'from rust_utils import source_fingerprint; print(source_fingerprint())')`
+   (run with `PYTHONPATH=src`). Copy the `.pyd` out of the wheel into `src/`
+   and write `<pyd>.rust-src-sha256` with the fingerprint, otherwise
+   `verify_loaded_runtime_extension` raises "appears stale" in some tests.
+
 ## Scrubbing
 
 `tools/scrub.py` (to write, P2.3) replaces `balance`/`balance_raw` with a

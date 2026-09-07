@@ -17,7 +17,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = "1"  # keep Cargo.lock at the pinned tag's passivbot-rust/Cargo.lock version; never enable float_roundtrip (D8)
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
@@ -31,7 +31,7 @@ async-trait = "0.1"
 # --- Pinned upstream engines (Phase 1 enables these; see docs/PLAN.md) -------
 # passivbot strategy engine. MUST stay pinned to the tag the live strategies
 # were optimized on. Requires the `rlib` feature branch (docs/PLAN.md P1.1).
-# passivbot_rust = { git = "https://github.com/iengai/passivbot.git", branch = "pb-runner/rlib-v8.1.0", default-features = false }
+passivbot_rust = { git = "https://github.com/iengai/passivbot.git", branch = "pb-runner/rlib-v8.1.0", default-features = false }
 #
 # ccxt official Rust port (transpiled, preview). Pin a COMMIT, not a branch:
 # the rust/ tree receives automated regeneration commits daily.

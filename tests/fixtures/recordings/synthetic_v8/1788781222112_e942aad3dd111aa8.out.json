@@ -1,0 +1,1 @@
+{"orders":[],"diagnostics":{"warnings":[],"loss_gate_blocks":[],"symbol_states":[{"symbol_idx":0,"long":{"input_mode":"normal","effective_mode":"normal","active":false,"allow_initial":false},"short":{"input_mode":null,"effective_mode":"manual","active":false,"allow_initial":false}}],"min_effective_cost_blocks":[],"forager_selections":[]}}
