@@ -12,6 +12,8 @@ use crate::{Candle, MarginMode};
 use serde_json::Value;
 
 pub const QUOTE: &str = "USDT";
+/// `market["limits"]["cost"]["min"] or 0.1` with ccxt 4.5.66 giving `None`.
+pub const CCXT_MIN_COST_FALLBACK: f64 = 0.1;
 
 /// `BTCUSDT` -> `BTC/USDT:USDT` (linear perpetual only; dated futures carry a
 /// `-YYMMDD` suffix in ccxt and are excluded by [`parse_markets`]).
@@ -124,7 +126,10 @@ pub fn parse_markets(
             qty_step: num(lot, "qtyStep")?,
             price_step: num(price, "tickSize")?,
             min_qty: num(lot, "minOrderQty")?,
-            min_cost: opt_num(lot, "minNotionalValue")?.unwrap_or(0.0),
+            // ccxt 4.5.66 leaves limits.cost.min = None for Bybit linear; passivbot
+            // then uses `or 0.1` (ccxt_bot.py set_market_specific_settings).
+            min_cost: CCXT_MIN_COST_FALLBACK,
+            min_notional: opt_num(lot, "minNotionalValue")?,
             contract_size: 1.0,
             max_leverage: num(lev, "maxLeverage")?,
             maker_fee,
@@ -473,8 +478,9 @@ mod tests {
                 b.min_cost,
                 b.max_leverage
             ),
-            (0.001, 0.1, 0.001, 5.0, 100.0)
+            (0.001, 0.1, 0.001, 0.1, 100.0)
         );
+        assert_eq!(b.min_notional, Some(5.0));
     }
 
     #[test]

@@ -145,7 +145,13 @@ pub struct MarketSpec {
     pub qty_step: f64,
     pub price_step: f64,
     pub min_qty: f64,
+    /// What passivbot ends up with as `min_costs[symbol]`:
+    /// `market["limits"]["cost"]["min"] or 0.1`. ccxt 4.5.66 (pinned by
+    /// passivbot v8.1.0) leaves `cost.min` unset for Bybit linear markets, so
+    /// this is always 0.1; the venue's `minNotionalValue` is kept in
+    /// `min_notional` for information only.
     pub min_cost: f64,
+    pub min_notional: Option<f64>,
     pub contract_size: f64,
     pub max_leverage: f64,
     pub maker_fee: f64,

@@ -78,7 +78,7 @@ Effort guesses are for orientation only.
       `11f45ee2bf0d2f809c318761c717415268da27c0`, measured build cost, API
       shape, `float_roundtrip` conflict with D8. Verdict (independent review,
       D11): hand-written client; ccxt deps stay out of `Cargo.toml`.
-- [ ] **P3.2** Implement `ExchangeClient` for Bybit v5 in
+- [x] **P3.2** (done 2026-09-07: 15 unit tests, clippy clean) Implement `ExchangeClient` for Bybit v5 in
       `crates/exchange-bybit`: instruments-info -> `MarketSpec` (USDT linear
       only), wallet-balance (UNIFIED formula), position/list (cursor, 200),
       order/realtime (cursor, 50, `positionIdx` side), tickers, kline 1m
@@ -91,7 +91,7 @@ Effort guesses are for orientation only.
         signing test vectors; `cargo clippy -D warnings`.
 - [ ] **P3.3** Order/position/fill updates: REST polling (`execution/list`,
       `closed-pnl` for P4.1 fills). Private WS deferred until a measured need.
-- [ ] **P3.4** Read-only integration test against Bybit using the abot read-only key from the dev box (`E:\projects\passivbot\api-keys.json` entry `415196485`): markets/balance/positions/open orders/tickers/ohlcv. No order placement.
+- [x] **P3.4** (done 2026-09-07: `examples/readonly_probe.rs` vs `tools/probe_python_ccxt.py`, `tools/compare_probes.py` = 0 stable-field differences on the abot account: 751 markets, BTC spec incl. min_cost/fees, XRP position, 3 open orders) Read-only integration test against Bybit using the abot read-only key from the dev box (`E:\projects\passivbot\api-keys.json` entry `415196485`): markets/balance/positions/open orders/tickers/ohlcv. No order placement.
       - Acceptance: test passes; field mapping cross-checked against what `exchanges/bybit.py` produces for the same account (dump both, diff).
 
 ## P4 — Runner loop  ~1 week

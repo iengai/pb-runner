@@ -40,10 +40,11 @@ const AUTH_CODES: &[&str] = &[
 ];
 const RATE_LIMIT_CODES: &[&str] = &["10006", "10016", "10018"];
 
-/// Default fee rates ccxt seeds into `markets[symbol]` for Bybit linear
-/// contracts (the Python bot reads `maker`/`taker` from there).
-pub const DEFAULT_MAKER_FEE: f64 = 0.0002;
-pub const DEFAULT_TAKER_FEE: f64 = 0.00055;
+/// Fee rates ccxt 4.5.66 seeds into `markets[symbol]` for Bybit linear
+/// contracts (`describe().fees`; the Python bot reads `maker`/`taker` from
+/// there; verified against the live account on 2026-09-07, P3.4).
+pub const DEFAULT_MAKER_FEE: f64 = 0.0001;
+pub const DEFAULT_TAKER_FEE: f64 = 0.0006;
 
 #[derive(Debug, Clone)]
 pub struct BybitConfig {
@@ -652,7 +653,8 @@ mod tests {
                 qty_step: 0.01,
                 price_step: 0.01,
                 min_qty: 0.01,
-                min_cost: 5.0,
+                min_cost: 0.1,
+                min_notional: Some(5.0),
                 contract_size: 1.0,
                 max_leverage: 100.0,
                 maker_fee: 0.0002,

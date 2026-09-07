@@ -42,7 +42,18 @@ set_position_mode / set_margin_mode are untyped core calls; errors carry the
 ccxt kind string). Python-side semantics recorded in PORT_INVENTORY section 3.
 Adjudication A (full ccxt dep) / B (hand-written v5 client) / C (vendored
 bybit slice) delegated to a subagent (brief in scratchpad `p3_brief.md`);
-verdict to be recorded as D11. Detached recording jobs relaunched after a
+verdict recorded as D11 (hand-written client).
+P3.2 done: `crates/exchange-bybit` = signing, envelope/error classes,
+parsers (numbers via `str::parse`), `ExchangeClient` impl; 15 unit tests.
+P3.4 done: `examples/readonly_probe.rs` and `tools/probe_python_ccxt.py`
+(ccxt 4.5.66, the version passivbot pins) agree on every stable field for
+the abot account (`tools/compare_probes.py`). Two parity facts learned and
+encoded: ccxt 4.5.66 gives `limits.cost.min = None` for Bybit linear so
+passivbot's `min_cost` is always 0.1 (`or 0.1`); fee rates are ccxt's
+describe defaults 0.0001 / 0.0006, not 0.0002 / 0.00055. Rust probe ~0.9 s
+vs Python ~3.7 s for the same 7 calls. P3.3 (fills) is implemented as
+`fetch_fills` (`/v5/execution/list`); private WS deferred.
+`docs/SNAPSHOT_SPEC.md` (893 lines, subagent) is the P4.2 field-by-field spec. Detached recording jobs relaunched after a
 process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
 seeded grid_v7, tm, iter7, tm8).
 
