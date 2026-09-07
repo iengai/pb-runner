@@ -18,6 +18,11 @@ name = "pb-snapcheck"
 path = "src/bin/snapcheck.rs"
 required-features = ["engine-v8"]
 
+[[bin]]
+name = "pb-plancheck"
+path = "src/bin/plancheck.rs"
+required-features = ["engine-v8"]
+
 [features]
 # Exactly one engine line is compiled into a given binary/image (docs/DECISIONS.md D6).
 # `engine-v8` pulls the pinned v8.1.0 rlib branch (workspace dependency).

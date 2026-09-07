@@ -85,7 +85,14 @@ from S3 with the contract's exit codes. `pb-runner --dry-run --once` on the
 abot account now prints the reconciled plan (cancels of the live v7 bot's
 XRP orders + 2 entries, expected with a different config). All four
 seeded-with-fills private sets: 400/400 diffcheck.
-**Not done:** live execution never exercised with a trading key (P5.3);
+`pb-plancheck` (P5.1-lite): the reconcile plan equals the Python bot's
+actual create/cancel requests on 2400/2400 cycles of five full runs; the
+sixth (seeded iter7) differs on 33/400 cycles where Python's order churn
+gate deferred far grid entries. `jsonexact` module = exact float parser for
+recordings. P6: Dockerfile + buildspec written (unbuilt, Docker not running
+locally); pbtb-rust runtime-selection branch (D7 option 1) being written by a
+subagent in `E:\projects\pbtb-rust-pbrunner`.
+**Not done:** churn gate (RECONCILE_SPEC 2.9); live execution never exercised with a trading key (P5.3);
 churn gate / market-distance filter (SPEC 4.3); HSL modes; P5/P6. Detached recording jobs relaunched after a
 process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
 seeded grid_v7, tm, iter7, tm8).

@@ -106,7 +106,7 @@ Effort guesses are for orientation only.
 
 ## P5 — Paper and shadow  ~1-2 weeks wall clock
 
-- [ ] **P5.1** Mock `ExchangeClient` driven by the passivbot fake scenarios; runner runs the same scenario as the Python bot; compare order streams cycle by cycle.
+- [ ] **P5.1** (partial 2026-09-07: `pb-plancheck` replays a full fake-exchange run's request log and compares the runner's cancel/create plan with the Python bot's actual requests per cycle: grid_v7 600/600, tm 600/600, seeded grid_v7 400/400, tm 400/400, tm8 400/400 identical; seeded iter7 367/400 - the 33 differing cycles are far grid entries the Python churn gate deferred (RECONCILE_SPEC 2.9), gate not ported yet. Full mock-exchange loop still open.) Mock `ExchangeClient` driven by the passivbot fake scenarios; runner runs the same scenario as the Python bot; compare order streams cycle by cycle.
 - [ ] **P5.2** Shadow run: pb-runner in `--dry-run` against the live account (read-only key) next to the live Python bot for the same config; log planned vs actual orders per cycle; target >= 99% identical order sets over 7 days, every difference explained.
 - [ ] **P5.3** Small-capital live run on a separate sub-account (user decision) for 1-2 weeks; compare fills and PnL with the Python bot on the same config.
 

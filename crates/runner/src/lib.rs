@@ -11,6 +11,7 @@ pub mod config;
 pub mod emas;
 #[cfg(feature = "engine-v8")]
 pub mod execute;
+pub mod jsonexact;
 #[cfg(feature = "engine-v8")]
 pub mod live;
 #[cfg(feature = "engine-v8")]
