@@ -1,0 +1,13 @@
+//! pb-runner library: config validation, config -> engine parameter mapping,
+//! EMA inputs and the orchestrator snapshot builder (docs/PLAN.md P4).
+//!
+//! The binary in `main.rs` drives the live loop; `bin/snapcheck.rs` replays
+//! committed recordings through the snapshot builder (P4.2 acceptance).
+
+#[cfg(feature = "engine-v8")]
+pub mod bot_params;
+pub mod config;
+#[cfg(feature = "engine-v8")]
+pub mod emas;
+#[cfg(feature = "engine-v8")]
+pub mod snapshot;

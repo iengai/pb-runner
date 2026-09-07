@@ -60,7 +60,18 @@ P4.2 started: `crates/runner/src/bot_params.rs` (`ConfigView`) reproduces
 and tm fixture recording. Facts encoded: hjson parses integral literals as
 ints (`0.0` -> `0`), the loader fills missing keys from the v8.1.0 template
 (`crates/runner/assets/template_v8.1.0.json`), forager weights are
-normalised at load, `wallet_exposure_limit = round(twel/n_positions, 8)`. Detached recording jobs relaunched after a
+normalised at load, `wallet_exposure_limit = round(twel/n_positions, 8)`.
+P4.2 snapshot builder done for the fake sets: `emas.rs` (window = ceil(span)
+closed buckets, candle fields rounded to float32 like `CANDLE_DTYPE`, engine
+`ema_last_f64`, provisional/strict gap policies, 1h aggregation) and
+`snapshot.rs` (universe, modes steps 4-7, spans per strategy, tradability
+with the forager cache-only rule, peek hints, incumbents, global). Acceptance
+tool `pb-snapcheck` (parses recordings with correctly-rounded floats, D8;
+replays the fake exchange's timeline gap fill): grid_v7 30/30, tm 30/30,
+grid_v7_seeded 30/30 identical. Gaps to close before P5 (SPEC section 8):
+HSL/cooldown/runtime-forced modes, `PB_modes` carry-over for tradability,
+close-EMA 10-min carry-forward, open-tail projection, trailing from real
+fills, entry-cooldown fill timestamps, realized-pnl cumsum from fills. Detached recording jobs relaunched after a
 process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
 seeded grid_v7, tm, iter7, tm8).
 

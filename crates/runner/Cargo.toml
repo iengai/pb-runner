@@ -5,9 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "Rust live runner for passivbot strategies (Bybit linear perps): snapshot -> pinned engine -> order reconciliation"
 
+[lib]
+name = "pb_runner"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pb-runner"
 path = "src/main.rs"
+
+[[bin]]
+name = "pb-snapcheck"
+path = "src/bin/snapcheck.rs"
+required-features = ["engine-v8"]
 
 [features]
 # Exactly one engine line is compiled into a given binary/image (docs/DECISIONS.md D6).

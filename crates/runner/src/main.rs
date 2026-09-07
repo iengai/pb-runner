@@ -9,9 +9,7 @@
 //! engine line differs from the one this binary was built for, and exits.
 //! The loop itself is P4.
 
-#[cfg(feature = "engine-v8")]
-mod bot_params;
-mod config;
+use pb_runner::config;
 
 use anyhow::{Context, Result};
 use clap::Parser;
