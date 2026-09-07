@@ -91,8 +91,8 @@ def approved_coins(config: dict) -> list[str]:
     return sorted(coins)
 
 
-def boot_close(candles_dir: Path, coin: str, dates: list[str], boot_index: int) -> float:
-    """Close of the 1m candle at `boot_index` (files are one UTC day = 1440 rows).
+def boot_candle(candles_dir: Path, coin: str, dates: list[str], boot_index: int) -> tuple[int, float]:
+    """(timestamp_ms, close) of the 1m candle at `boot_index` (files are one UTC day = 1440 rows).
 
     Reads the `.npy` directly (float64, C order, shape (1440, 6)) so the script
     runs under any Python, numpy or not.
@@ -113,18 +113,21 @@ def boot_close(candles_dir: Path, coin: str, dates: list[str], boot_index: int) 
             raise SystemExit(f"{path}: unexpected layout {header}")
         f.seek(minute * 6 * 8, 1)
         row = struct.unpack("<6d", f.read(6 * 8))
-    return float(row[4])
+    return int(row[0]), float(row[4])
 
 
 def seed_positions(coins: list[str], candles_dir: Path, dates: list[str], boot_index: int,
-                   balance: float, n: int, wallet_exposure: float, entry_offset: float) -> list[dict]:
+                   balance: float, n: int, wallet_exposure: float, entry_offset: float) -> tuple[list[dict], list[dict]]:
     """Long positions on the first `n` coins, sized to `wallet_exposure` of the
     balance at the boot price, with the entry price `entry_offset` above it so the
-    position starts under water (exercises closes/grid/unstuck paths at once)."""
-    out = []
+    position starts under water (exercises closes/grid/unstuck paths at once).
+    Each position also gets one boot fill one minute before boot, otherwise the
+    bot keeps the position in `position_fill_confirmation_pending` and marks its
+    strategy inputs unavailable (no closes or grid entries are planned)."""
+    out, fills = [], []
     for coin in coins[:n]:
         step = BYBIT_MARKETS[coin]["qty_step"]
-        price = boot_close(candles_dir, coin, dates, boot_index)
+        boot_ts, price = boot_candle(candles_dir, coin, dates, boot_index)
         qty = int((balance * wallet_exposure / price) / step) * step
         qty = max(qty, BYBIT_MARKETS[coin]["min_qty"])
         out.append({
@@ -133,11 +136,22 @@ def seed_positions(coins: list[str], candles_dir: Path, dates: list[str], boot_i
             "qty": round(qty, 10),
             "price": round(price * (1.0 + entry_offset), 10),
         })
-    return out
+        fills.append({
+            "id": str(len(fills) + 1),
+            "order_id": str(1000 + len(fills)),
+            "symbol": f"{coin}/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
+            "amount": round(qty, 10),
+            "price": round(price * (1.0 + entry_offset), 10),
+            "timestamp": boot_ts - 60_000,
+        })
+    return out, fills
 
 
 def build_scenario(name: str, coins: list[str], candles_dir: Path, dates: list[str],
-                   boot_index: int, balance: float, positions: list[dict] | None = None) -> dict:
+                   boot_index: int, balance: float, positions: list[dict] | None = None,
+                   fills: list[dict] | None = None) -> dict:
     symbols = {}
     replay = {}
     for coin in coins:
@@ -156,7 +170,7 @@ def build_scenario(name: str, coins: list[str], candles_dir: Path, dates: list[s
         "name": name,
         "tick_interval_seconds": 60,
         "boot_index": boot_index,
-        "account": {"balance": balance, "positions": positions or []},
+        "account": {"balance": balance, "positions": positions or [], "fills": fills or []},
         "symbols": symbols,
         "replay": {"symbols": replay},
     }
@@ -212,12 +226,12 @@ def run_one(args, name: str, config_path: Path) -> dict:
     coins = approved_coins(config)
     dates = date_range(args.dates)
     candles_dir = Path(args.candles).resolve()
-    positions = []
+    positions, fills = [], []
     if args.seed_positions > 0:
-        positions = seed_positions(coins, candles_dir, dates, args.boot_index, args.balance,
-                                   args.seed_positions, args.seed_we, args.seed_entry_offset)
+        positions, fills = seed_positions(coins, candles_dir, dates, args.boot_index, args.balance,
+                                          args.seed_positions, args.seed_we, args.seed_entry_offset)
     scenario = build_scenario(name, coins, candles_dir, dates,
-                              args.boot_index, args.balance, positions)
+                              args.boot_index, args.balance, positions, fills)
     scn_out = out_dir / "scenario.json"
     scn_out.write_text(json.dumps(scenario, indent=2), encoding="utf-8")
 

@@ -53,7 +53,14 @@ passivbot's `min_cost` is always 0.1 (`or 0.1`); fee rates are ccxt's
 describe defaults 0.0001 / 0.0006, not 0.0002 / 0.00055. Rust probe ~0.9 s
 vs Python ~3.7 s for the same 7 calls. P3.3 (fills) is implemented as
 `fetch_fills` (`/v5/execution/list`); private WS deferred.
-`docs/SNAPSHOT_SPEC.md` (893 lines, subagent) is the P4.2 field-by-field spec. Detached recording jobs relaunched after a
+`docs/SNAPSHOT_SPEC.md` (893 lines, subagent) is the P4.2 field-by-field spec.
+P4.2 started: `crates/runner/src/bot_params.rs` (`ConfigView`) reproduces
+`global_bot_params`, per-symbol `bot_params` and `strategy_params` exactly
+(JSON Value equality, int vs float preserved) for every committed grid_v7
+and tm fixture recording. Facts encoded: hjson parses integral literals as
+ints (`0.0` -> `0`), the loader fills missing keys from the v8.1.0 template
+(`crates/runner/assets/template_v8.1.0.json`), forager weights are
+normalised at load, `wallet_exposure_limit = round(twel/n_positions, 8)`. Detached recording jobs relaunched after a
 process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
 seeded grid_v7, tm, iter7, tm8).
 

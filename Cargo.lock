@@ -976,6 +976,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "passivbot_rust",
  "pb-exchange-bybit",
  "pb-snapshot",
  "serde",
