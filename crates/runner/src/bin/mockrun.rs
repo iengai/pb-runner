@@ -24,6 +24,7 @@ use clap::Parser;
 use pb_exchange_bybit::{PositionSide, Side};
 use pb_runner::bot_params::ConfigView;
 use pb_runner::config::LiveConfig;
+use pb_runner::exchange_config::ExchangeConfigurator;
 use pb_runner::execute::Executor;
 use pb_runner::jsonexact::parse_exact;
 use pb_runner::live::LiveRunner;
@@ -260,12 +261,14 @@ async fn main() -> Result<()> {
         std::fs::read_to_string(&config_path).with_context(|| config_path.display().to_string())?;
     LiveConfig::parse(&cfg_text, 8)?;
     let raw: Value = parse_exact(&cfg_text)?;
-    let post_only = raw
-        .pointer("/live/time_in_force")
+    let cfg = ConfigView::new(raw)?;
+    // `live.time_in_force` after template defaults (`good_till_cancelled`).
+    let post_only = cfg
+        .live("time_in_force")
         .and_then(Value::as_str)
         .map(|s| s == "post_only")
-        .unwrap_or(true);
-    let cfg = ConfigView::new(raw)?;
+        .unwrap_or(false);
+    let exchange_config = ExchangeConfigurator::from_config(&cfg);
 
     // Mock exchange from the scenario the Python harness ran.
     let scenario = Scenario::load(&scenario_path)?;
@@ -360,8 +363,8 @@ async fn main() -> Result<()> {
     let mut runner = LiveRunner::with_clocks(cfg, mock.clone(), wall, mono)?;
     runner.set_harness_secondary_never_fetched(!args.no_harness_compat);
     let symbols = runner.warmup().await?;
-    runner.configure_exchange(&symbols).await?;
-    let mut executor = Executor::new(mock.clone(), post_only);
+    runner.configure_exchange().await?;
+    let mut executor = Executor::new(mock.clone(), post_only, exchange_config);
     eprintln!("warmup done: {} symbols", symbols.len());
 
     let mut ex = Examples {

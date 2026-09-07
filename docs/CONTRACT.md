@@ -33,6 +33,7 @@ Reference: `E:\projects\pbtb-rust\deploy\passivbot-image\{Dockerfile.ecs,entrypo
 | Task-def family | `scalable-cluster-dev-passivbot` (7), `…-passivbot-v8` (8) | new families per line, selection per D7 |
 | Egress | NAT instance fixed EIP (Bybit keys are IP-whitelisted) | unchanged |
 | Write-back | none known (pbtb-rust observes ECS task state via EventBridge; balances via Bybit API from its own Lambda) | none (verified 2026-09-08, PLAN P6.4: the Python entrypoint only downloads; pbtb-rust reads ECS events and the exchange, never the container's files). |
+| Restarts | the Python process restarts the bot in-process after a 60 s cooldown when its hourly error budget trips (`restart_bot_on_too_many_errors`, 10/h) and leaves its loop (exit 0) once restarts in 24 h exceed `live.max_n_restarts_per_day` (passivbot.py:22690-22740) | same in-process loop (`main.rs` `run_live`/`run_bot`: budget trip or failed warmup -> teardown, 60 s cooldown, fresh bot; exit **30** once `live.max_n_restarts_per_day` is exceeded). What ECS/pbtb-rust provides: the task-state-change lambda (`usecase/reconcile_stopped_task.rs`) re-launches a stopped task **only** when the stop is memory-related (`exit_code == 137` and stop code not `UserInitiated`); any other exit, including 30, leaves the bot stopped until the user starts it again, exactly as with the Python image. The restart counter is therefore per process and is not persisted across container restarts (D19 item 3). |
 
 ## 3. Config contract
 

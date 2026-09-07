@@ -14,6 +14,8 @@ pub mod cooldown;
 #[cfg(feature = "engine-v8")]
 pub mod emas;
 #[cfg(feature = "engine-v8")]
+pub mod exchange_config;
+#[cfg(feature = "engine-v8")]
 pub mod execute;
 #[cfg(feature = "engine-v8")]
 pub mod hsl;

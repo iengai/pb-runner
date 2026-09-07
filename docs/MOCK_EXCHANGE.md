@@ -54,10 +54,14 @@ fill sequence produces bit-identical balances, entry prices and pnl.
    `since` floored to the bucket, up to 5 pages of `limit` (max 1000), each
    page starting at the last row of the previous one; without `since` the
    newest `limit` rows. Timeframes other than `1m`/`1h` are `NotSupported`.
-2. **No market orders through the trait.** `NewOrder` has no order type
-   because the Bybit client only sends `orderType: Limit`; the mock treats
-   every created order as a limit order. Market fills exist only through
-   the `manual_fill` scenario action.
+2. **Market orders** (since 2026-09-08, REVIEW finding 3): `NewOrder`
+   carries the engine's execution type; the mock prices a market order at
+   the step's last price and fills it immediately as taker exactly as
+   `fake.py:790-808` does (`create_one`, unit test
+   `market_order_fills_at_the_step_price_as_taker`). None of the recorded
+   runs emits one (`market_orders_allowed=false`, no HSL panic), so their
+   parity is unaffected. Market fills also exist through the `manual_fill`
+   scenario action.
 3. **Closed pnl.** The fake has no closed-pnl endpoint (Python reads
    `realizedPnl` per fill). `fetch_closed_pnl` returns one record per
    position-reducing fill with that fill's pnl, which gives the runner's

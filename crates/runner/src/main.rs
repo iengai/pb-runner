@@ -5,9 +5,15 @@
 //! `python src/main.py configs/<BOT_ID>.json` today, so pbtb-rust only needs
 //! a new task-definition family per engine line.
 //!
-//! Modes: `--check-only` validates the config and exits; `--dry-run`
-//! (default until P4.4 lands) runs the full planning loop against the live
-//! account with a read-only key and logs the orders it would place.
+//! Modes: `--check-only` validates the config and exits; without `--live`
+//! the loop runs the full planning cycle against the account with a
+//! read-only key and logs the orders it would place (dry run / shadow run).
+//!
+//! Lifecycle mirrors passivbot's `main()` (passivbot.py:22675-22736): the
+//! bot runs until its hourly error budget trips (`RestartBotException`),
+//! then it is torn down, the process sleeps the 60 s cooldown and starts a
+//! fresh bot in-process; restarts in the last 24 h are counted and the
+//! process exits (code 30) once they exceed `live.max_n_restarts_per_day`.
 
 use pb_runner::{config, startup};
 
@@ -20,6 +26,13 @@ use std::path::PathBuf;
 pub const ENGINE_MAJOR: u32 = 8;
 #[cfg(all(feature = "engine-v7", not(feature = "engine-v8")))]
 pub const ENGINE_MAJOR: u32 = 7;
+
+/// Exit code when the in-process restart budget is exhausted (Python's
+/// `main()` leaves its loop with exit 0 there; 30 makes the reason visible
+/// in ECS / CloudWatch).
+pub const EXIT_RESTARTS_EXCEEDED: i32 = 30;
+/// `cooldown_secs = 60` (passivbot.py:22688).
+pub const RESTART_COOLDOWN_S: u64 = 60;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -98,12 +111,20 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Why one bot lifetime ended.
+#[cfg(feature = "engine-v8")]
+enum BotExit {
+    /// `--once` completed or ctrl-c: leave the process.
+    Stop,
+    /// Error budget tripped (`RestartBotException`) or startup failed: the
+    /// outer loop restarts after the cooldown.
+    Restart(String),
+}
+
 #[cfg(feature = "engine-v8")]
 async fn run_live(args: &Args, config_text: &str) -> Result<()> {
     use pb_exchange_bybit::bybit::{BybitClient, BybitConfig};
-    use pb_runner::bot_params::ConfigView;
-    use pb_runner::execute::Executor;
-    use pb_runner::live::{load_api_key, LiveRunner};
+    use pb_runner::live::load_api_key;
     use std::sync::Arc;
 
     let raw: serde_json::Value = serde_json::from_str(config_text)?;
@@ -119,25 +140,116 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
         key.exchange
     );
     let client = Arc::new(BybitClient::new(BybitConfig::mainnet(key.key, key.secret))?);
-    let view = ConfigView::new(raw.clone())?;
-    let mut runner = LiveRunner::new(view, client.clone())?;
-    let symbols = runner.warmup().await?;
-    let dry_run = !args.live;
-    tracing::info!(?symbols, dry_run, "warmup complete");
-    let post_only = raw
-        .pointer("/live/time_in_force")
+    let max_restarts = raw
+        .pointer("/live/max_n_restarts_per_day")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(10) as usize;
+    let mut restarts: Vec<u64> = Vec::new();
+    loop {
+        let exit = run_bot(args, raw.clone(), client.clone()).await;
+        match exit {
+            BotExit::Stop => return Ok(()),
+            BotExit::Restart(reason) => {
+                tracing::warn!(reason = %reason, "restarting bot...");
+            }
+        }
+        // passivbot.py:22711-22736: 60 s countdown, then count the restart
+        // against the last 24 h and stop when the cap is exceeded.
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(RESTART_COOLDOWN_S)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutdown requested during restart cooldown");
+                return Ok(());
+            }
+        }
+        let now = pb_runner::live::now_ms();
+        restarts.push(now);
+        restarts.retain(|t| *t > now.saturating_sub(24 * 60 * 60 * 1000));
+        if restarts.len() > max_restarts {
+            tracing::error!(
+                restarts = restarts.len(),
+                max_restarts,
+                exit = EXIT_RESTARTS_EXCEEDED,
+                "n restarts exceeded last 24h; exiting"
+            );
+            std::process::exit(EXIT_RESTARTS_EXCEEDED);
+        }
+    }
+}
+
+/// One bot lifetime (`setup_bot` + `start_bot`): fresh runner state, fresh
+/// error budget, warmup, then the execution loop until it asks for a restart.
+#[cfg(feature = "engine-v8")]
+async fn run_bot(
+    args: &Args,
+    raw: serde_json::Value,
+    client: std::sync::Arc<pb_exchange_bybit::bybit::BybitClient>,
+) -> BotExit {
+    use pb_runner::bot_params::ConfigView;
+    use pb_runner::exchange_config::ExchangeConfigurator;
+    use pb_runner::execute::Executor;
+    use pb_runner::live::LiveRunner;
+
+    let view = match ConfigView::new(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "config view");
+            return BotExit::Restart(format!("config: {e:#}"));
+        }
+    };
+    // `live.time_in_force` from the resolved config (template default
+    // `good_till_cancelled`, config/schema.py:446): PostOnly only when the
+    // config says `post_only` (exchanges/bybit.py:545-549).
+    let post_only = view
+        .live("time_in_force")
         .and_then(serde_json::Value::as_str)
         .map(|s| s == "post_only")
-        .unwrap_or(true);
+        .unwrap_or(false);
+    let mut exchange_config = ExchangeConfigurator::from_config(&view);
+    let mut runner = match LiveRunner::new(view, client.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "runner init");
+            return BotExit::Restart(format!("init: {e:#}"));
+        }
+    };
+    let symbols = match runner.warmup().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "warmup failed");
+            return BotExit::Restart(format!("warmup: {e:#}"));
+        }
+    };
+    let dry_run = !args.live;
+    tracing::info!(?symbols, dry_run, post_only, "warmup complete");
     if !dry_run {
-        runner.configure_exchange(&symbols).await?;
+        if let Err(e) = runner.configure_exchange().await {
+            tracing::error!(error = %e, "exchange configuration failed");
+            return BotExit::Restart(format!("configure: {e:#}"));
+        }
     }
-    let mut executor = Executor::new(client.clone(), post_only);
+    exchange_config.set_markets(runner.markets().values());
+    let mut markets_seen_ms = runner.markets_loaded_ms();
+    let mut executor = Executor::new(client.clone(), post_only, exchange_config);
     loop {
         let t0 = std::time::Instant::now();
         let now = pb_runner::live::now_ms();
         let recent = executor.recent_executions(now).to_vec();
-        match runner.plan(&recent).await {
+        let planned = runner.plan(&recent).await;
+        // Non-fatal failures Python charges to the budget (hourly reload,
+        // symbols with exposure dropped from the cycle).
+        for _ in 0..runner.take_budget_errors() {
+            if let Err(e) = executor.note_error(now) {
+                return BotExit::Restart(e.to_string());
+            }
+        }
+        if runner.markets_loaded_ms() != markets_seen_ms {
+            markets_seen_ms = runner.markets_loaded_ms();
+            executor
+                .exchange_config_mut()
+                .set_markets(runner.markets().values());
+        }
+        match planned {
             Ok(cycle) => {
                 let p = &cycle.plan;
                 tracing::info!(
@@ -152,6 +264,7 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
                         + p.deferred_churn
                         + p.deferred_capacity,
                     skipped = p.skipped_market_snapshot + p.skipped_market_distance,
+                    skipped_symbols = cycle.skipped_symbols.len(),
                     warnings = cycle.output.diagnostics.warnings.len(),
                     "planned"
                 );
@@ -170,35 +283,48 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
                                 cancels_ok = r.cancels_ok,
                                 creates_ok = r.creates_ok,
                                 failures = r.failures,
+                                skipped_dirty = r.skipped_dirty,
+                                skipped_pending_config = r.skipped_pending_config,
                                 "wave done"
                             )
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "restart requested");
-                            std::process::exit(30);
+                            return BotExit::Restart(e.to_string());
                         }
                     }
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "planning cycle failed");
-                // Honour the exchange's back-off before the regular cycle delay.
-                if let Some(pb_exchange_bybit::ExchangeError::RateLimited { retry_after_ms }) = e
-                    .chain()
-                    .find_map(|c| c.downcast_ref::<pb_exchange_bybit::ExchangeError>())
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(*retry_after_ms)).await;
+                // run_execution_loop (passivbot.py:6657-6760): a rate limit
+                // backs off 5 s, any other exception 1 s
+                // (`_handle_execution_loop_failure`); both charge the same
+                // error budget as write failures.
+                let rate_limited = e.chain().any(|c| {
+                    matches!(
+                        c.downcast_ref::<pb_exchange_bybit::ExchangeError>(),
+                        Some(pb_exchange_bybit::ExchangeError::RateLimited { .. })
+                    )
+                });
+                tracing::error!(error = %e, rate_limited, "[error] operation=run_execution_loop action=record_error_restart_backoff cycle=abandoned");
+                if let Err(e) = executor.note_error(now) {
+                    tracing::error!(error = %e, "restart requested");
+                    return BotExit::Restart(e.to_string());
+                }
+                if !args.once {
+                    let backoff = if rate_limited { 5.0 } else { 1.0 };
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(backoff)).await;
                 }
             }
         }
         if args.once {
-            return Ok(());
+            return BotExit::Stop;
         }
         tokio::select! {
             _ = tokio::time::sleep(runner.sleep_between_cycles()) => {}
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutdown requested");
-                return Ok(());
+                return BotExit::Stop;
             }
         }
     }

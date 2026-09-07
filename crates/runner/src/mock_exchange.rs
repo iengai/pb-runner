@@ -19,8 +19,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use pb_exchange_bybit::{
-    Balance, Candle, ClosedPnl, ExchangeClient, ExchangeError, Fill, MarginMode, MarketSpec,
-    NewOrder, OpenOrder, OrderResult, Position, PositionSide, Side, Ticker,
+    Balance, CancelAck, Candle, ClosedPnl, ExchangeClient, ExchangeError, Fill, MarginMode,
+    MarketSpec, NewOrder, OpenOrder, OrderResult, Position, PositionSide, Side, Ticker,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1227,9 +1227,10 @@ impl MockExchange {
         }
     }
 
-    /// `create_order` (fake.py:729-822) for one limit order (the runner's
-    /// Bybit client only ever sends `orderType: Limit`, so [`NewOrder`] has
-    /// no type; market orders are reachable only through scenario actions).
+    /// `create_order` (fake.py:729-822): a market order takes the step's
+    /// last price and fills immediately as taker (fake.py:790-808); a limit
+    /// order fills at creation when the step price already crosses it,
+    /// else rests.
     fn create_one(&self, st: &mut State, o: &NewOrder) -> OrderResult<OpenOrder> {
         if !self.scenario.symbols.contains_key(&o.symbol) {
             return Err(ExchangeError::Rejected {
@@ -1265,14 +1266,17 @@ impl MockExchange {
         }
         let order_id = st.next_order_id.to_string();
         st.next_order_id += 1;
+        let market = o.is_market();
+        let last_price = self.step(st).prices[&o.symbol];
         let order = MockOrder {
             id: order_id.clone(),
             symbol: o.symbol.clone(),
-            order_type: "limit".into(),
+            order_type: if market { "market" } else { "limit" }.into(),
             side: o.side,
             pside: o.pside,
             amount: amount_abs,
-            price: o.price,
+            // `price = last_price if order_type == "market" else order_price`
+            price: if market { last_price } else { o.price },
             timestamp_ms: st.now_ms,
             client_order_id: o.client_id.clone(),
             status: "open".into(),
@@ -1280,7 +1284,7 @@ impl MockExchange {
             filled: 0.0,
             remaining: amount_abs,
         };
-        let filled = self.limit_crossed_now(st, &o.symbol, o.side, o.price);
+        let filled = market || self.limit_crossed_now(st, &o.symbol, o.side, o.price);
         self.record(
             st,
             Request::Create {
@@ -1288,7 +1292,7 @@ impl MockExchange {
                 side: o.side,
                 pside: o.pside,
                 amount: amount_abs,
-                price: o.price,
+                price: order.price,
                 reduce_only: o.reduce_only,
                 client_order_id: o.client_id.clone(),
                 order_id,
@@ -1296,7 +1300,9 @@ impl MockExchange {
             },
         );
         let ack = Self::to_open_order(&order);
-        if filled {
+        if market {
+            self.fill_order(st, order, last_price, "taker");
+        } else if filled {
             let price = order.price;
             self.fill_order(st, order, price, "maker");
         } else {
@@ -1307,7 +1313,7 @@ impl MockExchange {
 
     /// `cancel_order` (fake.py:824-842): the order is removed before the
     /// symbol check; unknown ids raise.
-    fn cancel_one(&self, st: &mut State, id: &str, symbol: &str) -> OrderResult<String> {
+    fn cancel_one(&self, st: &mut State, id: &str, symbol: &str) -> OrderResult<CancelAck> {
         let pos = st.open_orders.iter().position(|o| o.id == id);
         self.record(
             st,
@@ -1330,7 +1336,10 @@ impl MockExchange {
                 msg: format!("Fake order {id} belongs to {}, not {symbol}", order.symbol),
             });
         }
-        Ok(id.to_string())
+        Ok(CancelAck {
+            id: id.to_string(),
+            already_gone: false,
+        })
     }
 
     /// Requests recorded so far (`export_request_log`).
@@ -1482,6 +1491,7 @@ impl ExchangeClient for MockExchange {
                 max_leverage: 0.0,
                 maker_fee: m.maker_fee,
                 taker_fee: m.taker_fee,
+                active: true,
             })
             .collect())
     }
@@ -1636,7 +1646,7 @@ impl ExchangeClient for MockExchange {
         orders.iter().map(|o| self.create_one(&mut st, o)).collect()
     }
 
-    async fn cancel_orders(&self, orders: &[(String, String)]) -> Vec<OrderResult<String>> {
+    async fn cancel_orders(&self, orders: &[(String, String)]) -> Vec<OrderResult<CancelAck>> {
         let mut st = self.lock();
         orders
             .iter()
@@ -1676,6 +1686,7 @@ impl ExchangeClient for MockExchange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pb_exchange_bybit::OrderType;
     use serde_json::json;
 
     const T0: u64 = 1_700_000_000_000 / 60_000 * 60_000;
@@ -1721,6 +1732,7 @@ mod tests {
             price,
             reduce_only: ro,
             post_only: false,
+            order_type: OrderType::Limit,
         }
     }
 
@@ -1978,6 +1990,46 @@ mod tests {
         assert!(matches!(acks[0], Err(ExchangeError::Rejected { .. })));
         assert!(matches!(acks[1], Err(ExchangeError::Rejected { .. })));
         assert_eq!(acks[2].as_ref().unwrap().id, "1");
+    }
+
+    #[test]
+    fn market_order_fills_at_the_step_price_as_taker() {
+        // fake.py:790-808: a market order is priced at the step's last price
+        // and filled immediately as taker, whatever price the request carried.
+        let sc = scenario(
+            vec![prices(100.0, 1.0), prices(100.0, 1.0)],
+            json!({"balance": 1000.0}),
+        );
+        let ex = MockExchange::new(sc).unwrap();
+        let mut o = order(
+            "BTC/USDT:USDT",
+            Side::Buy,
+            PositionSide::Long,
+            1.0,
+            90.0,
+            false,
+        );
+        o.order_type = OrderType::Market;
+        let acks = rt(ex.create_orders(&[o]));
+        assert_eq!(acks[0].as_ref().unwrap().price, 100.0);
+        assert!(rt(ex.fetch_open_orders()).unwrap().is_empty());
+        let snap = ex.snapshot();
+        assert_eq!(snap.fills.len(), 1);
+        assert_eq!(
+            (snap.fills[0].price, snap.fills[0].liquidity.as_str()),
+            (100.0, "taker")
+        );
+        assert_eq!(snap.fills[0].fee, 100.0 * 0.0006);
+        assert_eq!(snap.positions[0].2, 1.0);
+        let reqs = ex.requests();
+        let create = reqs
+            .iter()
+            .find(|r| matches!(r.request, Request::Create { .. }))
+            .unwrap();
+        assert!(matches!(
+            &create.request,
+            Request::Create { filled: true, price, .. } if *price == 100.0
+        ));
     }
 
     #[test]

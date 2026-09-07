@@ -93,9 +93,15 @@ fn bool_field(v: &Value, key: &str) -> bool {
 }
 
 /// `/v5/market/instruments-info` (category=linear) -> USDT linear perpetuals
-/// with status `Trading`. Fees are not in this payload; the caller fills the
-/// account's rates (ccxt uses `fetchTradingFee` per symbol; passivbot reads
-/// `markets[symbol]["maker"]` which ccxt seeds with 0.0002 / 0.00055).
+/// of every status; `active` = `status == "Trading"` (ccxt `parseMarket`:
+/// `active = status == 'Trading'`). Non-trading markets are kept because
+/// ccxt keeps them in `markets`, so a position on a delisted/suspended
+/// symbol stays visible to the Python bot with `tradable = false`
+/// (passivbot.py:19903, SNAPSHOT_SPEC 1.3); only the approved-coin
+/// universe requires an active market (`filter_markets`). Fees are not in
+/// this payload; the caller fills the account's rates (ccxt uses
+/// `fetchTradingFee` per symbol; passivbot reads `markets[symbol]["maker"]`
+/// which ccxt seeds with 0.0002 / 0.00055).
 pub fn parse_markets(
     result: &Value,
     maker_fee: f64,
@@ -106,7 +112,7 @@ pub fn parse_markets(
         let settle = m.get("settleCoin").and_then(Value::as_str).unwrap_or("");
         let contract_type = m.get("contractType").and_then(Value::as_str).unwrap_or("");
         let status = m.get("status").and_then(Value::as_str).unwrap_or("");
-        if settle != QUOTE || contract_type != "LinearPerpetual" || status != "Trading" {
+        if settle != QUOTE || contract_type != "LinearPerpetual" {
             continue;
         }
         let base = str_field(m, "baseCoin")?;
@@ -134,6 +140,7 @@ pub fn parse_markets(
             max_leverage: num(lev, "maxLeverage")?,
             maker_fee,
             taker_fee,
+            active: status == "Trading",
         });
     }
     Ok(out)
@@ -497,11 +504,19 @@ mod tests {
             {"symbol":"BTCPERP","baseCoin":"BTC","quoteCoin":"USDC","settleCoin":"USDC","contractType":"LinearPerpetual","status":"Trading",
              "lotSizeFilter":{"qtyStep":"0.001","minOrderQty":"0.001"},"priceFilter":{"tickSize":"0.1"},"leverageFilter":{"maxLeverage":"100"}},
             {"symbol":"BTCUSDT-27DEC24","baseCoin":"BTC","quoteCoin":"USDT","settleCoin":"USDT","contractType":"LinearFutures","status":"Trading",
-             "lotSizeFilter":{"qtyStep":"0.001","minOrderQty":"0.001"},"priceFilter":{"tickSize":"0.1"},"leverageFilter":{"maxLeverage":"100"}}
+             "lotSizeFilter":{"qtyStep":"0.001","minOrderQty":"0.001"},"priceFilter":{"tickSize":"0.1"},"leverageFilter":{"maxLeverage":"100"}},
+            {"symbol":"OLDUSDT","baseCoin":"OLD","quoteCoin":"USDT","settleCoin":"USDT","contractType":"LinearPerpetual","status":"Closed",
+             "lotSizeFilter":{"qtyStep":"1","minOrderQty":"1"},"priceFilter":{"tickSize":"0.001"},"leverageFilter":{"maxLeverage":"25"}}
         ]});
         let m = parse_markets(&r, 0.0002, 0.00055).unwrap();
-        assert_eq!(m.len(), 1);
+        // The delisted perpetual is kept (inactive) so positions on it stay visible.
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            (m[1].symbol.as_str(), m[1].active),
+            ("OLD/USDT:USDT", false)
+        );
         let b = &m[0];
+        assert!(b.active);
         assert_eq!(b.symbol, "BTC/USDT:USDT");
         assert_eq!(
             (

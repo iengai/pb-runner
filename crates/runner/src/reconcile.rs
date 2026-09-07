@@ -795,6 +795,72 @@ mod tests {
     }
 
     #[test]
+    fn market_ideal_never_matches_a_resting_limit_and_bypasses_the_barrier() {
+        // SPEC 2.2: `type` is in the exact key, so a market ideal (which
+        // never rests) is always created; a resting limit order of the same
+        // shape is cancelled. A market panic close bypasses the cancel-first
+        // barrier (2.7); once executed it is gone and the engine stops
+        // emitting it, so nothing is recreated the next cycle.
+        let mut ideal = rec(
+            "A",
+            Side::Sell,
+            PositionSide::Long,
+            5.0,
+            1.0,
+            "close_panic_long",
+            None,
+        );
+        ideal.limit = false;
+        ideal.risk_critical = true;
+        let open = vec![rec(
+            "A",
+            Side::Sell,
+            PositionSide::Long,
+            5.0,
+            1.0,
+            "close_panic_long",
+            Some("1"),
+        )];
+        let plan = reconcile(
+            &[ideal.clone()],
+            &open,
+            &|_, _| PbMode::Panic,
+            &|_| 1.0,
+            &[],
+            0,
+            &params(),
+        );
+        assert_eq!(plan.matched_exact + plan.matched_tolerance, 0);
+        assert_eq!(plan.cancels.len(), 1);
+        assert_eq!(plan.creates.len(), 1);
+        assert!(!plan.creates[0].limit);
+        assert_eq!(plan.deferred_by_barrier, 0);
+        // A market entry (market_orders_allowed) is deferred by the barrier
+        // like any other create; only panic closes bypass.
+        let mut entry = rec(
+            "A",
+            Side::Buy,
+            PositionSide::Long,
+            5.0,
+            1.0,
+            "entry_grid_normal_long",
+            None,
+        );
+        entry.limit = false;
+        let plan = reconcile(
+            &[entry],
+            &open,
+            &|_, _| PbMode::Normal,
+            &|_| 1.0,
+            &[],
+            0,
+            &params(),
+        );
+        assert_eq!(plan.deferred_by_barrier, 1);
+        assert!(plan.creates.is_empty());
+    }
+
+    #[test]
     fn reduce_only_trim() {
         let planned = vec![
             PlannedOrder {

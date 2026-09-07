@@ -8,8 +8,8 @@ pub mod parse;
 pub mod sign;
 
 use crate::{
-    Balance, Candle, ClosedPnl, ExchangeClient, ExchangeError, Fill, MarginMode, MarketSpec,
-    NewOrder, OpenOrder, OrderResult, Position, PositionSide, Side, Ticker,
+    Balance, CancelAck, Candle, ClosedPnl, ExchangeClient, ExchangeError, Fill, MarginMode,
+    MarketSpec, NewOrder, OpenOrder, OrderResult, Position, PositionSide, Side, Ticker,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -39,6 +39,43 @@ const AUTH_CODES: &[&str] = &[
     "10003", "10004", "10005", "10007", "10008", "10009", "10010", "33004",
 ];
 const RATE_LIMIT_CODES: &[&str] = &["10006", "10016", "10018"];
+
+pub const WEEK_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// `exchanges/bybit.py::fetch_fills`: `end_time = exchange_time + 4h` when
+/// no end is given; the loop is bounded to 100 fetches.
+pub const FILLS_END_SLACK_MS: u64 = 4 * 60 * 60 * 1000;
+pub const FILLS_MAX_WINDOWS: usize = 100;
+/// `exchanges/bybit.py::fetch_pnls_sub`: `end_time = exchange_time + 1d`;
+/// at most 52 weekly windows (one year).
+pub const PNL_END_SLACK_MS: u64 = 24 * 60 * 60 * 1000;
+pub const PNL_MAX_WINDOWS: usize = 52;
+
+/// Explicit `[startTime, endTime]` windows of at most 7 days covering
+/// `[start_ms, end_ms]`, newest first, as the Python adapter walks them:
+/// `fetch_fills` (bybit.py:279-308) pages backwards by `endTime` (Bybit
+/// returns `[endTime - 7d, endTime]` when only `endTime` is sent, bybit.py:
+/// 495-500), `fetch_pnls_sub` (bybit.py:200-225) computes
+/// `sts = end - week*i, ets = sts + week, sts = max(sts, start)` and stops
+/// once `sts <= start`. Both are the same arithmetic; the runner sends both
+/// bounds explicitly. Empty windows are walked through (Python's
+/// `fetch_fills` stops at the first empty week, D19), so a lookback with a
+/// quiet recent week still loads completely.
+pub fn weekly_windows(start_ms: u64, end_ms: u64, max_windows: usize) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    if end_ms <= start_ms {
+        return out;
+    }
+    let mut end = end_ms;
+    for _ in 0..max_windows {
+        let start = end.saturating_sub(WEEK_MS).max(start_ms);
+        out.push((start, end));
+        if start <= start_ms {
+            break;
+        }
+        end = start;
+    }
+    out
+}
 
 /// Fee rates ccxt 4.5.66 seeds into `markets[symbol]` for Bybit linear
 /// contracts (`describe().fees`; the Python bot reads `maker`/`taker` from
@@ -80,6 +117,9 @@ pub struct BybitClient {
     ids: RwLock<HashMap<String, String>>,
     /// unified symbol -> market spec (for qty/price formatting).
     markets: RwLock<HashMap<String, MarketSpec>>,
+    /// ccxt `options.enableUnifiedMargin || options.enableUnifiedAccount`
+    /// (`is_unified_enabled`), resolved once from `/v5/user/query-api`.
+    unified: RwLock<Option<bool>>,
 }
 
 fn now_ms() -> u64 {
@@ -146,7 +186,29 @@ impl BybitClient {
             http,
             ids: RwLock::new(HashMap::new()),
             markets: RwLock::new(HashMap::new()),
+            unified: RwLock::new(None),
         })
+    }
+
+    /// ccxt `bybit.is_unified_enabled()`: `GET /v5/user/query-api`,
+    /// `unified == 1 || uta == 1` (`enableUnifiedMargin` / `enableUnifiedAccount`).
+    /// Cached for the life of the client as ccxt caches it in `options`.
+    pub async fn is_unified_account(&self) -> Result<bool, ExchangeError> {
+        if let Some(u) = self.unified.read().ok().and_then(|g| *g) {
+            return Ok(u);
+        }
+        let result = self.private_get("/v5/user/query-api", &[]).await?;
+        let flag = |k: &str| {
+            result.get(k).and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            }) == Some(1)
+        };
+        let unified = flag("unified") || flag("uta");
+        if let Ok(mut g) = self.unified.write() {
+            *g = Some(unified);
+        }
+        Ok(unified)
     }
 
     pub fn config(&self) -> &BybitConfig {
@@ -244,7 +306,11 @@ impl BybitClient {
             self.cfg.recv_window_ms,
             &qs,
         );
-        let url = format!("{}{}?{}", self.cfg.base_url, path, qs);
+        let url = if qs.is_empty() {
+            format!("{}{}", self.cfg.base_url, path)
+        } else {
+            format!("{}{}?{}", self.cfg.base_url, path, qs)
+        };
         let req = self.http.get(url).headers(self.auth_headers(ts, &sig));
         self.send(req).await
     }
@@ -319,20 +385,31 @@ impl BybitClient {
         Ok(pages)
     }
 
+    /// `POST /v5/order/create` body as ccxt `create_order_request` builds it
+    /// from Python's `execute_order` (passivbot.py:22351-22367:
+    /// `type=order["type"]`, `price=order["price"]`, params from
+    /// `exchanges/bybit.py::_build_order_params`: positionIdx, timeInForce,
+    /// orderLinkId). ccxt sends `price` only for limit orders and refuses
+    /// `postOnly` on market orders (`handle_post_only`), so a market order
+    /// goes out as `orderType: Market`, `timeInForce: GTC`, no price.
     fn order_body(&self, o: &NewOrder) -> Result<Value, ExchangeError> {
         let m = self.market(&o.symbol)?;
-        Ok(json!({
+        let market = o.is_market();
+        let mut body = json!({
             "category": "linear",
             "symbol": m.id,
             "side": match o.side { Side::Buy => "Buy", Side::Sell => "Sell" },
-            "orderType": "Limit",
+            "orderType": if market { "Market" } else { "Limit" },
             "qty": parse::fmt_step(o.qty.abs(), m.qty_step),
-            "price": parse::fmt_step(o.price, m.price_step),
-            "timeInForce": if o.post_only { "PostOnly" } else { "GTC" },
+            "timeInForce": if o.post_only && !market { "PostOnly" } else { "GTC" },
             "positionIdx": match o.pside { PositionSide::Long => 1, PositionSide::Short => 2 },
             "reduceOnly": o.reduce_only,
             "orderLinkId": o.client_id,
-        }))
+        });
+        if !market {
+            body["price"] = Value::String(parse::fmt_step(o.price, m.price_step));
+        }
+        Ok(body)
     }
 
     async fn create_one(&self, o: &NewOrder) -> OrderResult<OpenOrder> {
@@ -355,13 +432,21 @@ impl BybitClient {
         })
     }
 
-    async fn cancel_one(&self, id: &str, symbol: &str) -> OrderResult<String> {
+    /// `execute_cancellation` (passivbot.py:22373-22408): an "already gone"
+    /// error is a success carrying the ambiguity marker.
+    async fn cancel_one(&self, id: &str, symbol: &str) -> OrderResult<CancelAck> {
         let body = json!({"category": "linear", "symbol": self.id_of(symbol)?, "orderId": id});
         match self.private_post("/v5/order/cancel", &body).await {
-            Ok(_) => Ok(id.to_string()),
+            Ok(_) => Ok(CancelAck {
+                id: id.to_string(),
+                already_gone: false,
+            }),
             Err(e) if is_already_gone(&e) => {
-                tracing::debug!(order_id = id, %symbol, "cancel: order already gone ({e})");
-                Ok(id.to_string())
+                tracing::info!(order_id = id, %symbol, "[order] cancel skipped: order already gone ({e})");
+                Ok(CancelAck {
+                    id: id.to_string(),
+                    already_gone: true,
+                })
             }
             Err(e) => Err(e),
         }
@@ -504,6 +589,11 @@ impl ExchangeClient for BybitClient {
         Ok(all.into_values().collect())
     }
 
+    /// `exchanges/bybit.py::fetch_fills` (279-308): without `start_time` a
+    /// single `fetch_my_trades()` (Bybit's default window); with it, the
+    /// range `[start, end or now + 4h]` is walked backwards in 7-day
+    /// windows (ccxt `paginate` = `nextPageCursor` inside each window),
+    /// deduplicated by execution id (`fetch_pnls` joins on `execId`).
     async fn fetch_fills(
         &self,
         symbol: Option<&str>,
@@ -517,15 +607,34 @@ impl ExchangeClient for BybitClient {
         if let Some(s) = symbol {
             base.push(("symbol", self.id_of(s)?));
         }
-        if let Some(s) = start_ms {
-            base.push(("startTime", s.to_string()));
-        }
-        if let Some(e) = end_ms {
-            base.push(("endTime", e.to_string()));
-        }
+        let windows: Vec<(Option<u64>, Option<u64>)> = match start_ms {
+            None => vec![(None, end_ms)],
+            Some(start) => {
+                let end = end_ms.unwrap_or_else(|| now_ms() + FILLS_END_SLACK_MS);
+                weekly_windows(start, end, FILLS_MAX_WINDOWS)
+                    .into_iter()
+                    .map(|(s, e)| (Some(s), Some(e)))
+                    .collect()
+            }
+        };
         let mut out = Vec::new();
-        for page in self.paginate("/v5/execution/list", &base, 100).await? {
-            out.extend(parse::parse_fills(&page, &|id| self.symbol_of(id))?);
+        for (ws, we) in windows {
+            let mut params = base.clone();
+            if let Some(s) = ws {
+                params.push(("startTime", s.to_string()));
+            }
+            if let Some(e) = we {
+                params.push(("endTime", e.to_string()));
+            }
+            let mut n = 0usize;
+            for page in self.paginate("/v5/execution/list", &params, 100).await? {
+                let fills = parse::parse_fills(&page, &|id| self.symbol_of(id))?;
+                n += fills.len();
+                out.extend(fills);
+            }
+            if let (Some(s), Some(e)) = (ws, we) {
+                tracing::debug!(start = s, end = e, fills = n, "fetched fills window");
+            }
         }
         let mut seen = std::collections::HashSet::new();
         out.retain(|f| seen.insert(f.id.clone()));
@@ -533,21 +642,41 @@ impl ExchangeClient for BybitClient {
         Ok(out)
     }
 
+    /// `exchanges/bybit.py::fetch_pnls_sub` (200-225): without `start_time`
+    /// one `fetch_pnl` page; with it, explicit 7-day windows from
+    /// `end or now + 1d` back to `start` (at most 52), each cursor-paginated
+    /// (`fetch_pnl`, 227-277), deduplicated by `(orderId, updatedTime)`.
     async fn fetch_closed_pnl(
         &self,
         start_ms: Option<u64>,
         end_ms: Option<u64>,
     ) -> Result<Vec<ClosedPnl>, ExchangeError> {
-        let mut base = vec![("category", "linear".to_string())];
-        if let Some(s) = start_ms {
-            base.push(("startTime", s.to_string()));
-        }
-        if let Some(e) = end_ms {
-            base.push(("endTime", e.to_string()));
-        }
+        let base = vec![("category", "linear".to_string())];
+        let windows: Vec<(Option<u64>, Option<u64>)> = match start_ms {
+            None => vec![(None, end_ms)],
+            Some(start) => {
+                let end = end_ms.unwrap_or_else(|| now_ms() + PNL_END_SLACK_MS);
+                weekly_windows(start, end, PNL_MAX_WINDOWS)
+                    .into_iter()
+                    .map(|(s, e)| (Some(s), Some(e)))
+                    .collect()
+            }
+        };
         let mut out = Vec::new();
-        for page in self.paginate("/v5/position/closed-pnl", &base, 100).await? {
-            out.extend(parse::parse_closed_pnl(&page, &|id| self.symbol_of(id))?);
+        for (ws, we) in windows {
+            let mut params = base.clone();
+            if let Some(s) = ws {
+                params.push(("startTime", s.to_string()));
+            }
+            if let Some(e) = we {
+                params.push(("endTime", e.to_string()));
+            }
+            for page in self
+                .paginate("/v5/position/closed-pnl", &params, 100)
+                .await?
+            {
+                out.extend(parse::parse_closed_pnl(&page, &|id| self.symbol_of(id))?);
+            }
         }
         let mut seen = std::collections::HashSet::new();
         out.retain(|p| seen.insert((p.order_id.clone(), p.timestamp_ms)));
@@ -559,7 +688,7 @@ impl ExchangeClient for BybitClient {
         futures::future::join_all(orders.iter().map(|o| self.create_one(o))).await
     }
 
-    async fn cancel_orders(&self, orders: &[(String, String)]) -> Vec<OrderResult<String>> {
+    async fn cancel_orders(&self, orders: &[(String, String)]) -> Vec<OrderResult<CancelAck>> {
         futures::future::join_all(
             orders
                 .iter()
@@ -568,15 +697,37 @@ impl ExchangeClient for BybitClient {
         .await
     }
 
+    /// `exchanges/bybit.py::update_exchange_config` (584-596): ccxt
+    /// `set_position_mode(True)` = `POST /v5/position/switch-mode`
+    /// `{category: linear, coin: USDT, mode: 3}` (ccxt bybit.py:6801-6836);
+    /// `110025` / "not modified" means already in hedge mode.
     async fn set_hedge_mode(&self) -> Result<(), ExchangeError> {
         let body = json!({"category": "linear", "coin": parse::QUOTE, "mode": 3});
         match self.private_post("/v5/position/switch-mode", &body).await {
             Ok(_) => Ok(()),
-            Err(e) if is_not_modified(&e) => Ok(()),
+            Err(e) if is_not_modified(&e) => {
+                tracing::debug!("[config] hedge mode already set (not modified)");
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
 
+    /// `exchanges/bybit.py::update_exchange_config_by_symbols` (553-582):
+    /// `cca.set_margin_mode(margin_mode, symbol, {"leverage": leverage})`
+    /// tolerating `110026` / "not modified", then
+    /// `cca.set_leverage(leverage, symbol)` tolerating `110043` / "not
+    /// modified"; anything else raises and the symbol is retried later with
+    /// backoff (passivbot.py:10149-10240).
+    ///
+    /// ccxt `set_margin_mode` (bybit.py:6677-6760) branches on
+    /// `is_unified_enabled()`: a unified account gets the account-wide
+    /// `POST /v5/account/set-margin-mode {setMarginMode: REGULAR_MARGIN |
+    /// ISOLATED_MARGIN}` (the `leverage` param is carried along by
+    /// `self.extend(request, params)`); a classic account gets the
+    /// per-symbol `POST /v5/position/switch-isolated`. `set_leverage`
+    /// (6762-6799) is `POST /v5/position/set-leverage` with
+    /// `buyLeverage = sellLeverage = number_to_string(leverage)`.
     async fn configure_symbol(
         &self,
         symbol: &str,
@@ -585,19 +736,34 @@ impl ExchangeClient for BybitClient {
     ) -> Result<(), ExchangeError> {
         let id = self.id_of(symbol)?;
         let lev = format!("{}", leverage as i64);
-        // ccxt `setMarginMode` for a UTA account sets the account-wide mode;
-        // per-symbol `switch-isolated` is the classic-account path. The Python
-        // bot calls set_margin_mode(mode, symbol, {leverage}) then set_leverage.
-        let mode_body = json!({"category": "linear", "symbol": id, "tradeMode": match margin_mode { MarginMode::Cross => 0, MarginMode::Isolated => 1 }, "buyLeverage": lev, "sellLeverage": lev});
-        match self
-            .private_post("/v5/position/switch-isolated", &mode_body)
-            .await
-        {
+        let unified = self.is_unified_account().await?;
+        let (path, mode_body) = if unified {
+            (
+                "/v5/account/set-margin-mode",
+                json!({
+                    "setMarginMode": match margin_mode {
+                        MarginMode::Cross => "REGULAR_MARGIN",
+                        MarginMode::Isolated => "ISOLATED_MARGIN",
+                    },
+                    "leverage": lev,
+                }),
+            )
+        } else {
+            (
+                "/v5/position/switch-isolated",
+                json!({
+                    "category": "linear",
+                    "symbol": id,
+                    "tradeMode": match margin_mode { MarginMode::Cross => 0, MarginMode::Isolated => 1 },
+                    "buyLeverage": lev,
+                    "sellLeverage": lev,
+                }),
+            )
+        };
+        match self.private_post(path, &mode_body).await {
             Ok(_) => {}
-            Err(e) if is_not_modified(&e) => {}
-            // UTA accounts reject switch-isolated (margin mode is account-wide); leverage still applies.
-            Err(ExchangeError::Rejected { code, .. }) if code == "10001" || code == "110032" => {
-                tracing::debug!(%symbol, "switch-isolated not applicable to this account type ({code})");
+            Err(e) if is_not_modified(&e) => {
+                tracing::debug!(%symbol, "margin mode already set (not modified)");
             }
             Err(e) => return Err(e),
         }
@@ -608,7 +774,10 @@ impl ExchangeClient for BybitClient {
             .await
         {
             Ok(_) => Ok(()),
-            Err(e) if is_not_modified(&e) => Ok(()),
+            Err(e) if is_not_modified(&e) => {
+                tracing::debug!(%symbol, "leverage already set (not modified)");
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
@@ -687,6 +856,7 @@ mod tests {
                 max_leverage: 100.0,
                 maker_fee: 0.0002,
                 taker_fee: 0.00055,
+                active: true,
             },
         );
         let o = NewOrder {
@@ -698,6 +868,7 @@ mod tests {
             price: 3814.26,
             reduce_only: false,
             post_only: true,
+            order_type: crate::OrderType::Limit,
         };
         let body = client.order_body(&o).unwrap();
         assert_eq!(
@@ -715,6 +886,63 @@ mod tests {
         assert_eq!(body["timeInForce"], "GTC");
         assert_eq!(body["reduceOnly"], true);
         assert_eq!(body["side"], "Sell");
+        // Market order (engine `execution_type = market`): ccxt sends
+        // `orderType: Market` without `price`, and never `PostOnly`.
+        let market = NewOrder {
+            side: Side::Sell,
+            reduce_only: true,
+            post_only: true,
+            order_type: crate::OrderType::Market,
+            ..sell
+        };
+        let body = client.order_body(&market).unwrap();
+        assert_eq!(
+            body,
+            json!({"category":"linear","symbol":"ETHUSDT","side":"Sell","orderType":"Market","qty":"0.05","timeInForce":"GTC","positionIdx":1,"reduceOnly":true,"orderLinkId":"x-pb-abc"})
+        );
+        assert!(body.get("price").is_none());
+    }
+
+    #[test]
+    fn weekly_windows_walk_the_whole_range_backwards() {
+        let day = 24 * 60 * 60 * 1000u64;
+        let end = 100 * day;
+        // 30 days -> 5 windows of 7 days newest first, the last one clamped.
+        let w = weekly_windows(end - 30 * day, end, FILLS_MAX_WINDOWS);
+        assert_eq!(w.len(), 5);
+        assert_eq!(w[0], (end - 7 * day, end));
+        assert_eq!(w[1], (end - 14 * day, end - 7 * day));
+        assert_eq!(w[4], (end - 30 * day, end - 28 * day));
+        // Contiguous coverage of exactly [start, end].
+        for pair in w.windows(2) {
+            assert_eq!(pair[0].0, pair[1].1);
+        }
+        // Less than a week: one clamped window.
+        assert_eq!(
+            weekly_windows(end - 3 * day, end, FILLS_MAX_WINDOWS),
+            vec![(end - 3 * day, end)]
+        );
+        // Exactly a week: one window, no zero-length tail.
+        assert_eq!(
+            weekly_windows(end - 7 * day, end, FILLS_MAX_WINDOWS),
+            vec![(end - 7 * day, end)]
+        );
+        // Degenerate ranges produce nothing; the cap bounds the walk.
+        assert!(weekly_windows(end, end, FILLS_MAX_WINDOWS).is_empty());
+        assert_eq!(weekly_windows(0, end, 3).len(), 3);
+        // fetch_pnls_sub arithmetic: sts = end - week*i, ets = sts + week, sts = max(sts, start).
+        let start = end - 20 * day;
+        let mut expected = Vec::new();
+        for i in 1..PNL_MAX_WINDOWS as u64 {
+            let sts = end - 7 * day * i;
+            let ets = sts + 7 * day;
+            let sts = sts.max(start);
+            expected.push((sts, ets));
+            if sts <= start {
+                break;
+            }
+        }
+        assert_eq!(weekly_windows(start, end, PNL_MAX_WINDOWS), expected);
     }
 
     #[test]

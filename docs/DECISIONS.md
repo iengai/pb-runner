@@ -547,3 +547,86 @@ now. pbtb-rust routes engine key `7` to the frozen Python image per bot
   bot count after the user reviews the 18 `cap-v712` templates; an
   operational need for the pb-runner contract on v7 bots. The order of
   work if (a) starts is written under PLAN P7.
+
+## D19 (2026-09-08) Pre-live review fixes: fill windows, per-symbol degradation, in-process restart loop, market orders
+
+Context: docs/REVIEW_2026-09-08.md findings 1-8, fixed in one pass against
+`src/exchanges/bybit.py`, `src/passivbot.py` and ccxt `bybit.py` (line
+references in the code). The non-obvious choices:
+
+1. **Fill / closed-pnl windows walk the whole range.** The client sends
+   explicit `[startTime, endTime]` 7-day windows newest-first
+   (`weekly_windows`, the arithmetic of `fetch_pnls_sub` bybit.py:200-225
+   and of Bybit's implicit `[endTime - 7d, endTime]` that `fetch_fills`
+   bybit.py:279-308 relies on). Python's `fetch_fills` stops at the first
+   week that returns no fills, which would truncate a 30-day lookback
+   behind a quiet week; the runner walks every window (5 requests for 30
+   days, bounded like Python at 100 / 52 windows). Verified equal counts
+   on the abot account (1391 fills / 514 closed-pnl rows over 30 days).
+   The incremental refresh refetches from one hour before the last sync
+   (Python's `start_time - 1h` overlap) up to now, every cycle, so it
+   reaches the present on an empty account too; both buffers are pruned to
+   `pnls_max_lookback_days`.
+2. **Missing ticker / market / candles degrade per symbol, not per
+   cycle.** Python raises the whole cycle when any planning ticker is
+   missing (`market_data.py:600-640`) and when the EMA bundle fails for a
+   symbol with a position (`required_ema_can_mark_nontradable` false);
+   for flat candidates it marks the symbol non-tradable and continues. The
+   runner drops a symbol with no ticker / no market / no candles from the
+   cycle (no orders planned, its open orders left alone so they are not
+   cancelled as unwanted), plans the others, and charges the shared error
+   budget once per cycle only when a dropped symbol has a position or open
+   orders -- the case where Python would have aborted the cycle -- so a
+   persistent fault still reaches the restart -> `init_markets` path at
+   Python's pace. A candle refresh failure with cached candles plans on
+   them (Python's candle manager serves its cache); with no candles and
+   exposure the cycle fails as Python's bundle raises. Inactive markets
+   (status != Trading) are kept with `MarketSpec.active = false` and flow
+   into `tradable` (pb:19903); only approved coins require an active market.
+3. **Error budget = one counter, in-process restarts.** Planning failures
+   and write failures feed the same `Executor::note_error`
+   (`restart_bot_on_too_many_errors`, 10 per hour). Hourly market reload
+   failures and dropped-symbol cycles are charged through
+   `LiveRunner::take_budget_errors`. On a trip the process does what
+   Python's `main()` does: tear down, sleep 60 s, rebuild the bot with a
+   fresh budget, count restarts over 24 h, and exit (30) once they exceed
+   `live.max_n_restarts_per_day`. pbtb-rust's task-state-change lambda
+   restarts a task only on a memory-related stop (`exit_code == 137`, not
+   `UserInitiated`; `usecase/reconcile_stopped_task.rs`), so a non-OOM exit
+   leaves the bot stopped until the user starts it -- identical to the
+   Python image, whose process also leaves its loop after the cap. The
+   daily cap is therefore in-process only and not persisted (CONTRACT.md
+   section 2).
+4. **Market orders.** `NewOrder.order_type` carries the engine's
+   execution type; the body is `orderType: Market`, no `price`,
+   `timeInForce: GTC` (ccxt sends `price` only for limit orders and
+   `handle_post_only` refuses `postOnly` on market orders -- with
+   `time_in_force = post_only` Python's ccxt call would raise before the
+   request; the runner sends GTC instead, since a refused panic close is
+   the worse outcome and the guard is ccxt's, not strategy). Reconcile is
+   unchanged: a market ideal never matches a resting order (Python's exact
+   key includes `type`) and, once executed, is not emitted again.
+5. **Lazy per-symbol exchange configuration** (`exchange_config.rs`) as
+   `update_exchange_configs`: only the wave's create symbols, done-set,
+   exponential backoff, rate-limit stop, 0.2 s pause, creates on pending
+   symbols skipped without a budget charge. On a unified account the
+   margin mode goes through the account-wide
+   `/v5/account/set-margin-mode` once per symbol exactly as ccxt's
+   `set_margin_mode` does for Python (tolerating 110026 / not modified);
+   the classic path keeps `switch-isolated`. Hedge mode is asserted at
+   startup and re-asserted hourly regardless of `live.hedge_mode`, as
+   `init_markets` -> `update_exchange_config` -> `set_position_mode(True)`.
+   Margin mode is always cross on Bybit (`_resolve_margin_policy_for_symbol`
+   ignores the `isolated` preference unless the market is isolated-only).
+6. **Ordering of the wave filters.** Python applies the dirty-symbol skip
+   (3.1 step 6) and the exchange-config skip (step 7) before the market
+   snapshot filter, churn admission and create capacity (steps 8-9). The
+   runner's steps 8-9 run inside `plan()` before execution, so steps 6-7
+   are applied by the executor after them: a wave can carry fewer creates
+   than Python's (never more, never different ones), and the difference
+   is re-planned next cycle.
+
+Not fixed (REVIEW finding 8): `normalize_open_order` still derives
+reduce-only from the config's `hedge_mode` rather than the order's
+`positionIdx`; the recent-execution guard still stamps creates with the
+loop-start time.

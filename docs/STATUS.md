@@ -2,6 +2,64 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 (worktree agent) — pre-live review findings 1-8 fixed (fill windows, error budget + in-process restarts, market orders, lazy exchange config, dirty symbols)
+
+**Changed:** `crates/exchange-bybit`: `fetch_fills` / `fetch_closed_pnl`
+walk explicit 7-day `[startTime, endTime]` windows over the whole range
+(`weekly_windows`, bybit.py:200-225 / 279-308 / 495-500), cursor pagination
+per window, dedupe; `NewOrder.order_type` (`OrderType::{Limit,Market}`) and
+`order_body` sends `orderType: Market` without `price`/`PostOnly` as ccxt
+does; `cancel_orders` returns `CancelAck { already_gone }`;
+`configure_symbol` = ccxt `set_margin_mode` (unified account ->
+`/v5/account/set-margin-mode`, detected through `/v5/user/query-api` like
+`is_unified_enabled`; classic -> `switch-isolated`) then `set-leverage`,
+not-modified tolerated; `parse_markets` keeps non-Trading perpetuals with
+`MarketSpec.active = false`. `crates/runner`: new `exchange_config.rs`
+(`update_exchange_configs` port: lazy per create symbol, backoff, rate-limit
+stop, 0.2 s pause, `min(live.leverage, market max)`, cross margin);
+`execute.rs` (dirty symbols from failed/already-gone cancels skip the wave's
+creates, lazy configuration before creates, market order type, one error
+budget `note_error` shared with planning failures, length mismatch no longer
+charged); `live.rs` (hourly `load_markets` + hedge-mode re-assert with
+budget charge on failure, fills/closed-pnl refetched every cycle from an
+hour before the last sync and pruned to the lookback, per-symbol
+degradation: missing ticker / market / candles drop the symbol with its
+open orders untouched, `active` -> `tradable`, approved coins need an active
+market, `configure_exchange` = hedge mode always with `init_markets`' three
+network retries); `main.rs` (Python `main()` lifecycle in-process: budget
+trip or failed warmup -> teardown, 60 s cooldown, fresh bot, exit 30 after
+`max_n_restarts_per_day`; `time_in_force` from `ConfigView`, default GTC);
+`mock_exchange.rs` fills market orders at the step price as taker
+(`fake.py:790-808`); `bin/mockrun.rs` follows. Docs: REVIEW resolutions per
+finding, RECONCILE_SPEC 3.5.1, CONTRACT section 2 (restarts: pbtb-rust only
+relaunches OOM stops), MOCK_EXCHANGE deviation 2, PLAN P4.4/P4.5, D19.
+
+**Verified:** `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets -D warnings`, `cargo test --workspace` (107 tests; new: 2
+exchange-bybit (`weekly_windows`, market order body), 2 exchange_config, 4
+execute, 1 reconcile, 1 mock_exchange). `pb-plancheck` unchanged: public
+grid_v7 600/600 (both artifact dirs), tm 600/600; seeded2 grid_v7, tm, tm8,
+iter7 400/400. `pb-mockrun --diff-inputs` identical requests / open-order
+sets / positions / balances / fill counts on the same six (600/600 x3,
+400/400 x4) and on `.local/fake_v8_fills/grid_v7` 150/150, engine-input
+differences unchanged (only `realized_pnl_cumsum_*`, D17.4). `pb-snapcheck`
+identical on grid_v7, tm, grid_v7_seeded, tm_seeded, grid_v7_forced 30/30
+each. `pb-runner --once` dry run against the abot account: `fill history
+loaded fills=1391 closed_pnl=514 lookback_days=30 oldest_fill_ms=1786318210248
+newest_fill_ms=1788795142014` (the whole 30 days; before the fix only the
+first 7 days loaded), `post_only=false`, cycle planned 4 ideal / 2 cancels
+/ 2 creates, 0 skipped symbols. Python cross-check through ccxt with the
+same key (`fetch_fills` + `fetch_pnls_sub` reproduced): 1391 fills in the
+lookback (1393 with the 1 h overlap), 514 closed-pnl rows, same newest
+fill, 5 `fetch_my_trades` calls.
+
+**Not fixed (REVIEW 8):** `normalize_open_order` reduce-only rule from the
+config's `hedge_mode` instead of the order's positionIdx; recent-execution
+guard stamped at loop start. Both noted in D19.
+
+**Next action:** HSL state machine (parallel worktree, `snapshot.rs`);
+P5.2 shadow run; P6 image build with the new lifecycle.
+
 ## 2026-09-08 (worktree agent) — HSL equity hard stop ported (SNAPSHOT_SPEC 2.3 step 1, D16)
 
 **Changed:** new `crates/runner/src/hsl.rs`: `HslConfig` (`_parse_hsl_config`

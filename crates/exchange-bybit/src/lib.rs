@@ -40,6 +40,19 @@ impl ExchangeError {
             _ => None,
         }
     }
+
+    /// `Passivbot._is_rate_limit_like_exception` (passivbot.py:10247-10251):
+    /// ccxt `RateLimitExceeded`, or a message containing `rate limit`,
+    /// `too many`, `429` or `10006`.
+    pub fn is_rate_limit_like(&self) -> bool {
+        if matches!(self, ExchangeError::RateLimited { .. }) {
+            return true;
+        }
+        let msg = self.to_string().to_ascii_lowercase();
+        ["rate limit", "too many", "429", "10006"]
+            .iter()
+            .any(|t| msg.contains(t))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -96,6 +109,16 @@ pub struct OpenOrder {
     pub created_ms: Option<u64>,
 }
 
+/// Execution type of a new order: the engine's `execution_type`
+/// (`limit` / `market`), passed to the exchange as ccxt `type`
+/// (Python `execute_order`, passivbot.py:22351-22367: `type=order.get("type", "limit")`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderType {
+    Limit,
+    Market,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewOrder {
     pub client_id: String,
@@ -103,9 +126,30 @@ pub struct NewOrder {
     pub side: Side,
     pub pside: PositionSide,
     pub qty: f64,
+    /// Ignored by the exchange for market orders (ccxt only sends `price`
+    /// for limit orders, `bybit.py::create_order_request`).
     pub price: f64,
     pub reduce_only: bool,
+    /// `timeInForce: PostOnly`; never applied to market orders (ccxt
+    /// refuses `postOnly` market orders, `handle_post_only`).
     pub post_only: bool,
+    pub order_type: OrderType,
+}
+
+impl NewOrder {
+    pub fn is_market(&self) -> bool {
+        self.order_type == OrderType::Market
+    }
+}
+
+/// Outcome of one acknowledged cancel. `already_gone` = the exchange said
+/// the order no longer exists (Python `execute_cancellation`'s
+/// `_ambiguous_cancel_success_result`, passivbot.py:22373-22408): the cancel
+/// counts as success but the symbol is marked state-dirty for the wave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelAck {
+    pub id: String,
+    pub already_gone: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -168,6 +212,11 @@ pub struct MarketSpec {
     pub max_leverage: f64,
     pub maker_fee: f64,
     pub taker_fee: f64,
+    /// ccxt `market["active"]` (Bybit: `status == "Trading"`). Inactive
+    /// markets stay listed so that positions and orders on a delisted or
+    /// suspended symbol remain visible; the Python bot reads
+    /// `markets_dict[symbol]["active"]` into `tradable` (passivbot.py:19903).
+    pub active: bool,
 }
 
 /// Per-order outcome of a batch call; order and index match the request.
@@ -191,14 +240,19 @@ pub trait ExchangeClient: Send + Sync {
         since_ms: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Candle>, ExchangeError>;
-    /// Fills between `start_ms` and `end_ms` (inclusive), ascending by time.
+    /// Fills between `start_ms` and `end_ms` (inclusive), ascending by time,
+    /// deduplicated by execution id. With `start_ms` the whole range is
+    /// walked (Bybit returns at most 7 days per request; Python
+    /// `exchanges/bybit.py::fetch_fills` walks backwards by `endTime`).
     async fn fetch_fills(
         &self,
         symbol: Option<&str>,
         start_ms: Option<u64>,
         end_ms: Option<u64>,
     ) -> Result<Vec<Fill>, ExchangeError>;
-    /// Closed-pnl records between `start_ms` and `end_ms`, ascending by time.
+    /// Closed-pnl records between `start_ms` and `end_ms`, ascending by
+    /// time; with `start_ms` the range is walked in 7-day windows (Python
+    /// `fetch_pnls_sub`).
     async fn fetch_closed_pnl(
         &self,
         start_ms: Option<u64>,
@@ -207,11 +261,15 @@ pub trait ExchangeClient: Send + Sync {
     /// One request per order, sent concurrently (Python: `asyncio.gather`).
     async fn create_orders(&self, orders: &[NewOrder]) -> Vec<OrderResult<OpenOrder>>;
     /// Cancel by exchange id; an order that is already gone counts as
-    /// cancelled (Python: `execute_cancellation`).
-    async fn cancel_orders(&self, orders: &[(String, String)]) -> Vec<OrderResult<String>>;
-    /// Hedge mode for the whole linear account (Bybit `switch-mode` 3).
+    /// cancelled with `already_gone` set (Python: `execute_cancellation`).
+    async fn cancel_orders(&self, orders: &[(String, String)]) -> Vec<OrderResult<CancelAck>>;
+    /// Hedge mode for the whole linear account (Bybit `switch-mode` 3;
+    /// Python `update_exchange_config` = ccxt `set_position_mode(True)`),
+    /// "not modified" tolerated.
     async fn set_hedge_mode(&self) -> Result<(), ExchangeError>;
-    /// Margin mode + leverage for one symbol, "already set" responses ignored.
+    /// Margin mode + leverage for one symbol (Python
+    /// `update_exchange_config_by_symbols`: ccxt `set_margin_mode` then
+    /// `set_leverage`), "not modified" responses tolerated.
     async fn configure_symbol(
         &self,
         symbol: &str,

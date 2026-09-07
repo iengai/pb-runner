@@ -764,6 +764,40 @@ What is fatal (stops without restart): malformed Rust output / ideal orders
 (1.5), malformed JSON from Rust, contradictory reducer/priority invariants,
 foreign passivbot orders detected on the account (`rec.py:784`).
 
+### 3.5.1 Port notes (2026-09-08, REVIEW findings 2/4/5/7, D19)
+
+- **Dirty symbols (3.1 step 6 / 3.2).** `ExchangeClient::cancel_orders`
+  returns `CancelAck { id, already_gone }`; `Executor::execute` marks the
+  symbol of every non-acknowledged or already-gone cancel dirty (all cancel
+  symbols on a response length mismatch, which charges nothing) and skips
+  the wave's creates on those symbols (`WaveReport.dirty_symbols`,
+  `skipped_dirty`). The dedicated-protective-market-panic bypass exists
+  only on Python's protective supervisor path (`configure_creations=False`)
+  and is not modelled.
+- **Exchange configuration (3.1 step 7).** `exchange_config.rs` ports
+  `update_exchange_configs` (passivbot.py:10149-10240): lazy per create
+  symbol, done-set, backoff `min(5 * 2**(n-1), 60) + U(0, 0.5)` s, a
+  rate-limit-like failure ends the wave's configuration, 0.2 s pause after
+  a success, creates on pending symbols skipped with no budget charge.
+  Bybit hook (`exchanges/bybit.py:553-582`): ccxt `set_margin_mode` -> on a
+  unified account `POST /v5/account/set-margin-mode` (account-wide, once
+  per symbol as Python does), classic account `switch-isolated`; then
+  `set-leverage` with `min(live.leverage, market max)`; 110026 / 110043 /
+  "not modified" tolerated. Hedge mode (`set_position_mode(True)`) is set
+  at startup and re-asserted with the hourly market reload, always.
+- **Error budget and restart (3.5).** `Executor::note_error` is the single
+  `error_counts` list: one entry per failed write batch, one per failed
+  planning cycle (`_handle_execution_loop_failure`; rate limit -> 5 s
+  back-off, otherwise 1 s), one per failed hourly market reload and one
+  per cycle that had to drop a symbol with exposure (D19 item 2). At 10 per
+  hour the bot is torn down and rebuilt in-process after the 60 s cooldown
+  (`main.rs`), and the process exits 30 once restarts in 24 h exceed
+  `live.max_n_restarts_per_day` (CONTRACT.md section 2 for what ECS does
+  then).
+- **Filter order.** Steps 8-9 run in `LiveRunner::plan`, steps 6-7 in the
+  executor afterwards (D19 item 6): a wave never carries more creates than
+  Python's for the same state.
+
 ### 3.6 State that must persist across cycles (in-process only)
 
 | state | owner | used by |

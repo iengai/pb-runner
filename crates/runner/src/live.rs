@@ -101,7 +101,18 @@ pub struct CyclePlan {
     pub output: OrchestratorOutput,
     pub input: Value,
     pub plan: Plan,
+    /// Universe symbols left out of this cycle (no market, no planning
+    /// ticker, or no candles): no orders planned for them and their open
+    /// orders untouched (D19).
+    pub skipped_symbols: Vec<String>,
 }
+
+/// `init_markets` cadence: "update markets dict once every hour"
+/// (passivbot.py:21665-21675, `maintain_hourly_cycle`).
+pub const MARKETS_RELOAD_INTERVAL_MS: u64 = 60 * 60 * 1000;
+/// Overlap of the incremental fill refetch (`fetch_pnls` keeps fills from
+/// `start_time - 1h`, exchanges/bybit.py:317).
+pub const FILLS_REFETCH_OVERLAP_MS: u64 = 60 * 60 * 1000;
 
 #[derive(Debug, Default)]
 struct CandleBuffer {
@@ -146,6 +157,18 @@ pub struct LiveRunner {
     /// background candle refresh runs, so forager cache-only symbols are
     /// never fetched (`cache_only_never_fetched`, pb:18244-18247).
     harness_secondary_never_fetched: bool,
+    /// `init_markets_last_update_ms`: hourly market reload (SPEC: finding 2).
+    markets_loaded_ms: u64,
+    /// Wall time up to which fills / closed pnl were fetched; the next
+    /// refetch starts an hour earlier (overlap) and always reaches `now`.
+    fills_synced_ms: Option<u64>,
+    /// Whether the hourly reload also re-asserts hedge mode (live mode only;
+    /// Python's `init_markets` always calls `update_exchange_config`).
+    hedge_mode_on_reload: bool,
+    /// Non-fatal failures Python charges to the error budget
+    /// (`restart_bot_on_too_many_errors`): hourly reload failures, cycles
+    /// that had to drop a symbol with exposure. Drained by the loop.
+    pending_budget_errors: usize,
     pub cycles: u64,
 }
 
@@ -196,8 +219,102 @@ impl LiveRunner {
             wall,
             mono,
             harness_secondary_never_fetched: false,
+            markets_loaded_ms: 0,
+            fills_synced_ms: None,
+            hedge_mode_on_reload: false,
+            pending_budget_errors: 0,
             cycles: 0,
         })
+    }
+
+    /// Markets as of the last (re)load; `markets_loaded_ms` changes on every
+    /// reload so the caller can refresh derived state (leverage caps).
+    pub fn markets(&self) -> &BTreeMap<String, MarketSpec> {
+        &self.markets
+    }
+
+    pub fn markets_loaded_ms(&self) -> u64 {
+        self.markets_loaded_ms
+    }
+
+    /// Errors accumulated since the last call that Python would route
+    /// through `restart_bot_on_too_many_errors` without failing the cycle.
+    pub fn take_budget_errors(&mut self) -> usize {
+        std::mem::take(&mut self.pending_budget_errors)
+    }
+
+    /// `live.pnls_max_lookback_days` in ms (template default 30 days).
+    fn lookback_ms(&self) -> u64 {
+        let days = self
+            .cfg
+            .live("pnls_max_lookback_days")
+            .and_then(Value::as_f64)
+            .unwrap_or(30.0);
+        (days * 86_400_000.0) as u64
+    }
+
+    /// `load_markets` into `self.markets` (`init_markets`, passivbot.py:3920-3960:
+    /// at startup and once an hour; on the hourly path a failure is logged,
+    /// charged to the error budget and retried next hour, the previous
+    /// markets stay in use, 21665-21690).
+    pub async fn reload_markets(&mut self, now: u64) -> Result<()> {
+        let markets = self.client.load_markets().await?;
+        self.markets = markets.into_iter().map(|m| (m.symbol.clone(), m)).collect();
+        self.markets_loaded_ms = now;
+        tracing::info!(
+            markets = self.markets.len(),
+            active = self.markets.values().filter(|m| m.active).count(),
+            "markets loaded"
+        );
+        Ok(())
+    }
+
+    async fn maybe_reload_markets(&mut self, now: u64) {
+        if now.saturating_sub(self.markets_loaded_ms) <= MARKETS_RELOAD_INTERVAL_MS {
+            return;
+        }
+        // `init_markets` re-asserts hedge mode before reloading the markets.
+        if self.hedge_mode_on_reload {
+            if let Err(e) = self.set_hedge_mode_with_retries().await {
+                tracing::warn!(error = %e, "[hourly] hedge mode re-assert failed | action=check_error_budget_then_retry");
+                self.pending_budget_errors += 1;
+                self.markets_loaded_ms = now;
+                return;
+            }
+        }
+        match self.reload_markets(now).await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "[hourly] maintenance cycle failed | action=check_error_budget_then_retry");
+                self.pending_budget_errors += 1;
+                // Python stamps `init_markets_last_update_ms` at the start of
+                // `init_markets`, so a failed reload is retried an hour later.
+                self.markets_loaded_ms = now;
+            }
+        }
+    }
+
+    /// `init_markets` (passivbot.py:3925-3940): `update_exchange_config()`
+    /// (= `set_position_mode(True)`) with three attempts on transient
+    /// network errors, sleeping `5 * attempt` seconds between them; any
+    /// other error propagates.
+    async fn set_hedge_mode_with_retries(&self) -> Result<()> {
+        for attempt in 1..=3u64 {
+            match self.client.set_hedge_mode().await {
+                Ok(()) => return Ok(()),
+                Err(e @ ExchangeError::Network(_)) if attempt < 3 => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "[init_markets] update_exchange_config error; retrying in {}s",
+                        5 * attempt
+                    );
+                    tokio::time::sleep(Duration::from_secs(5 * attempt)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        unreachable!("loop returns")
     }
 
     /// Fake-harness compatibility (D17): mark every symbol's candles as never
@@ -255,8 +372,11 @@ impl LiveRunner {
         Ok((m, h))
     }
 
-    /// Symbols the bot may trade: approved coins with a listed market, plus
-    /// anything with a position or open order.
+    /// Symbols the bot may trade (`_build_live_symbol_universe`,
+    /// passivbot.py:16941-16953): approved coins with an active market
+    /// (`filter_markets` keeps only `active` markets in `eligible_symbols`),
+    /// coin overrides, plus anything with a position or open order
+    /// regardless of the market's status.
     fn universe_symbols(
         &self,
         builder: &SnapshotBuilder<'_>,
@@ -264,16 +384,17 @@ impl LiveRunner {
         orders: &[OpenOrder],
     ) -> Vec<String> {
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let listed = |s: &str| self.markets.get(s).is_some_and(|m| m.active);
         for pside in PSIDES {
             for s in builder.approved(pside) {
-                if self.markets.contains_key(s) {
+                if listed(s) {
                     set.insert(s.clone());
                 }
             }
         }
         for coin in self.cfg.override_coins() {
             let s = format!("{coin}/USDT:USDT");
-            if self.markets.contains_key(&s) {
+            if listed(&s) {
                 set.insert(s);
             }
         }
@@ -321,9 +442,8 @@ impl LiveRunner {
 
     /// Startup: markets, warmup lengths, candle history, fill history.
     pub async fn warmup(&mut self) -> Result<Vec<String>> {
-        let markets = self.client.load_markets().await?;
-        self.markets = markets.into_iter().map(|m| (m.symbol.clone(), m)).collect();
-        tracing::info!(markets = self.markets.len(), "markets loaded");
+        let now = (self.wall)();
+        self.reload_markets(now).await?;
         let (symbols, m, h) = {
             let builder = SnapshotBuilder::new(&self.cfg)?;
             let symbols = self.universe_symbols(&builder, &[], &[]);
@@ -342,17 +462,19 @@ impl LiveRunner {
         for s in &symbols {
             self.refresh_candles(s, now).await?;
         }
-        let lookback_days = self
-            .cfg
-            .live("pnls_max_lookback_days")
-            .and_then(Value::as_f64)
-            .unwrap_or(30.0);
-        let since = now.saturating_sub((lookback_days * 86_400_000.0) as u64);
+        // Fill history over `pnls_max_lookback_days`: the client walks the
+        // whole range in 7-day windows (exchanges/bybit.py::fetch_fills /
+        // fetch_pnls_sub), so every day of the lookback is loaded.
+        let since = now.saturating_sub(self.lookback_ms());
         self.fills = self.client.fetch_fills(None, Some(since), None).await?;
         self.closed_pnl = self.client.fetch_closed_pnl(Some(since), None).await?;
+        self.fills_synced_ms = Some(now);
         tracing::info!(
             fills = self.fills.len(),
             closed_pnl = self.closed_pnl.len(),
+            lookback_days = self.lookback_ms() as f64 / 86_400_000.0,
+            oldest_fill_ms = self.fills.first().map(|f| f.timestamp_ms),
+            newest_fill_ms = self.fills.last().map(|f| f.timestamp_ms),
             "fill history loaded"
         );
         if self.hsl.is_some() {
@@ -420,40 +542,39 @@ impl LiveRunner {
         Ok(())
     }
 
-    /// Startup exchange configuration (Python `update_exchange_config*`):
-    /// hedge mode for the account, then margin mode + leverage per symbol.
-    pub async fn configure_exchange(&self, symbols: &[String]) -> Result<()> {
-        let hedge = self
-            .cfg
-            .live("hedge_mode")
-            .map(|v| v.as_bool().unwrap_or(true))
-            .unwrap_or(true);
-        if hedge {
-            self.client.set_hedge_mode().await?;
-        }
-        let leverage = self
-            .cfg
-            .live("leverage")
-            .and_then(Value::as_f64)
-            .unwrap_or(10.0);
-        let margin = match self
-            .cfg
-            .live("margin_mode_preference")
-            .and_then(Value::as_str)
-        {
-            Some("isolated") => pb_exchange_bybit::MarginMode::Isolated,
-            _ => pb_exchange_bybit::MarginMode::Cross,
-        };
-        for s in symbols {
-            self.client.configure_symbol(s, leverage, margin).await?;
-        }
-        tracing::info!(
-            symbols = symbols.len(),
-            leverage,
-            ?margin,
-            hedge,
-            "exchange configured"
-        );
+    /// Startup exchange configuration as `init_markets` does it
+    /// (passivbot.py:3925-3940): hedge mode for the whole account, always
+    /// (`exchanges/bybit.py::update_exchange_config` calls
+    /// `set_position_mode(True)` unconditionally; `live.hedge_mode` only
+    /// shapes the cancel-first barrier scope), retried on network errors.
+    /// Margin mode and leverage are configured lazily per symbol before its
+    /// first create (`exchange_config.rs`, RECONCILE_SPEC 3.1 step 7). Also
+    /// arms the hourly re-assert.
+    pub async fn configure_exchange(&mut self) -> Result<()> {
+        self.set_hedge_mode_with_retries().await?;
+        self.hedge_mode_on_reload = true;
+        tracing::info!("[config] hedge mode set");
+        Ok(())
+    }
+
+    /// Incremental fill / closed-pnl refresh reaching `now`: refetch from an
+    /// hour before the last sync (`fetch_pnls` keeps `>= start_time - 1h`),
+    /// merge by id, then prune both buffers to the lookback (Python's fill
+    /// cache is bounded by `pnls_max_lookback_days`, `fill_cache_age_limit_ms`).
+    async fn refresh_fills(&mut self, now: u64) -> Result<()> {
+        let lookback_start = now.saturating_sub(self.lookback_ms());
+        let since = self
+            .fills_synced_ms
+            .map(|t| t.saturating_sub(FILLS_REFETCH_OVERLAP_MS))
+            .unwrap_or(lookback_start)
+            .max(lookback_start);
+        let new = self.client.fetch_fills(None, Some(since), None).await?;
+        merge_fills(&mut self.fills, new);
+        let new = self.client.fetch_closed_pnl(Some(since), None).await?;
+        merge_closed_pnl(&mut self.closed_pnl, new);
+        self.fills_synced_ms = Some(now);
+        self.fills.retain(|f| f.timestamp_ms >= lookback_start);
+        self.closed_pnl.retain(|p| p.timestamp_ms >= lookback_start);
         Ok(())
     }
 
@@ -462,50 +583,99 @@ impl LiveRunner {
     pub async fn plan(&mut self, recent: &[RecentExecution]) -> Result<CyclePlan> {
         let now = (self.wall)();
         let wall = self.wall.clone();
+        self.maybe_reload_markets(now).await;
         let balance = self.client.fetch_balance().await?;
         let positions = self.client.fetch_positions().await?;
         let orders = self.client.fetch_open_orders().await?;
-        if let Some(last) = self.fills.last().map(|f| f.timestamp_ms) {
-            let new = self.client.fetch_fills(None, Some(last), None).await?;
-            merge_fills(&mut self.fills, new);
-        }
-        if let Some(last) = self.closed_pnl.last().map(|p| p.timestamp_ms) {
-            let new = self.client.fetch_closed_pnl(Some(last), None).await?;
-            for p in new {
-                if !self
-                    .closed_pnl
-                    .iter()
-                    .any(|x| x.order_id == p.order_id && x.timestamp_ms == p.timestamp_ms)
-                {
-                    self.closed_pnl.push(p);
-                }
-            }
-            self.closed_pnl
-                .sort_by_key(|p| (p.timestamp_ms, p.order_id.clone()));
-        }
+        self.refresh_fills(now).await?;
         let symbols = {
             let builder = SnapshotBuilder::new(&self.cfg)?;
             self.universe_symbols(&builder, &positions, &orders)
         };
+        let has_exposure = |symbol: &str| {
+            positions.iter().any(|p| p.symbol == symbol)
+                || orders.iter().any(|o| o.symbol == symbol)
+        };
+        // Per-symbol degradation (D19). Python's candle manager serves the
+        // cached candles when a refresh fails; the EMA bundle then marks a
+        // flat candidate non-tradable and raises for a symbol with exposure
+        // (SNAPSHOT_SPEC 3.6, `required_ema_can_mark_nontradable`). A
+        // symbol with no candles at all after a failed fetch is therefore
+        // skipped when flat and fails the cycle when it has exposure.
+        let mut skipped: Vec<(String, &'static str)> = Vec::new();
         for s in &symbols {
-            self.refresh_candles(s, now).await?;
+            if let Err(e) = self.refresh_candles(s, now).await {
+                let have = self.candles.get(s).is_some_and(|b| !b.m1.is_empty());
+                if have {
+                    tracing::warn!(symbol = %s, error = %e, "[candle] refresh failed; planning on cached candles");
+                } else if has_exposure(s) {
+                    return Err(e.context(format!(
+                        "{s}: candles unavailable for a symbol with exposure"
+                    )));
+                } else {
+                    tracing::warn!(symbol = %s, error = %e, "[candle] refresh failed; symbol skipped this cycle");
+                    skipped.push((s.clone(), "no_candles"));
+                }
+            }
         }
         // Planning market snapshots (`get_orchestrator_market_snapshots`):
         // cached tickers younger than the fetch TTL are reused, the rest
         // come from one bulk `fetch_tickers`; `fetched_ms` is the local
         // receive time and drives the pre-create freshness gate later.
+        // Python raises on any missing symbol (market_data.py:600-640); the
+        // runner drops the symbol from the cycle instead (D19) and charges
+        // the error budget once when it has exposure.
         let client = self.client.clone();
         let fetch = || client.fetch_tickers();
-        let planning: HashMap<String, MarketSnapshot> = self
+        let fetch_ttl = fetch_max_age_ms(LIVE_MARKET_SNAPSHOT_MAX_AGE_MS);
+        let planning: HashMap<String, MarketSnapshot> = match self
             .snapshots
-            .get_snapshots(
-                &fetch,
-                &symbols,
-                fetch_max_age_ms(LIVE_MARKET_SNAPSHOT_MAX_AGE_MS),
-                &*wall,
-            )
+            .get_snapshots(&fetch, &symbols, fetch_ttl, &*wall)
             .await
-            .context("planning market snapshots")?;
+        {
+            Ok(p) => p,
+            Err(crate::market_filter::SnapshotError::Incomplete(missing)) => {
+                let now_after = (self.wall)();
+                let mut p = HashMap::new();
+                for s in &symbols {
+                    if let Some(snap) = self.snapshots.get_cached(s, now_after, fetch_ttl) {
+                        p.insert(s.clone(), snap.clone());
+                    }
+                }
+                for s in missing {
+                    if !skipped.iter().any(|(x, _)| *x == s) {
+                        skipped.push((s, "no_ticker"));
+                    }
+                }
+                p
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context("planning market snapshots")),
+        };
+        for s in &symbols {
+            if !self.markets.contains_key(s) && !skipped.iter().any(|(x, _)| x == s) {
+                skipped.push((s.clone(), "no_market"));
+            }
+        }
+        if !skipped.is_empty() {
+            let exposed: Vec<&String> = skipped
+                .iter()
+                .filter(|(s, _)| has_exposure(s))
+                .map(|(s, _)| s)
+                .collect();
+            tracing::warn!(
+                skipped = ?skipped,
+                with_exposure = ?exposed,
+                "[state] symbols left out of this cycle (no orders planned, open orders untouched)"
+            );
+            if !exposed.is_empty() {
+                self.pending_budget_errors += 1;
+            }
+        }
+        let skipped_set: HashSet<String> = skipped.iter().map(|(s, _)| s.clone()).collect();
+        let symbols: Vec<String> = symbols
+            .into_iter()
+            .filter(|s| !skipped_set.contains(s))
+            .collect();
 
         // Balance hysteresis (SPEC 5.1).
         let raw = balance.total_usdt;
@@ -571,16 +741,11 @@ impl LiveRunner {
             )
         };
         self.prev_hysteresis_balance = snapped;
-        let lookback_days = self
-            .cfg
-            .live("pnls_max_lookback_days")
-            .and_then(Value::as_f64)
-            .unwrap_or(30.0);
         let (cum_max, cum_last) = if builder.uses_realized_pnl()? {
             realized_pnl_cumsum(
                 &self.fills,
                 &self.closed_pnl,
-                now.saturating_sub((lookback_days * 86_400_000.0) as u64),
+                now.saturating_sub(self.lookback_ms()),
             )
         } else {
             (0.0, 0.0)
@@ -685,7 +850,9 @@ impl LiveRunner {
                     maker_fee: m.maker_fee,
                     taker_fee: m.taker_fee,
                 },
-                active: true,
+                // `markets_dict[symbol]["active"]` -> `tradable` (pb:19903):
+                // a position on a delisted market stays visible, non-tradable.
+                active: m.active,
                 bid: t.bid,
                 ask: t.ask,
                 min_cost_price: t.last,
@@ -771,8 +938,11 @@ impl LiveRunner {
         let mono = (self.mono)();
         let risk_pairs = risk_active_pairs(&out, &snap.symbols);
         self.churn.evaluate(&symbols, &mut ideal, &risk_pairs, mono);
+        // Open orders of skipped symbols are not reconciled (they would be
+        // cancelled as unwanted otherwise).
         let open: Vec<OrderRec> = orders
             .iter()
+            .filter(|o| !skipped_set.contains(&o.symbol))
             .map(|o| reconcile::normalize_open_order(o, hedge_mode))
             .collect();
         let pb_modes = &self.pb_modes;
@@ -805,6 +975,7 @@ impl LiveRunner {
             output: out,
             input: snap.input,
             plan,
+            skipped_symbols: skipped.into_iter().map(|(s, _)| s).collect(),
         })
     }
 
@@ -1082,6 +1253,19 @@ fn merge_fills(buf: &mut Vec<Fill>, new: Vec<Fill>) {
         }
     }
     buf.sort_by_key(|f| (f.timestamp_ms, f.id.clone()));
+}
+
+fn merge_closed_pnl(buf: &mut Vec<ClosedPnl>, new: Vec<ClosedPnl>) {
+    let mut keys: std::collections::HashSet<(String, u64)> = buf
+        .iter()
+        .map(|p| (p.order_id.clone(), p.timestamp_ms))
+        .collect();
+    for p in new {
+        if keys.insert((p.order_id.clone(), p.timestamp_ms)) {
+            buf.push(p);
+        }
+    }
+    buf.sort_by_key(|p| (p.timestamp_ms, p.order_id.clone()));
 }
 
 /// Aggregate 1m to 1h when the exchange did not provide hourly candles.
