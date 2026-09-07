@@ -694,3 +694,69 @@ fn merge_fills(buf: &mut Vec<Fill>, new: Vec<Fill>) {
 pub fn hourly_from_minutes(m1: &[Candle]) -> Vec<Candle> {
     aggregate_1h(m1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill(id: &str, order: &str, ts: u64, side: Side, fee: f64) -> Fill {
+        Fill {
+            id: id.into(),
+            order_id: order.into(),
+            client_id: None,
+            symbol: "A/USDT:USDT".into(),
+            side,
+            pside: PositionSide::Long,
+            qty: 1.0,
+            price: 1.0,
+            fee,
+            is_maker: true,
+            timestamp_ms: ts,
+        }
+    }
+
+    #[test]
+    fn realized_pnl_cumsum_attaches_closed_pnl_to_last_fill_and_negates_fees() {
+        let fills = vec![
+            fill("f1", "o1", 100, Side::Buy, 0.1),
+            fill("f2", "o2", 200, Side::Sell, 0.1),
+            fill("f3", "o2", 300, Side::Sell, 0.1),
+        ];
+        let closed = vec![ClosedPnl {
+            order_id: "o2".into(),
+            symbol: "A/USDT:USDT".into(),
+            pside: PositionSide::Long,
+            pnl: 5.0,
+            timestamp_ms: 300,
+        }];
+        // cumsum: -0.1, -0.2, -0.3 + 5 = 4.7 -> max 4.7, last 4.7
+        let (max, last) = realized_pnl_cumsum(&fills, &closed, 0);
+        assert!((last - 4.7).abs() < 1e-12 && (max - 4.7).abs() < 1e-12);
+        // losses only: max clamps at 0
+        let (max, last) = realized_pnl_cumsum(&fills[..1], &[], 0);
+        assert_eq!(max, 0.0);
+        assert!((last + 0.1).abs() < 1e-12);
+        // lookback excludes old fills
+        let (_, last) = realized_pnl_cumsum(&fills, &closed, 250);
+        assert!((last - 4.9).abs() < 1e-12);
+    }
+
+    #[test]
+    fn merge_candles_dedups_and_trims() {
+        let mut buf = vec![
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0, 0.0, 2.0, 0.0],
+        ];
+        merge_candles(
+            &mut buf,
+            vec![
+                [2.0, 0.0, 0.0, 0.0, 2.5, 0.0],
+                [3.0, 0.0, 0.0, 0.0, 3.0, 0.0],
+            ],
+            2,
+        );
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0][4], 2.5);
+        assert_eq!(buf[1][0], 3.0);
+    }
+}
