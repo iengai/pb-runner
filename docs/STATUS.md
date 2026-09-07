@@ -2,6 +2,50 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-07 (session 3, IN PROGRESS) — P2 recordings, P3.1 started
+
+Working notes so a fresh context can resume; finalize at session end.
+
+**Mandate (user, this session):** advance until a pure-Rust bot can be
+deployed on pbtb-rust; open decisions go to a same-tier subagent for review;
+no upstream PR for the rlib plumbing; repo is public and stays so
+(memory: pb-runner-mandate). History was rewritten to remove the company
+account name; origin/master = 26b3789 + this session's commits.
+
+**Done so far:**
+- Recorder patch applied (uncommitted) to `E:\projects\passivbot-rlib-v8.1.0\src\passivbot.py`.
+- Tools: `tools/record_fake_v8.py` (replay scenario + harness driver + MANIFEST,
+  `--seed-positions`), `tools/fake_live_clock.py` (pins all clocks to fake
+  time, ccxt-like `fetch_ohlcv` paging, vectorised candle priming),
+  `tools/select_fixtures.py` (subsample), `tools/make_public_configs.py`
+  -> `tests/fixtures/configs/fake_v8/{grid_v7,tm}.json`. Details and the
+  five pitfalls in RECORDER.md section A. Decision D10 (public configs for
+  committed fixtures; private recordings stay in gitignored `.local/`).
+- Private recordings (600 cycles each, 2025-08-01..10-28 replay, boot day 84):
+  iter7, iter12, tm8 -> diffcheck 1800/1800 ok. Only
+  `entry_initial_normal_long` orders appeared (no fills in 10 h of replay).
+- Detached jobs running (`.local/fake_v8/run_*.sh|log`): public configs
+  (grid_v7, tm; 600 cycles) then seeded batch (grid_v7, tm, iter7, tm8;
+  400 cycles, 2 seeded long positions 2% under water).
+
+**Next:** when jobs finish: diffcheck each set; `select_fixtures.py` public
+sets (stride 20, max 60) + seeded public sets into
+`tests/fixtures/recordings/fake_v8/{grid_v7,tm,grid_v7_seeded,tm_seeded}`;
+diffcheck committed sets; tick P1.2/P2.1/P2.2; commit+push. Then P3.1:
+ccxt HEAD on 2026-09-07 = `11f45ee2bf0d2f809c318761c717415268da27c0`;
+rust/ tree = workspace {ccxt, ccxt-base, ccxt-pro, ccxt-prediction, tests}, 56 MB.
+P3.1 facts: `transpiled-base` compiles all 209 exchanges (no per-exchange
+feature); dev build of ccxt-base+ccxt+ccxt-pro = 7 min 22 s on 32 threads,
+debug target 12 GB, ccxt-base rlib 2.5 GB. Typed Bybit API covers every call
+the Python bot uses (`&mut self`, `crate::Result<T>`; set_leverage /
+set_position_mode / set_margin_mode are untyped core calls; errors carry the
+ccxt kind string). Python-side semantics recorded in PORT_INVENTORY section 3.
+Adjudication A (full ccxt dep) / B (hand-written v5 client) / C (vendored
+bybit slice) delegated to a subagent (brief in scratchpad `p3_brief.md`);
+verdict to be recorded as D11. Detached recording jobs relaunched after a
+process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
+seeded grid_v7, tm, iter7, tm8).
+
 ## 2026-09-07 (session 2) — P1 done except the P2-gated box
 
 **Remote (added later the same day):** `origin` = public repo

@@ -3,7 +3,7 @@ name = "pb-exchange-bybit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Bybit linear-perp adapter for pb-runner: REST + private WS, field mapping, error classification. Backed by the ccxt official Rust port (P3)."
+description = "Bybit v5 USDT-linear adapter for pb-runner: hand-written REST client (D11), field mapping mirroring passivbot's ccxt usage, error classification."
 
 [dependencies]
 serde.workspace = true
@@ -13,3 +13,8 @@ thiserror.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+futures.workspace = true

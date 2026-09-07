@@ -148,3 +148,80 @@ attribute). Nothing in this repo depends on the choice.
   compare field-by-field; this folds into the P4.2 acceptance. Budget
   1-2 days inside P4.
 
+
+## D10 (2026-09-07) Committed fake_v8 fixtures come from public configs; private-config recordings stay local
+
+- The repository is public (`iengai/pb-runner`, user decision 2026-09-07).
+  A recorded `OrchestratorInput` embeds the full per-coin `bot_params`, so a
+  recording made with one of the `strategy_lab` configs would publish the
+  user's optimized strategy parameters. Those configs are gitignored research
+  in the passivbot checkout for the same reason.
+- Therefore the committed set `tests/fixtures/recordings/fake_v8/` is produced
+  from `tests/fixtures/configs/fake_v8/{grid_v7,tm}.json`, derived by
+  `tools/make_public_configs.py` from passivbot's own example configs with
+  upstream default strategy parameters (trailing_grid_v7 with forager on and
+  two `coin_overrides`; trailing_martingale with forager on). Exercised
+  engine paths are the same as for the private configs (same strategy kinds,
+  forager selection, overrides), only the numbers differ.
+- The three private cap1000 configs named in PLAN P2.2 are still recorded
+  (`tools/record_fake_v8.py`, output under the gitignored `.local/`) and
+  diffcheck is run on them before every engine-facing change; results are
+  reported in STATUS, the files are never committed.
+- Supersedes the P2.2 wording "commit them under fake_v8/" for the private
+  configs.
+
+## D11 (2026-09-07) P3.1: hand-written Bybit v5 client; the ccxt Rust port is not used (supersedes D3)
+
+Adjudicated by an independent same-tier review (brief: scratchpad
+`p3_brief.md`; facts in STATUS 2026-09-07 session 3). Verdict B, reasons in
+rank order:
+
+1. `ccxt-base` declares `serde_json = { features = ["preserve_order",
+   "float_roundtrip"] }`. Cargo feature unification would enable
+   `float_roundtrip` for the whole binary, changing how
+   `compute_ideal_orders_json` parses engine input: exactly the artefact D8
+   forbids. A vendored slice would have to fork generated code to remove it.
+2. Parity is weaker than it looks: typed methods take `&mut self` (Python
+   gathers N `create_order` calls on one instance), and the fields the bot
+   actually reads (balance from `info.result.list[0]`, position side from
+   `info.positionIdx`) are raw Bybit payload, not unified fields. A small
+   client reproduces the request shapes line for line from `bybit.ts`.
+3. Transpiled bodies signal errors by `panic!` caught with `catch_unwind`
+   (74 `panic!` in bybit.rs); a `panic = "abort"` release profile would turn
+   every exchange error into process death.
+4. Build cost: 7 min 22 s dev for the three ccxt crates on 32 threads,
+   2.5 GB rlib, 12 GB target, all 209 exchanges compiled (no per-exchange
+   feature); with thin LTO + cgu 1 and two engine lines (D6) this is tens of
+   minutes per PR.
+5. ~10 endpoints / ~600 lines vs 870 KB generated source + 23k-line runtime
+   regenerated daily.
+
+Consequences:
+- `crates/exchange-bybit` implements Bybit v5 (`category=linear`) directly:
+  public `GET /v5/market/instruments-info`, `/v5/market/tickers`,
+  `/v5/market/kline`; private (HMAC-SHA256 over
+  `timestamp + apiKey + recvWindow + query|body`) `GET /v5/account/wallet-balance`
+  (`accountType=UNIFIED`), `GET /v5/position/list`, `GET /v5/order/realtime`,
+  `POST /v5/order/create`, `POST /v5/order/cancel`,
+  `POST /v5/position/set-leverage`, `POST /v5/position/switch-mode`,
+  `POST /v5/position/switch-isolated`; for P4.1 fills
+  `GET /v5/execution/list`, `GET /v5/position/closed-pnl`.
+- Behaviours reproduced verbatim from ccxt/the Python adapter (list in
+  PORT_INVENTORY section 3 and the verdict): unified symbol mapping
+  `BASE/USDT:USDT` <-> `BASEUSDT` (linear USDT-settled only), market fields
+  (`qtyStep`, `tickSize`, `minOrderQty`, `minNotionalValue`, `maxLeverage`,
+  contract size 1), UTA balance formula, `positionIdx` side mapping, ignored
+  error codes 110025/110026/110043, "already gone" cancel codes (110001 and
+  message patterns), order params (`positionIdx`, `timeInForce`
+  `PostOnly|GTC`, `orderLinkId`, `reduceOnly`, `orderType Limit`, qty/price
+  formatted with market precision), cursor pagination limits (200 / 50),
+  kline `limit=1000` with at most 5 forward pages.
+- Numbers are parsed from Bybit's strings with `str::parse::<f64>`
+  (correctly rounded, same as Python `float()`), never via serde_json floats.
+- Private WebSocket (P3.3) starts as REST polling; WS only if measured
+  latency requires it.
+- Reversal condition: ccxt ships per-exchange features, drops
+  `float_roundtrip` from defaults, `&self` typed clients, and a release build
+  under ~5 min incremental in CI; all four together.
+- Parity check for P3.4: record the Python bot's ccxt requests/responses for
+  the read-only abot account and compare against this client's requests.

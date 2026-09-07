@@ -27,6 +27,10 @@ clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
 async-trait = "0.1"
+hmac = "0.12"
+futures = "0.3"
+# rustls so the arm64 image needs no OpenSSL; gzip because Bybit compresses.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "http2"] }
 
 # --- Pinned upstream engines (Phase 1 enables these; see docs/PLAN.md) -------
 # passivbot strategy engine. MUST stay pinned to the tag the live strategies

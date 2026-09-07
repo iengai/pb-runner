@@ -53,6 +53,40 @@ orders/positions/fills (`live/candle_ws.py` for candles). Map each to
 `pb-exchange-bybit::ExchangeClient`; extend the trait only when a call is
 proven necessary.
 
+Semantics observed in v8.1.0 (`exchanges/bybit.py`, `exchanges/ccxt_bot.py`,
+`passivbot.py`), to reproduce in the Rust adapter (P3.2):
+
+- Client config: `apiKey`/`secret` from api-keys.json, `enableRateLimit`,
+  `timeout` 30 s, `options.defaultType = "swap"`; hedge mode via
+  `set_position_mode(True)` once (Bybit error `110025` / "not modified" is
+  ignored). Per symbol: `set_margin_mode(mode, symbol, {leverage})`
+  (ignore `110026`) then `set_leverage(leverage, symbol)` (ignore `110043`).
+- Balance: `fetch_balance()` -> `info.result.list[0]`; if
+  `accountType == "UNIFIED"`: `totalEquity - totalPerpUPL`, else sum over
+  coins with `marginCollateral && collateralSwitch` of
+  `usdValue - unrealisedPnl`; non-UTA falls back to `total[quote]`.
+- Positions: `fetch_positions({limit: 200})` paginated by
+  `info.nextPageCursor` (`{cursor, limit}`), keyed by `symbol + side`;
+  normalized `{symbol, position_side = side.lower(), size = contracts,
+  price = entryPrice}`.
+- Open orders: `fetch_open_orders(symbol=None, limit=50)` paginated the same
+  way, keyed by id, sorted by timestamp; `qty = amount`; position side from
+  `info.positionIdx` (1 long, 2 short, 0 one-way -> derived), else
+  `positionSide`, else error.
+- Tickers: `fetch_tickers()` filtered to known markets; `{bid, ask,
+  last or bid}` with `None -> 0`.
+- 1m candles: `fetch_ohlcv(symbol, "1m", since, limit=1000)`, since rounded
+  down to the minute, at most 5 forward pages (`since = last ts`), dedupe by
+  ts, sorted.
+- Create: one `create_order(symbol, type, side, amount=|qty|, price,
+  params)` per order, all in parallel (`asyncio.gather`); params
+  `{positionIdx: 1|2, timeInForce: "postOnly"|"GTC" (from live.time_in_force),
+  orderLinkId: custom_id}`. Cancel: `cancel_order(id, symbol)` in parallel;
+  Bybit `110001` / "order not exists|too late to cancel|already filled|..."
+  is treated as already gone, not an error.
+- Fills / pnl history: `fetch_my_trades` and `fetch_positions_history` (for
+  the fill-events manager); needed by P4.1 only for realized-pnl lookback.
+
 ## 4. (A) Reused from the engine crate unchanged
 
 `orchestrator.rs` (compute_ideal_orders, forager selection, hysteresis,

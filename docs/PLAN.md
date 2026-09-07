@@ -60,18 +60,37 @@ Effort guesses are for orientation only.
 - [ ] **P2.2** Produce fake-exchange recordings for at least: one
       trailing_grid_v7 config with forager on (cap1000_iter7_highreturn),
       one with coin_overrides (cap1000_iter12_alt_balanced), one
-      trailing_martingale config. Commit them under
-      `tests/fixtures/recordings/fake_v8/`.
+      trailing_martingale config (cap1000_iter8_tm_regime26). Per D10 the
+      private configs are recorded into the gitignored `.local/` only; the
+      committed set under `tests/fixtures/recordings/fake_v8/` is recorded
+      from the public configs in `tests/fixtures/configs/fake_v8/`
+      (trailing_grid_v7 + forager + coin_overrides, trailing_martingale +
+      forager), unseeded and with seeded open positions
+      (`tools/record_fake_v8.py --seed-positions`).
 - [ ] **P2.3** `tools/scrub.py` for real recordings (balance normalisation).
 - [ ] **P2.4** (needs user approval) real-market recordings via a shadow ECS
       task with the patch; keep private; run diffcheck on them.
       - Acceptance for P2: diffcheck 0 failures on both fixture sets.
 
-## P3 — Exchange adapter (Bybit linear, via ccxt Rust port)  ~2-3 days
+## P3 — Exchange adapter (Bybit v5 linear, hand-written; D11)  ~2-3 days
 
-- [ ] **P3.1** Pin a ccxt commit (`git ls-remote https://github.com/ccxt/ccxt HEAD` at the time; record it in CONTRACT.md) and enable the `ccxt`/`ccxt-pro` git deps. Confirm `cargo build` time and binary size; if the `transpiled-base` feature is too heavy, evaluate `--no-default-features` + only the bybit module, or fall back per D3.
-- [ ] **P3.2** Implement `ExchangeClient` for Bybit: markets, balance (UNIFIED), positions (hedge/one-way), open orders, tickers, 1m OHLCV, batch create (postOnly/reduceOnly, client order ids), batch cancel, set leverage. Error classification into `ExchangeError`.
-- [ ] **P3.3** Private WS (orders/positions/executions) via `ccxt-pro` or REST polling fallback with the same interface.
+- [x] **P3.1** Evaluate the ccxt Rust port: pinned candidate
+      `11f45ee2bf0d2f809c318761c717415268da27c0`, measured build cost, API
+      shape, `float_roundtrip` conflict with D8. Verdict (independent review,
+      D11): hand-written client; ccxt deps stay out of `Cargo.toml`.
+- [ ] **P3.2** Implement `ExchangeClient` for Bybit v5 in
+      `crates/exchange-bybit`: instruments-info -> `MarketSpec` (USDT linear
+      only), wallet-balance (UNIFIED formula), position/list (cursor, 200),
+      order/realtime (cursor, 50, `positionIdx` side), tickers, kline 1m
+      (limit 1000, <= 5 pages), order/create (one request per order,
+      `PostOnly|GTC`, `orderLinkId`, `reduceOnly`), order/cancel ("already
+      gone" codes), set-leverage / switch-mode / switch-isolated (ignore
+      110025/110026/110043). HMAC-SHA256 signing, recv_window, numbers parsed
+      from strings. Error classification into `ExchangeError` from `retCode`.
+      - Acceptance: unit tests with recorded JSON fixtures for every parser and
+        signing test vectors; `cargo clippy -D warnings`.
+- [ ] **P3.3** Order/position/fill updates: REST polling (`execution/list`,
+      `closed-pnl` for P4.1 fills). Private WS deferred until a measured need.
 - [ ] **P3.4** Read-only integration test against Bybit using the abot read-only key from the dev box (`E:\projects\passivbot\api-keys.json` entry `415196485`): markets/balance/positions/open orders/tickers/ohlcv. No order placement.
       - Acceptance: test passes; field mapping cross-checked against what `exchanges/bybit.py` produces for the same account (dump both, diff).
 

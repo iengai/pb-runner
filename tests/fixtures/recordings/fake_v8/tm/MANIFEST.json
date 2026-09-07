@@ -1,0 +1,44 @@
+{
+  "producer": "tools/record_fake_v8.py + passivbot src/tools/run_fake_live.py (fake exchange, replay)",
+  "passivbot_commit": "e808cfd33fcd2bc086619cd56131744549161826",
+  "passivbot_describe": "v8.1.0-1-ge808cfd33",
+  "extension_source_fingerprint": "0cf730b52c50b9b640ddaa1118911f63acd5b7334315ef0f4e2c819a154871f1",
+  "python": "E:/projects/passivbot/.venv/Scripts/python.exe",
+  "config_name": "tm",
+  "config_source": "E:\\projects\\pb-runner\\tests\\fixtures\\configs\\fake_v8\\tm.json",
+  "config_source_sha256": "e44d773d92d3359edb45ef003d5fdc16885c3be0645f37a91cb0c345773d92f1",
+  "config_overrides": {
+    "live.minimum_coin_age_days": 0,
+    "live.user": "fake_tm"
+  },
+  "scenario": {
+    "coins": [
+      "ADA",
+      "BTC",
+      "ETH",
+      "SOL",
+      "XRP"
+    ],
+    "candle_dates": [
+      "2025-08-01",
+      "2025-10-28"
+    ],
+    "boot_index": 120960,
+    "balance": 1000.0,
+    "max_steps": 600,
+    "seeded_positions": []
+  },
+  "calls_recorded": 600,
+  "unique_inputs_kept": 600,
+  "duplicates_dropped": 0,
+  "harness_seconds": 376.9,
+  "recorded_utc": "2026-09-07T13:32:05Z",
+  "selection": {
+    "source_recordings": 600,
+    "transitions_available": 526,
+    "stride": 30,
+    "max": 30,
+    "kept": 30,
+    "kept_transitions": 30
+  }
+}

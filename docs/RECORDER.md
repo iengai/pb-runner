@@ -48,19 +48,63 @@ reports it.
 
 passivbot ships a scenario-driven fake exchange
 (`src/exchanges/fake.py`; selected when the config has
-`live.fake_scenario_path`). Recordings from it contain no real account data
-and may be committed to `tests/fixtures/recordings/`.
+`live.fake_scenario_path`) and a harness that drives the bot through it one
+planning cycle per candle (`src/tools/run_fake_live.py`). Recordings from it
+contain no real account data (balance is the scenario's, positions are
+fake fills).
+
+`tools/record_fake_v8.py` (this repo) does the whole thing: builds a
+`replay` scenario for the config's approved coins from the dev box's cached
+Bybit 1m candles (`E:\projects\passivbot\historical_data\ohlcvs_bybit`,
+daily `.npy`), writes a config copy with two overrides
+(`live.minimum_coin_age_days = 0`, `live.user = fake_<name>`), runs the
+harness through `tools/fake_live_clock.py`, dedupes identical inputs and
+writes `MANIFEST.json`. `tools/select_fixtures.py` subsamples the result
+(order-set transitions + every n-th cycle) into `tests/fixtures/recordings/fake_v8/<name>/`.
+
+Which configs (D10): the committed set is recorded from the public configs
+in `tests/fixtures/configs/fake_v8/` (`tools/make_public_configs.py`,
+upstream default parameters). The private `strategy_lab` configs are
+recorded the same way into the gitignored `.local/` and only their diffcheck
+result is reported.
 
 ```bash
-cd E:/projects/passivbot
-PB_RUNNER_RECORD_DIR=E:/projects/pb-runner/tests/fixtures/recordings/fake_v8 \
-  .venv/Scripts/python.exe src/main.py <config-with-fake_scenario_path>.json
+python tools/make_public_configs.py --checkout E:/projects/passivbot-rlib-v8.1.0
+python tools/record_fake_v8.py --checkout E:/projects/passivbot-rlib-v8.1.0 \
+  --python E:/projects/passivbot/.venv/Scripts/python.exe \
+  --candles E:/projects/passivbot/historical_data/ohlcvs_bybit \
+  --config grid_v7=tests/fixtures/configs/fake_v8/grid_v7.json \
+  --config tm=tests/fixtures/configs/fake_v8/tm.json \
+  --dates 2025-08-01:2025-10-28 --boot-index 120960 --max-steps 600 --out .local/fake_v8_public
+python tools/select_fixtures.py --src .local/fake_v8_public/grid_v7/recordings \
+  --dst tests/fixtures/recordings/fake_v8/grid_v7 --stride 20 --max 60
+cargo run -p pb-diffcheck --features engine -- --dir tests/fixtures/recordings/fake_v8/grid_v7
 ```
 
-Look at `tests/test_fake_exchange.py` and `tests/fixtures/` in the passivbot
-checkout for scenario file examples. Use a real strategy config
-(e.g. `strategy_lab/configs/cap1000_iter7_highreturn.json`, v8) with the
-fake scenario added.
+Things learned on 2026-09-07 (all handled by the two tools; none of them
+changes tracked passivbot files):
+
+1. **Clock.** The harness redirects `bot.get_exchange_time` and the candle
+   manager's `_now_ms_callback` to scenario time, but `utils.utc_ms` and
+   `candlestick_manager._utc_now_ms` are still wall clock and
+   `get_completed_candle_health` is often called without `now_ms`, so a
+   replay older than the EMA windows is judged stale and every coin becomes
+   non-tradable. `fake_live_clock.py` rebinds those names in every imported
+   module to the fake client's `now_ms`.
+2. **History length.** Hourly EMAs (`volatility_ema_span_hours` = 1467 h in
+   the cap1000 configs) require the full window *before* the boot candle;
+   `warmup_ratio` does not relax this. Use ~89 days of candles with
+   `boot_index` at day 84 (`--dates 2025-08-01:2025-10-28 --boot-index 120960`).
+3. **Fake `fetch_ohlcv` paging.** With `since` + `limit` the fake returns
+   the *newest* `limit` rows, ccxt returns the *oldest*; the manager pages
+   forward, so windows longer than 1000 hourly candles kept a hole at the
+   start. The wrapper restores ccxt semantics.
+4. **Coin age.** `is_old_enough` compares the first replay candle with "now";
+   with the clock pinned that is ~84 days, below `minimum_coin_age_days`
+   (365), hence the config override.
+5. **Speed.** `_prime_fake_candles` rebuilds the 1m array row by row per
+   step; with 120k rows x 10 coins that is >1M Python iterations per cycle.
+   The wrapper swaps in a vectorised version (same output).
 
 ### B. Real market data (local, NOT committable)
 

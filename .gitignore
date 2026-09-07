@@ -11,3 +11,5 @@
 *.log
 /configs/*.json
 api-keys.json
+# local-only working data (fake-exchange runs with private configs)
+/.local/
