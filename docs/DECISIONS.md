@@ -452,3 +452,30 @@ exercise market orders, partial fills, or exchange errors, none of which
 the fake exchange models either. Fills are covered by unit tests and the
 extra `fake_v8_fills` run, not by the six original runs (no price ever
 reached a resting order there).
+
+## D18 (2026-09-08) P7 (v7.12.0 line) deferred: v7 bots stay on the Python image via D12 routing
+
+Adjudicated by a same-tier subagent survey (PORT_INVENTORY section 6, PLAN
+P7 recommendation block). Option (c): do not build the `engine-v7` runner
+now. pbtb-rust routes engine key `7` to the frozen Python image per bot
+(D12), so nothing is blocked; the only measured cost is RSS (~430 MB vs
+~20 MiB per bot).
+
+- Option (b) (v7 configs through the v8 `trailing_grid_v7` compatibility
+  strategy) is not a port under D6: upstream's `docs/v7_to_v8_migration.md`
+  disclaims runtime identity and measured divergence for forager and
+  exposure-enforced configs. It remains a re-validation path that turns a
+  legacy config into an ordinary line-8 bot.
+- Option (a) (full v7 runner line) is feasible: v7.12.0 already has
+  `compute_ideal_orders` with an input schema that is a strict subset of
+  v8's plus two Python-computed unstuck allowances; the rlib plumbing is a
+  verbatim re-apply of e808cfd33; the Bybit adapter and recording tooling
+  are reusable. But EMA/forager loading, mode overrides, the initial-entry
+  distance gate, freshness guardrails and pending-PnL blocking have
+  v7-specific semantics needing their own spec derivation: ~60% of the
+  line-8 P4 effort plus 1-2 weeks of shadow, for a line that gets no new
+  strategies.
+- Revisit triggers: Bybit API drift breaking the frozen v7 image; the v7
+  bot count after the user reviews the 18 `cap-v712` templates; an
+  operational need for the pb-runner contract on v7 bots. The order of
+  work if (a) starts is written under PLAN P7.

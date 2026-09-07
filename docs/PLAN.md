@@ -121,6 +121,50 @@ Effort guesses are for orientation only.
 
 - [ ] Repeat P1-P5 with `engine-v7` (branch `pb-runner/rlib-v7.12.0`), PORT_INVENTORY section 6 filled in first. Recordings from the abot account (read-only key, RECORDER.md option B.2) are the natural real-data source.
 
+**Recommendation (2026-09-08, from the PORT_INVENTORY section 6 survey; not a
+decision until recorded in DECISIONS):** keep the v7 bots on the Python
+image (option c) and do not start P7 until line 8 has passed P5.2/P5.3 and
+the `8rs` rollout (P6); re-evaluate then against three triggers.
+
+Reasons:
+
+1. Option (b), running v7 configs through the v8 engine's `trailing_grid_v7`
+   compatibility strategy, is ruled out as a *port* by D6: upstream itself
+   says the migration "does not promise identical fills or performance
+   across the complete v7 and v8 runtimes" and measured material divergence
+   for forager and exposure-enforced configs (`docs/v7_to_v8_migration.md`
+   at v8.1.0), which is exactly the class of the `cap-v712` templates. It
+   stays available as a *re-validation* path: if the user re-optimises or
+   re-backtests a legacy config on v8 and accepts it, it becomes an ordinary
+   line-8 bot and needs no v7 runner at all.
+2. Option (a) is feasible and mechanically well understood (the v7 engine
+   has the same `compute_ideal_orders` orchestrator, its inputs are a strict
+   subset of v8's plus two Python-computed unstuck allowances, the rlib
+   plumbing is a verbatim re-apply, the Bybit adapter and the recording
+   tooling are reusable), but it is not a copy of line 8: EMA/forager
+   metric loading, mode overrides, the initial-entry distance gate, the
+   freshness guardrails and the pending-PnL block have v7-specific semantics
+   that need their own SNAPSHOT_SPEC/RECONCILE_SPEC derivation, plus the
+   P2 recordings and the P5 shadow wall clock. Estimate ~60% of the line-8
+   P4 effort (about a week of sessions) plus 1-2 weeks of shadow time, for
+   a line that receives no new strategies (D6: "new strategies go to v8").
+3. Option (c) costs nothing now: pbtb-rust already routes engine key `7`
+   to the frozen `passivbot-live:v7.12.0-arm64` image per bot (D12), and
+   the Python bot's only measured disadvantage is RSS (~430 MB vs ~20 MiB).
+
+Triggers to revisit, in order of weight: (i) Bybit API drift breaks the
+frozen v7 Python image (ccxt pinned inside it) — then either (a) or a
+re-validated (b) is forced, and (a) has the advantage that the Rust Bybit
+adapter is the one maintained for line 8; (ii) the number of live v7 bots
+after the user's own review of the 18 `cap-v712` templates (retire the line
+when they are gone or re-validated); (iii) an operational reason to want
+the pb-runner logging/contract on v7 bots (CONTRACT.md). If (a) is started,
+the order is: P1 rlib (half day, PORT_INVENTORY 6.5), line-7 field table
+into a SNAPSHOT_SPEC delta (6.1/6.2), P2 fake-exchange recordings with the
+v7 fake exchange (`src/exchanges/fake.py` exists at the tag) and a
+`synthetic_v7` set from the v7 orchestrator tests, then P4 with the
+`engine-v7` feature gating the line-specific snapshot/reconcile code.
+
 ## Upgrade procedure (engine tag bump)
 
 1. New branch `pb-runner/rlib-<newtag>` in the fork; rebase the rlib plumbing.
