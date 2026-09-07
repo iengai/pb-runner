@@ -45,6 +45,11 @@ Both lines expose `compute_ideal_orders_json` and `orchestrator::OrchestratorInp
   follow the procedure in `docs/PLAN.md` ("Upgrade procedure").
 - GitHub: use `gh auth switch --user iengai` for anything under `iengai/*` or
   upstream PRs; switch back to the machine's default gh account afterwards.
+- Git identity: this project and every sibling repo listed above are
+  private. Commits must be authored as `kk <iamibe.kai@gmail.com>` (the
+  `iengai` identity), never with the machine's global git identity.
+  Set with `git config --local user.name kk` / `user.email
+  iamibe.kai@gmail.com` in any new clone or worktree before committing.
 - AWS: `AWS_PROFILE=dev`; in Git Bash set `MSYS_NO_PATHCONV=1` for `aws logs`.
 - Windows dev box: `cargo` 1.90 on host works for build/test. arm64 images are
   built through pbtb-rust's CodeBuild pipeline (user-triggered), or locally

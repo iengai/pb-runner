@@ -390,7 +390,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "passivbot_rust"
 version = "0.1.0"
-source = "git+https://github.com/iengai/passivbot.git?branch=pb-runner%2Frlib-v8.1.0#52638d38da6de3ea85e3fc22e0512cc2ff6952b6"
+source = "git+https://github.com/iengai/passivbot.git?branch=pb-runner%2Frlib-v8.1.0#e808cfd33fcd2bc086619cd56131744549161826"
 dependencies = [
  "log",
  "memmap",

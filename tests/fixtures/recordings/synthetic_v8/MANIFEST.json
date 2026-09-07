@@ -1,7 +1,7 @@
 {
   "producer": "pytest + pb_recorder_plugin (passivbot's own orchestrator tests)",
-  "passivbot_commit": "52638d38da6de3ea85e3fc22e0512cc2ff6952b6",
-  "passivbot_describe": "v8.1.0-1-g52638d38d",
+  "passivbot_commit": "e808cfd33fcd2bc086619cd56131744549161826",
+  "passivbot_describe": "v8.1.0-1-ge808cfd33",
   "extension_path": "E:\\projects\\passivbot-rlib-v8.1.0\\src\\passivbot_rust.cp312-win_amd64.pyd",
   "runtime_build_info": {
     "crate_version": "0.1.0",

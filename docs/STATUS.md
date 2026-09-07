@@ -5,9 +5,9 @@ Newest entry first. Each entry: what changed, what was verified, next action.
 ## 2026-09-07 (session 2) — P1 done except the P2-gated box
 
 **State:** P1.1 done and pushed (`iengai/passivbot` branch
-`pb-runner/rlib-v8.1.0`, commit `52638d38d` = tag v8.1.0 + build plumbing).
+`pb-runner/rlib-v8.1.0`, commit `e808cfd33` = tag v8.1.0 + build plumbing).
 P1.2 implemented; the `passivbot_rust` git dependency is enabled in
-`Cargo.toml` (locked to `52638d38d`), `diffcheck --features engine` replays
+`Cargo.toml` (locked to `e808cfd33`), `diffcheck --features engine` replays
 recordings. P1.3 decided (D9). 153 synthetic recordings committed under
 `tests/fixtures/recordings/synthetic_v8/` with `MANIFEST.json`.
 

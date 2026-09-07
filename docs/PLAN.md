@@ -15,7 +15,7 @@ Effort guesses are for orientation only.
 
 ## P1 — Engine as a library (line 8)  ~1 day
 
-- [x] **P1.1 rlib branch.** (done 2026-09-07: commit `52638d38d` on
+- [x] **P1.1 rlib branch.** (done 2026-09-07: commit `e808cfd33` on
       `iengai/passivbot`, branch pushed; upstream PR not opened yet.) In the `iengai/passivbot` fork (check it exists:
       `gh repo view iengai/passivbot`; fork if not), branch
       `pb-runner/rlib-v8.1.0` from tag `v8.1.0`. Changes in `passivbot-rust/`:
