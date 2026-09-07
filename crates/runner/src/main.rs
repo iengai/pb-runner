@@ -24,14 +24,15 @@ pub const ENGINE_MAJOR: u32 = 7;
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// passivbot live config (JSON) of the engine line this binary targets
-    config: PathBuf,
+    /// passivbot live config (JSON) of the engine line this binary targets.
+    /// Optional when BUCKET/USER_ID/BOT_ID are set (the config is downloaded).
+    config: Option<PathBuf>,
     /// Validate the config and exit without connecting to the exchange.
     #[arg(long)]
     check_only: bool,
-    /// Plan and log orders every cycle, never send anything (default).
-    #[arg(long, default_value_t = true)]
-    dry_run: bool,
+    /// Send orders. Without this flag the loop only plans and logs (dry run).
+    #[arg(long)]
+    live: bool,
     /// Run a single planning cycle and exit (with --dry-run).
     #[arg(long)]
     once: bool,
@@ -53,7 +54,7 @@ async fn main() -> Result<()> {
         Ok(None) => {}
         Ok(Some(inputs)) => match startup::download(&inputs).await {
             Ok(d) => {
-                args.config = d.config;
+                args.config = Some(d.config);
                 args.api_keys = d.api_keys;
             }
             Err((code, e)) => {
@@ -69,8 +70,12 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
     }
-    let text = std::fs::read_to_string(&args.config)
-        .with_context(|| format!("reading {}", args.config.display()))?;
+    let config_path = args
+        .config
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("config path required (or set BUCKET/USER_ID/BOT_ID)"))?;
+    let text = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
     let cfg = config::LiveConfig::parse(&text, ENGINE_MAJOR)?;
     tracing::info!(
         engine_line = cfg.engine_major,
@@ -117,13 +122,14 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
     let view = ConfigView::new(raw.clone())?;
     let mut runner = LiveRunner::new(view, client.clone())?;
     let symbols = runner.warmup().await?;
-    tracing::info!(?symbols, dry_run = args.dry_run, "warmup complete");
+    let dry_run = !args.live;
+    tracing::info!(?symbols, dry_run, "warmup complete");
     let post_only = raw
         .pointer("/live/time_in_force")
         .and_then(serde_json::Value::as_str)
         .map(|s| s == "post_only")
         .unwrap_or(true);
-    if !args.dry_run {
+    if !dry_run {
         runner.configure_exchange(&symbols).await?;
     }
     let mut executor = Executor::new(client.clone(), post_only);
@@ -145,7 +151,7 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
                     warnings = cycle.output.diagnostics.warnings.len(),
                     "planned"
                 );
-                if args.dry_run {
+                if dry_run {
                     for o in &p.cancels {
                         tracing::info!(symbol = %o.symbol, side = ?o.side, pside = ?o.pside, qty = o.qty, price = o.price, order_type = %o.pb_order_type, "dry-run cancel");
                     }

@@ -112,8 +112,8 @@ Effort guesses are for orientation only.
 
 ## P6 — Image and control-plane integration
 
-- [ ] **P6.1** `docker/Dockerfile`: multi-stage, arm64, static or distroless; measure RSS.
-- [ ] **P6.2** ECR repo + build pipeline (reuse pbtb-rust CodeBuild pattern; user triggers builds).
+- [ ] **P6.1** (2026-09-07: `docker/Dockerfile` = rust:1.95 builder + distroless cc nonroot, engine line via `--build-arg ENGINE`; not built yet: Docker Desktop is not running on the dev box, CodeBuild builds it. RSS unmeasured.) `docker/Dockerfile`: multi-stage, arm64, static or distroless; measure RSS.
+- [ ] **P6.2** (2026-09-07: `deploy/buildspec.yml` written, mirrors pbtb-rust's; ECR repo `pb_runner` added by the pbtb-rust branch of P6.3; CodeBuild project creation and the first build are user actions.) ECR repo + build pipeline (reuse pbtb-rust CodeBuild pattern; user triggers builds).
 - [ ] **P6.3** pbtb-rust: decide D7, add task-def family/families, log groups; PR from account `iengai`.
 - [ ] **P6.4** Verify "write-back: none" assumption in CONTRACT.md.
 

@@ -25,7 +25,7 @@ Reference: `E:\projects\pbtb-rust\deploy\passivbot-image\{Dockerfile.ecs,entrypo
 |---|---|---|
 | Env in | `BUCKET`, `USER_ID`, `BOT_ID` | same |
 | Startup | entrypoint downloads `s3://$BUCKET/$USER_ID/$BOT_ID/$BOT_ID.json` -> `/app/configs/$BOT_ID.json` and `.../api-keys.json` -> `/app/api-keys.json` (uses aws cli in image) | same files, same paths. Download done by the Rust binary itself (aws-sdk-s3) so the image needs no aws cli or shell; env names unchanged |
-| Exec | `python src/main.py configs/$BOT_ID.json` | `pb-runner configs/$BOT_ID.json` |
+| Exec | `python src/main.py configs/$BOT_ID.json` | `pb-runner --live` (config path optional when the env is set: the binary uses the downloaded `configs/$BOT_ID.json`). Without `--live` the container only plans and logs (dry run), which is the shadow-run mode for P5.2. |
 | `api-keys.json` shape | `{ "<live.user>": {"exchange":"bybit","key":"…","secret":"…"}, "referrals": {…} }` | same; runner reads the entry named by `live.user` |
 | Exit codes | 10 missing env, 20/21 download failed, 22 empty file | keep identical |
 | Logs | stdout/stderr -> CloudWatch `/ecs/scalable-cluster-dev/passivbot[-v8]` | stdout JSON lines (tracing), same log-group convention with a `-rs` suffix (P6) |
