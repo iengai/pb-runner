@@ -43,8 +43,13 @@ recordings. P1.3 decided (D9). 153 synthetic recordings committed under
 worktree (apply the RECORDER.md patch to its `src/passivbot.py` locally, or
 reuse the plugin's wrapper), for the three configs named in PLAN P2.2, into
 `tests/fixtures/recordings/fake_v8/`; run diffcheck on them; then tick P1.2
-and P2.2. `strategy_lab/` configs are in the main checkout
-(`E:\projects\passivbot\strategy_lab\configs\`), not in the worktree.
+and P2.2. Probe done: the fake exchange is selected by
+`live.fake_scenario_path` (`src/exchanges/fake.py:196`); scenario examples
+are in `tests/test_run_fake_live.py` and `tests/test_fake_exchange.py`; the
+configs are in the main checkout `E:\projects\passivbot\strategy_lab\configs\`
+(`cap1000_iter7_highreturn.json`, `cap1000_iter12_alt_balanced.json`, and
+`cap1000_iter8_tm_regime26.json` for trailing_martingale), not in the
+worktree.
 
 **Open questions for the user:** unchanged (D7; approval for P2.4 and P5.3).
 Optional: open the upstream PR for the rlib plumbing (P1.1 last bullet).
