@@ -112,9 +112,9 @@ Effort guesses are for orientation only.
 
 ## P6 — Image and control-plane integration
 
-- [ ] **P6.1** (2026-09-07: `docker/Dockerfile` = rust:1.95 builder + distroless cc nonroot, engine line via `--build-arg ENGINE`; not built yet: Docker Desktop is not running on the dev box, CodeBuild builds it. RSS unmeasured.) `docker/Dockerfile`: multi-stage, arm64, static or distroless; measure RSS.
+- [ ] **P6.1** (2026-09-07: `docker/Dockerfile` = rust:1.95 builder + distroless cc nonroot, engine line via `--build-arg ENGINE`; release binary 16.9 MB on Windows x64 (thin LTO, cgu 1); local linux/amd64 image built with the same Dockerfile: 63.2 MB image, 1m49s cold cargo build; dry-run loop against the abot account with the grid_v7 config (10 symbols, 22 cycles) holds at 19-20 MiB RSS via docker stats, vs ~430 MB for the Python bot. Still unverified: the arm64 build itself, which CodeBuild does (P6.2, user-triggered).) `docker/Dockerfile`: multi-stage, arm64, static or distroless; measure RSS.
 - [ ] **P6.2** (2026-09-07: `deploy/buildspec.yml` written, mirrors pbtb-rust's; ECR repo `pb_runner` added by the pbtb-rust branch of P6.3; CodeBuild project creation and the first build are user actions.) ECR repo + build pipeline (reuse pbtb-rust CodeBuild pattern; user triggers builds).
-- [ ] **P6.3** pbtb-rust: decide D7, add task-def family/families, log groups; PR from account `iengai`.
+- [x] **P6.3** (2026-09-07: D7 resolved by D12, option 1. Branch `feat/pb-runner-runtime` on `iengai/pbtb-rust`, PR https://github.com/iengai/pbtb-rust/pull/35: engine keys `<major>[rs]`, bot attribute `runtime`, `/runtime` command, ECR repo `pb-runner`, `8rs` task-def entry commented out until the image exists. Merge, apply and deploy are user actions.) pbtb-rust: decide D7, add task-def family/families, log groups; PR from account `iengai`.
 - [ ] **P6.4** Verify "write-back: none" assumption in CONTRACT.md.
 
 ## P7 — Line 7 (v7.12.0)

@@ -80,9 +80,9 @@ Append-only. A later entry may supersede an earlier one; say so explicitly.
   code is line-agnostic; line-specific parts live behind the same features.
   Do the v8 line first (that is where new strategies go), then v7.
 - pbtb-rust already routes by `config_version` major; the remaining question
-  is how it chooses Python image vs pb-runner image *within* a line (D7, open).
+  is how it chooses Python image vs pb-runner image *within* a line (D7 -> D12).
 
-## D7 (open) Runtime selection in pbtb-rust
+## D7 (open, resolved by D12) Runtime selection in pbtb-rust
 
 Options, to be decided at P6 with the user:
 1. New engine keys in `passivbot_engines` (e.g. `"8rs"`) plus a per-bot
@@ -225,3 +225,39 @@ Consequences:
   under ~5 min incremental in CI; all four together.
 - Parity check for P3.4: record the Python bot's ccxt requests/responses for
   the read-only abot account and compare against this client's requests.
+
+## D12 (2026-09-07) pbtb-rust selects the image per bot: engine key `<major>[rs]` + bot attribute `runtime`
+
+Resolves D7 with option 1. Implemented on `iengai/pbtb-rust` branch
+`feat/pb-runner-runtime` (commit c56f53c; PR from that branch, not merged or
+applied by this repo's sessions).
+
+- Engine table `APP__ECS__TD_PASSIVBOT_BY_ENGINE` keys become
+  `<major>[py|rs]` (`7=arn,8=arn,8rs=arn`). A bare major or `py` is the
+  Python passivbot image; `rs` is the pb-runner image of the same line. Any
+  other suffix fails boot, so a typo can never register a line.
+- The bot row gets an optional string attribute `runtime` (`py`|`rs`); absent
+  reads as `py`, so every existing bot keeps launching exactly as before.
+  Unknown values are a corrupt-record error, not a fallback.
+- Both launchers (Telegram Run and the Lambda auto-restart) resolve on
+  `(config line, bot.runtime)`. A bot set to `rs` whose line has no `rs`
+  image is refused with a user-facing message at `/runtime`, at "Choose
+  config" and at Run; it never silently launches the Python image.
+- Telegram: `/runtime <bot_id> [py|rs]`; State and the `/start` summary show
+  the runtime. Applies on the next Run (same convention as the other per-bot
+  setters); rollback is flipping it back and restarting.
+- Terraform: `passivbot_engines` entries gain `image_repo` (default the
+  passivbot-live repo) and `command` (null keeps the image entrypoint; the
+  `8rs` entry passes `["--live"]` because pb-runner is dry-run by default,
+  CONTRACT.md). New ECR repo `pb-runner` (`module.ecr` key `pb_runner`,
+  `force_delete=false`). The `8rs` tfvars entry stays commented out until the
+  image exists; the task-definition module emits a byte-identical definition
+  for `command=null`, so the existing `7`/`8` families show no diff.
+- Rollout order (RUNBOOK "pb-runner runtime"): build+push image from this
+  repo's CodeBuild project -> uncomment `8rs` -> scoped apply (task def,
+  lambda, telebot base env) -> telebot-deploy (lambda and telebot must both
+  carry the new parser before an `8rs` key appears) -> move one bot with
+  `/runtime <bot_id> rs` + Stop/Run.
+- Why not option 2 (swap the line's image wholesale): no per-bot opt-in, no
+  instant rollback, and the Python and Rust runners would share a task-def
+  family and memory limit although their RSS differs by an order of magnitude.
