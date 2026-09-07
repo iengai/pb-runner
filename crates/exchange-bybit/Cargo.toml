@@ -1,0 +1,15 @@
+[package]
+name = "pb-exchange-bybit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bybit linear-perp adapter for pb-runner: REST + private WS, field mapping, error classification. Backed by the ccxt official Rust port (P3)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true

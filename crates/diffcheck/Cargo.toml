@@ -1,0 +1,20 @@
+[package]
+name = "pb-diffcheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Replays recorded passivbot orchestrator calls through the pinned Rust engine and compares order sets"
+
+[[bin]]
+name = "diffcheck"
+path = "src/main.rs"
+
+[features]
+# Enabled in P1.2 once the rlib branch of passivbot_rust exists.
+engine = []
+
+[dependencies]
+pb-snapshot = { path = "../snapshot" }
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true

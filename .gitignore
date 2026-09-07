@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+# recordings can contain balances/positions of real accounts: keep them local
+/tests/fixtures/recordings/*
+!/tests/fixtures/recordings/.gitkeep
+!/tests/fixtures/recordings/README.md
+/.env
+*.log
+/configs/*.json
+api-keys.json

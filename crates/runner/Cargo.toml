@@ -1,0 +1,28 @@
+[package]
+name = "pb-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust live runner for passivbot strategies (Bybit linear perps): snapshot -> pinned engine -> order reconciliation"
+
+[[bin]]
+name = "pb-runner"
+path = "src/main.rs"
+
+[features]
+# Exactly one engine line is compiled into a given binary/image (docs/DECISIONS.md D6).
+# Both are placeholders until P1.1 wires the git dependencies.
+default = ["engine-v8"]
+engine-v8 = []
+engine-v7 = []
+
+[dependencies]
+pb-snapshot = { path = "../snapshot" }
+pb-exchange-bybit = { path = "../exchange-bybit" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
