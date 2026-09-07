@@ -79,40 +79,49 @@ history; then the entry-cooldown position-delta guard.
 
 ## 2026-09-08 (session 4) — line 8 feature-complete for a shadow/small-capital run; all agent work merged on master
 
-Summary of the day (details in the worktree-agent entries below, newest
-first): churn gate (D13), pre-create market gate + distance filter (D14),
-SNAPSHOT_SPEC 8 gaps except HSL (D15), HSL account-level machine (D16),
-mock exchange + `pb-mockrun` closed loop (D17, P5.1 ticked), P7 survey
-(D18, deferred), pre-live review and its fixes (`docs/REVIEW_2026-09-08.md`,
-D19), candle refetch throttled to bucket boundaries, rate-limit back-off.
-pbtb-rust runtime selection: PR https://github.com/iengai/pbtb-rust/pull/35
-(D12; not merged, nothing applied). P6.4 verified.
+Summary of the day (details in the worktree-agent entries, newest first):
+churn gate (D13), pre-create market gate + distance filter (D14),
+SNAPSHOT_SPEC 8 gaps (D15), HSL account-level machine (D16) and coin mode
+(D20), mock exchange + `pb-mockrun` closed loop (D17, P5.1 ticked), P7
+survey (D18, deferred), two pre-live review passes and their fixes
+(`docs/REVIEW_2026-09-08.md`, D19; second pass: failed creates enter the
+recent-execution guard, an exposed symbol drop fails the cycle, hedge-mode
+retry on rate limits, no barrier bypass for market panic closes), candle
+refetch throttled to bucket boundaries, rate-limit back-off,
+`realized_pnl_cumsum` fee fallback. pbtb-rust runtime selection: PR
+https://github.com/iengai/pbtb-rust/pull/35 (D12; not merged, nothing
+applied). P6.4 verified. Memory note: pushes to `iengai/*` need
+`gh auth switch --user iengai`.
 
-**Verified on master (f48ac39):** `cargo test --workspace` 124; plancheck
-600/600 x2 + 400/400 x4; mockrun identical on those six + fills run
-150/150; snapcheck identical on six fixture sets (grid_v7, tm,
-grid_v7_seeded, tm_seeded, grid_v7_forced 30/30 each, grid_v7_hsl 27/27
+**Verified on master (HEAD of this entry):** `cargo test --workspace` 137;
+plancheck 600/600 x2 + 400/400 x4; mockrun identical in requests, account
+state and engine inputs on those six, fills run 150/150; snapcheck
+identical on seven fixture sets (grid_v7, tm, grid_v7_seeded, tm_seeded,
+grid_v7_forced 30/30 each; grid_v7_hsl 27/27 and grid_v7_hsl_coin 25/25
 with every traced HSL state matching); `pb-runner --once` dry run vs the
 abot account: 1391 fills / 514 closed-pnl rows over 30 days (Python
-cross-check identical), plan in 0.74 s.
+cross-check identical).
 
 **Container soak (dry-run, read-only key, linux/amd64 image, 64 MiB cap):**
-first build 20 min / 257 cycles / 3 rate-limit errors (20 kline requests
-per cycle); after the throttle 2829 cycles over ~2 h, zero errors or
-warnings, RSS 20-23 MiB, planning p50 428 ms / p99 1.9 s / max 4.4 s.
-Restarted on the review-fix image at 17:35 UTC (`pbr-soak`).
+first build 257 cycles / 3 rate-limit errors in 20 min (20 kline requests
+per cycle); after the throttle 2829 cycles over ~2 h with zero errors, RSS
+20-23 MiB, planning p50 428 ms / p99 1.9 s / max 4.4 s; review-fix image
+2062 cycles zero errors, RSS 22-26 MiB. Restarted on the final image of
+the day (`pbr-soak`); check `docker logs pbr-soak` next session.
 
-**Open gaps:** HSL `coin` signal mode (default when HSL is on; refused at
-load per D16 — being ported by a subagent, D20 pending); operator runtime
-forced modes (no source); cached forager-metric fallback (runner skips
-the cycle where Python ranks on stale metrics); `normalize_open_order`
-reduce-only rule from config `hedge_mode` rather than `positionIdx`
-(moot: hedge mode is always asserted now); arm64 image never built
-(CodeBuild, user); live execution never exercised with a trading key.
+**Open gaps (all documented, none blocks a shadow run):** operator runtime
+forced modes (no source in the runner); cached forager-metric fallback
+(runner fails the cycle where Python ranks on stale metrics); HSL
+replay-matrix cache / background replay / latch files (accelerators only);
+`normalize_open_order` reduce-only rule from config `hedge_mode` (moot,
+hedge mode always asserted); arm64 image never built (CodeBuild, user);
+live execution never exercised with a trading key; SIGINT outside the
+sleep windows is swallowed (dev only).
 
-**Next action (autonomous):** merge the coin-mode port; then a long soak of
-the fixed image (>= 24 h) and a second read-only review pass over
-`exchange_config.rs` / restart paths before P5.3.
+**Next action (autonomous):** keep the soak running and read its log at
+the next session start; nothing else in PLAN P1-P6 is doable without the
+user. If new fixtures are wanted: a fake run with a re-entry during an
+HSL cooldown (repanic path is unit-tested only).
 **Needs the user:** merge PR #35 and apply Terraform (ECR repo, later the
 `8rs` task definition); create the pb-runner CodeBuild project and run the
 first arm64 build (P6.2); approve the ECS shadow task (P5.2) and the
