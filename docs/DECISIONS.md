@@ -630,3 +630,112 @@ Not fixed (REVIEW finding 8): `normalize_open_order` still derives
 reduce-only from the config's `hedge_mode` rather than the order's
 `positionIdx`; the recent-execution guard still stamps creates with the
 loop-start time.
+
+## D20 (2026-09-08) HSL coin mode ported in `hsl_coin.rs` (amends D16 item 2): per-pair machine, coin RED supervisor + protective planning per cycle, start-up reconstruction from the fills' panic markers
+
+Facts (`src/passivbot_hsl.py` at e808cfd33, `src/passivbot.py`,
+`passivbot-rust/src/equity_hard_stop_loss.rs`):
+
+- `live.hsl_signal_mode = "coin"` (the default) keeps one
+  `EquityHardStopRuntime` per `(pside, symbol)` (`_hsl_coin_state`,
+  hsl:2460: the account-level state dict plus `pnl_reset_timestamp_ms`) fed
+  with `hsl_coin_drawdown_signal(balance, n_positions, peak_realized,
+  last_realized, upnl)`: `slot_budget = balance / round(n_positions)`,
+  `drawdown_raw = max(0, peak - (last + upnl)) / slot_budget`, synthetic
+  equity `max(1 - drawdown_raw, 1e-12)` against a constant peak of 1. Peak
+  and last realized are the running sum of the pair's `pnl + fee_paid` over
+  the fills at or after `max(ts - lookback, pnl_reset_timestamp_ms)`
+  (hsl:3485); a finalized episode sets `pnl_reset_timestamp_ms = stop_ts + 1`.
+  TWEL is not an input; `_coin_active_pside` only requires the side enabled,
+  `n_positions > 0` and `twel > 0`. Per-coin `hsl_*` values apply only to
+  `coin_overrides` coins (`_equity_hard_stop_config(pside, symbol)`).
+- The account-level state is never fed in coin mode: `_orchestrator_mode_override`
+  step 1, `get_forced_PB_mode(pside)`, `_apply_equity_hard_stop_orange_overlay`
+  and `_refresh_halted_runtime_forced_modes` are no-ops. The pair modes
+  travel through `_runtime_forced_modes[pside][symbol]` (step 3) and the
+  replay-pending set (step 2); the universe and the forager flag are not
+  affected by a red / halted pair.
+- Production red supervision (`_equity_hard_stop_run_coin_red_supervisor`,
+  hsl:8205) loops while a pair needs panic supervision (latched, not halted,
+  and the current sample red or absent; or halted with a repanic reset
+  pending): protective refresh (balance / positions / open orders only),
+  per pair flat -> flatten-fill lookup since `pending_red_since_ms` (the
+  ledger refreshed through `update_pnls` when the fill is missing) ->
+  pending stop event + confirmation, else a sample refresh whose recovery
+  pauses panic (`tp_only_with_active_entry_cancellation`) without ending the
+  episode; two confirmations finalize (halt, cooldown, `graceful_stop`); the
+  remaining pairs are planned with the protective-panic input
+  (`calc_protective_panic_ideal_orders_orchestrator`, pb:16516: target
+  symbols holding a position, `panic` on the target psides, `manual`
+  elsewhere, no EMAs / trailing / fill timestamps, `auto_unstuck_allowed`
+  false, zero realized cumsum), executed without mode filters against the
+  target pairs' open orders, then `execution_delay_seconds` of sleep. The
+  fake harness runs this production loop in coin mode (unlike the unified
+  fake step of D16), all iterations at the same scenario minute.
+- Start-up (`_equity_hard_stop_initialize_coin_from_history`, hsl:5569):
+  `get_balance_equity_history(hsl_replay_signal_mode="coin",
+  hsl_coin_compact_replay=True)` returns the minute grid with per-pair
+  realized / unrealized series and the panic flatten markers (a `panic`
+  fill after which the pair is flat by `compute_psize_pprice`'s fallback --
+  the `final_state=` keyword raises `TypeError`, so a long's psize never
+  returns to zero and a short's stays zero --, by the authoritative flat
+  position, or by the replay slot). Held and ambiguous pairs walk every row,
+  the others the change-point rows (`_hsl_compact_sparse_replay_indices`);
+  a panic marker on a red-confirming row (tier red or score >= red - 1e-12)
+  or a red-seen zero crossing finalizes the episode (halted / cooldown /
+  no-restart), a panic fill inside its cooldown without a reconstructed stop
+  halts by contract (`_equity_hard_stop_infer_coin_replay_contract`), an
+  elapsed cooldown resets, and the present sample can re-activate red. The
+  replay-matrix cache reuse "never becomes authoritative" (hsl:1874): it
+  hands back a history equivalent to the full replay and changes no
+  decision.
+- `_equity_hard_stop_refresh_coin_cooldown_after_repanic` (hsl:4776) is not
+  bound on `Passivbot` in the checkout (the call sites hsl:4958 / hsl:8261
+  would raise `AttributeError` on a repanic reset with the `panic` cooldown
+  policy).
+
+Decision:
+
+1. `hsl_coin.rs` ports the per-pair machine on top of the engine crate:
+   `CoinState` / `CoinMetrics` / `CoinStopEvent`, `HslState::{check_coin,
+   supervise_coin_red, initialize_coin_from_history, coin_panic_pairs,
+   coin_red_active}`, the flatten-fill lookup per pair
+   (`hsl::latest_flatten_fill_timestamp(symbol)`), `CoinEnv` for what the
+   owner supplies (`_calc_upnl_sum_strict`, blocking-order counts, an
+   optional traced realized peak/last), `HslConfig::coin_overrides` /
+   `side_config` / `coin_active_pside`. `HslModes` carries `coin_enabled`,
+   `replay_pending` and `runtime_forced` into `SnapshotBuilder::mode_override`
+   steps 2-3. `HslConfig::from_config` accepts coin mode (D16 item 2
+   lifted); `unified` / `pside` are unchanged.
+2. Start-up reconstruction = `hsl::coin_history` (the timeline replay
+   generalised: minute grid, per-pair series with `NaN` for absent values,
+   panic markers with `psize_after_quirk`) + `initialize_coin_from_history`
+   (dense / sparse rows, `RealizedWindow` = `rolling_realized_at`, contract
+   inference, present sample). No cache, no background replay: the runner
+   replays synchronously at warmup, so `replay_pending` is empty afterwards
+   and step 2 never fires in the runner; it is kept in `HslModes` for the
+   trace replay and for parity of the builder.
+3. `LiveRunner` runs `check_coin` every cycle; when pairs still need panic
+   supervision it runs one `supervise_coin_red` iteration and plans the
+   protective-panic input (`SnapshotBuilder::build_protective`) instead of
+   the normal one: reconciliation limited to the target pairs, no mode
+   filters, `PB_modes` untouched, the cycle sleep standing in for the loop's
+   `execution_delay_seconds`. This is the production shape at the cycle
+   cadence (D16 item 3 stays for the account-level modes). The repanic
+   cooldown refresh is ported as written (hsl:4776) although Python cannot
+   reach it.
+4. Verification (same standard as D16 item 4): `tools/fake_live_clock.py`
+   traces the coin machine (`coin_*` records, RECORDER A), `pb-snapcheck`
+   drives `HslState` with the traced per-pair inputs (realized peak / last,
+   unrealized pnl, blocking counts; the ledger-derived values are
+   cross-checked with the stale-ledger classification, flatten lookups
+   too), recomputes the start-up replay from `fills.json` + candles, asserts
+   every pair state and forced mode after every check / supervisor
+   iteration, and rebuilds the protective recordings with
+   `build_protective` for the traced targets. Fixture `grid_v7_hsl_coin`
+   (config: `grid_v7_hsl` in coin mode with `coin_overrides.BTC` red 0.3).
+5. Not ported: the replay-matrix cache, the background / partial replay
+   (`mark_protective_ready`), latch files and events, operator runtime
+   forced modes (the runner's `runtime_forced` map is written only by the
+   coin machine), coin overrides of `n_positions` (Python reads the global
+   `bot_value`).

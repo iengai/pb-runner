@@ -23,7 +23,14 @@
 //!   the traced Python state after every step, the start-up replay is
 //!   recomputed from `fills.json` + candles, and the derived pnl inputs are
 //!   cross-checked at every check. The mode overrides of each recording then
-//!   come from the Rust machine, not from the trace.
+//!   come from the Rust machine, not from the trace. In coin mode (SPEC 2.3
+//!   steps 2-3, `hsl_coin.rs`, D20) the trace's `coin_*` records drive the
+//!   per-pair machine the same way (the traced per-pair realized peak/last,
+//!   unrealized pnl and blocking-order counts are the inputs; the
+//!   ledger-derived values are cross-checked), the start-up replay is
+//!   recomputed from `fills.json` + candles through `hsl::coin_history`, and
+//!   the protective-panic recordings of the coin RED supervisor are rebuilt
+//!   with `SnapshotBuilder::build_protective` for the traced target pairs.
 //!
 //! Derived fields are compared exactly (Value equality: int vs float kept);
 //! `effective_min_cost` uses the 600 s-TTL cached price the bot had, which is
@@ -39,9 +46,11 @@ use passivbot_rust::types::TrailingPriceBundle;
 use pb_runner::bot_params::ConfigView;
 use pb_runner::emas::Candle;
 use pb_runner::hsl::{
-    balance_equity_timeline, hsl_pnl, pside_index, realized_pnl_now, CycleInputs, FeePolicy,
-    HslConfig, HslFill, HslPosition, HslState, RedObservation, SideState, Supervision, LONG, SHORT,
+    balance_equity_timeline, coin_history, hsl_pnl, latest_flatten_fill_timestamp, pside_index,
+    realized_pnl_now, CycleInputs, FeePolicy, HslConfig, HslFill, HslPosition, HslState,
+    RedObservation, ReplayInputs, SideState, Supervision, LONG, SHORT,
 };
+use pb_runner::hsl_coin::{coin_realized_pnl_peak_last, CoinEnv, CoinInputs, CoinState};
 use pb_runner::jsonexact::parse_exact;
 use pb_runner::snapshot::{
     trailing_bundle, AccountState, CycleState, MarketParams, SideState as SnapSide,
@@ -331,6 +340,9 @@ fn load_fills(path: &Path, fee: &FeePolicy) -> Result<Vec<HslFill>> {
                 increase: (pside == LONG) == (side == "buy"),
                 pnl: num(&f["pnl"]),
                 fee_paid,
+                pb_order_type: pb_runner::reconcile::pb_order_type_from_custom_id(
+                    f["clientOrderId"].as_str().filter(|c| !c.is_empty()),
+                ),
             },
         ));
     }
@@ -691,6 +703,411 @@ fn compare_side(par: &mut Parity, label: &str, py: &Value, rs: &SideState) {
     }
 }
 
+/// Assert one traced Python coin pair state (`_hsl_coin_state_summary`)
+/// against the Rust pair state.
+fn compare_coin_state(par: &mut Parity, label: &str, py: &Value, rs: &CoinState) {
+    let f = |k: &str| py.get(k).and_then(Value::as_f64);
+    let b = |k: &str| py.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let u = |k: &str| py.get(k).and_then(Value::as_u64);
+    let s = |k: &str| py.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    par.eq(
+        &format!("{label}.initialized"),
+        b("initialized"),
+        rs.runtime.initialized(),
+    );
+    par.eq(
+        &format!("{label}.red_latched"),
+        b("red_latched"),
+        rs.runtime.red_latched(),
+    );
+    par.eq(
+        &format!("{label}.red_seen_in_episode"),
+        b("red_seen_in_episode"),
+        rs.runtime.state.red_seen_in_episode,
+    );
+    par.eq(
+        &format!("{label}.tier"),
+        s("tier"),
+        rs.runtime.tier().as_str().to_string(),
+    );
+    par.float(
+        &format!("{label}.peak_strategy_equity"),
+        f("peak_strategy_equity"),
+        rs.runtime.state.peak_strategy_equity,
+    );
+    par.float(
+        &format!("{label}.drawdown_ema"),
+        f("drawdown_ema"),
+        rs.runtime.state.drawdown_ema,
+    );
+    par.float(
+        &format!("{label}.rolling_peak_strategy_equity"),
+        f("rolling_peak_strategy_equity"),
+        rs.runtime.last_rolling_peak,
+    );
+    par.eq(&format!("{label}.halted"), b("halted"), rs.halted);
+    par.eq(
+        &format!("{label}.no_restart_latched"),
+        b("no_restart_latched"),
+        rs.no_restart_latched,
+    );
+    par.float(
+        &format!("{label}.no_restart_peak_strategy_equity"),
+        f("no_restart_peak_strategy_equity"),
+        rs.no_restart_peak_strategy_equity,
+    );
+    par.eq(
+        &format!("{label}.cooldown_until_ms"),
+        u("cooldown_until_ms"),
+        rs.cooldown_until_ms,
+    );
+    par.eq(
+        &format!("{label}.pending_red_since_ms"),
+        u("pending_red_since_ms"),
+        rs.pending_red_since_ms,
+    );
+    par.eq(
+        &format!("{label}.red_flat_confirmations"),
+        u("red_flat_confirmations").unwrap_or(0) as u32,
+        rs.red_flat_confirmations,
+    );
+    par.eq(
+        &format!("{label}.cooldown_intervention_active"),
+        b("cooldown_intervention_active"),
+        rs.cooldown_intervention_active,
+    );
+    par.eq(
+        &format!("{label}.cooldown_repanic_reset_pending"),
+        b("cooldown_repanic_reset_pending"),
+        rs.cooldown_repanic_reset_pending,
+    );
+    par.eq(
+        &format!("{label}.cooldown_repanic_since_ms"),
+        u("cooldown_repanic_since_ms"),
+        rs.cooldown_repanic_since_ms,
+    );
+    par.eq(
+        &format!("{label}.cooldown_unresolved_residue"),
+        b("cooldown_unresolved_residue"),
+        rs.cooldown_unresolved_residue,
+    );
+    par.eq(
+        &format!("{label}.pnl_reset_timestamp_ms"),
+        u("pnl_reset_timestamp_ms"),
+        rs.pnl_reset_timestamp_ms,
+    );
+    let pm = &py["last_metrics"];
+    par.eq(
+        &format!("{label}.last_metrics.some"),
+        !pm.is_null(),
+        rs.last_metrics.is_some(),
+    );
+    if let (false, Some(m)) = (pm.is_null(), &rs.last_metrics) {
+        let l = format!("{label}.last_metrics");
+        let g = |k: &str| pm.get(k).and_then(Value::as_f64);
+        par.eq(
+            &format!("{l}.timestamp_ms"),
+            pm["timestamp_ms"].as_u64(),
+            Some(m.timestamp_ms),
+        );
+        par.float(&format!("{l}.balance"), g("balance"), m.balance);
+        par.float(&format!("{l}.slot_budget"), g("slot_budget"), m.slot_budget);
+        par.float(
+            &format!("{l}.peak_realized_pnl"),
+            g("peak_realized_pnl"),
+            m.peak_realized_pnl,
+        );
+        par.float(
+            &format!("{l}.realized_pnl"),
+            g("realized_pnl"),
+            m.realized_pnl,
+        );
+        par.float(
+            &format!("{l}.unrealized_pnl"),
+            g("unrealized_pnl"),
+            m.unrealized_pnl,
+        );
+        par.float(
+            &format!("{l}.strategy_pnl"),
+            g("strategy_pnl"),
+            m.strategy_pnl,
+        );
+        par.float(
+            &format!("{l}.peak_strategy_pnl"),
+            g("peak_strategy_pnl"),
+            m.peak_strategy_pnl,
+        );
+        par.float(
+            &format!("{l}.strategy_equity"),
+            g("strategy_equity"),
+            m.strategy_equity,
+        );
+        par.float(&format!("{l}.equity"), g("equity"), m.strategy_equity);
+        par.float(
+            &format!("{l}.drawdown_usd"),
+            g("drawdown_usd"),
+            m.drawdown_usd,
+        );
+        par.float(
+            &format!("{l}.drawdown_raw"),
+            g("drawdown_raw"),
+            m.drawdown_raw,
+        );
+        par.float(
+            &format!("{l}.drawdown_ema"),
+            g("drawdown_ema"),
+            m.drawdown_ema,
+        );
+        par.float(
+            &format!("{l}.drawdown_score"),
+            g("drawdown_score"),
+            m.drawdown_score,
+        );
+        par.float(
+            &format!("{l}.red_threshold"),
+            g("red_threshold"),
+            m.red_threshold,
+        );
+        par.eq(
+            &format!("{l}.tier"),
+            pm["tier"].as_str().unwrap_or("").to_string(),
+            m.tier.as_str().to_string(),
+        );
+        par.eq(
+            &format!("{l}.red_active_now"),
+            pm["red_active_now"].as_bool(),
+            Some(m.red_active_now),
+        );
+        par.eq(
+            &format!("{l}.red_seen_in_episode"),
+            pm["red_seen_in_episode"].as_bool(),
+            Some(m.red_seen_in_episode),
+        );
+        par.eq(
+            &format!("{l}.changed"),
+            pm["changed"].as_bool(),
+            Some(m.changed),
+        );
+        par.eq(
+            &format!("{l}.elapsed_minutes"),
+            pm["elapsed_minutes"].as_u64(),
+            Some(m.elapsed_minutes),
+        );
+    }
+    let ps = &py["last_stop_event"];
+    par.eq(
+        &format!("{label}.last_stop_event.some"),
+        !ps.is_null(),
+        rs.last_stop_event.is_some(),
+    );
+    if let (false, Some(e)) = (ps.is_null(), &rs.last_stop_event) {
+        let l = format!("{label}.last_stop_event");
+        let g = |k: &str| ps.get(k).and_then(Value::as_f64);
+        par.eq(
+            &format!("{l}.stop_event_timestamp_ms"),
+            ps["stop_event_timestamp_ms"].as_u64(),
+            Some(e.stop_event_timestamp_ms),
+        );
+        par.eq(
+            &format!("{l}.cooldown_until_ms"),
+            ps["cooldown_until_ms"].as_u64(),
+            e.cooldown_until_ms,
+        );
+        par.eq(
+            &format!("{l}.no_restart_latched"),
+            ps["no_restart_latched"].as_bool(),
+            Some(e.no_restart_latched),
+        );
+        // The contract-reconstructed payload of a halted pair only carries
+        // the fields above (`complete = false`).
+        par.eq(
+            &format!("{l}.complete"),
+            ps.get("strategy_equity").is_some_and(|v| !v.is_null()),
+            e.complete,
+        );
+        if e.complete {
+            par.float(
+                &format!("{l}.strategy_equity"),
+                g("strategy_equity"),
+                e.strategy_equity,
+            );
+            par.float(
+                &format!("{l}.peak_strategy_equity"),
+                g("peak_strategy_equity"),
+                e.peak_strategy_equity,
+            );
+            par.float(
+                &format!("{l}.trigger_peak_strategy_equity"),
+                g("trigger_peak_strategy_equity"),
+                e.trigger_peak_strategy_equity,
+            );
+            par.float(
+                &format!("{l}.drawdown_raw"),
+                g("drawdown_raw"),
+                e.drawdown_raw,
+            );
+            par.float(
+                &format!("{l}.drawdown_ema"),
+                g("drawdown_ema"),
+                e.drawdown_ema,
+            );
+            par.float(
+                &format!("{l}.drawdown_score"),
+                g("drawdown_score"),
+                e.drawdown_score,
+            );
+            par.float(
+                &format!("{l}.no_restart_peak_strategy_equity"),
+                g("no_restart_peak_strategy_equity"),
+                e.no_restart_peak_strategy_equity,
+            );
+            par.float(
+                &format!("{l}.no_restart_drawdown_raw"),
+                g("no_restart_drawdown_raw"),
+                e.no_restart_drawdown_raw,
+            );
+        }
+    }
+    let pp = &py["pending_stop_event"];
+    par.eq(
+        &format!("{label}.pending_stop_event.some"),
+        !pp.is_null(),
+        rs.pending_stop_event.is_some(),
+    );
+    if let (false, Some(e)) = (pp.is_null(), &rs.pending_stop_event) {
+        let l = format!("{label}.pending_stop_event");
+        par.eq(
+            &format!("{l}.stop_event_timestamp_ms"),
+            pp["stop_event_timestamp_ms"].as_u64(),
+            Some(e.stop_event_timestamp_ms),
+        );
+        par.float(
+            &format!("{l}.drawdown_raw"),
+            pp["drawdown_raw"].as_f64(),
+            e.drawdown_raw,
+        );
+        par.float(
+            &format!("{l}.drawdown_ema"),
+            pp["drawdown_ema"].as_f64(),
+            e.drawdown_ema,
+        );
+        par.float(
+            &format!("{l}.strategy_equity"),
+            pp["strategy_equity"].as_f64(),
+            e.strategy_equity,
+        );
+        par.float(
+            &format!("{l}.slot_budget"),
+            pp["slot_budget"].as_f64(),
+            e.slot_budget,
+        );
+    }
+}
+
+/// Every traced pair state (`_hsl_coin_states`) against the Rust pair
+/// states, both ways.
+fn compare_coin_states(par: &mut Parity, label: &str, py: &Value, hsl: &HslState) {
+    for (pside, idx) in [("long", LONG), ("short", SHORT)] {
+        let traced = py.get(pside).and_then(Value::as_object);
+        for (symbol, st) in traced.into_iter().flatten() {
+            match hsl.coin[idx].get(symbol) {
+                Some(rs) => compare_coin_state(par, &format!("{label}.{pside}:{symbol}"), st, rs),
+                None => par.mismatches.push(format!(
+                    "{label}.{pside}:{symbol}: python has a state, rust none"
+                )),
+            }
+        }
+        for symbol in hsl.coin[idx].keys() {
+            if !traced.is_some_and(|t| t.contains_key(symbol)) {
+                par.mismatches.push(format!(
+                    "{label}.{pside}:{symbol}: rust has a state, python none"
+                ));
+            }
+        }
+    }
+}
+
+/// `_hsl_coin_modes`: the runtime forced modes and the replay-pending pairs.
+fn compare_coin_modes(par: &mut Parity, label: &str, py: &Value, hsl: &HslState) {
+    for (pside, idx) in [("long", LONG), ("short", SHORT)] {
+        let traced: BTreeMap<String, String> = py["forced"][pside]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+            .collect();
+        par.eq(
+            &format!("{label}.forced.{pside}"),
+            traced,
+            hsl.runtime_forced[idx].clone(),
+        );
+    }
+    let pending: BTreeSet<(usize, String)> = py["replay_pending"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            Some((
+                pside_index(p.get(0)?.as_str()?),
+                p.get(1)?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    par.eq(
+        &format!("{label}.replay_pending"),
+        pending,
+        hsl.replay_pending.clone(),
+    );
+}
+
+/// The traced per-pair inputs of a coin record (`_hsl_coin_inputs`):
+/// `(pside, symbol) -> (peak_realized, last_realized, unrealized_pnl,
+/// entry_orders, nonpanic_close_orders, reset_ts)`.
+type TracedPairs = BTreeMap<(usize, String), (f64, f64, f64, usize, usize, Option<u64>)>;
+
+fn traced_pairs(ev: &Value) -> TracedPairs {
+    let mut out = TracedPairs::new();
+    for (key, v) in ev["pairs"].as_object().into_iter().flatten() {
+        let Some((pside, symbol)) = key.split_once(':') else {
+            continue;
+        };
+        out.insert(
+            (pside_index(pside), symbol.to_string()),
+            (
+                num(&v["peak_realized"]),
+                num(&v["last_realized"]),
+                num(&v["unrealized_pnl"]),
+                v["entry_orders"].as_u64().unwrap_or(0) as usize,
+                v["nonpanic_close_orders"].as_u64().unwrap_or(0) as usize,
+                v["reset_ts"].as_u64(),
+            ),
+        );
+    }
+    out
+}
+
+fn traced_symbols(ev: &Value) -> BTreeSet<String> {
+    ev["symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str().map(str::to_string))
+        .collect()
+}
+
+fn traced_pairs_list(v: &Value) -> Vec<(usize, String)> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            Some((
+                pside_index(p.get(0)?.as_str()?),
+                p.get(1)?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
 fn compare_states(par: &mut Parity, label: &str, py: &Value, hsl: &HslState) {
     for (pside, idx) in [("long", LONG), ("short", SHORT)] {
         if !hsl.enabled(idx) {
@@ -809,6 +1226,206 @@ impl Checker<'_> {
                 upnl,
             );
         }
+        Ok(())
+    }
+
+    /// Cross-check the traced per-pair coin inputs against the ledger-derived
+    /// realized peak/last (stale-ledger aware) and the step-price unrealized
+    /// pnl.
+    #[allow(clippy::too_many_arguments)]
+    fn check_coin_inputs(
+        &self,
+        par: &mut Parity,
+        label: &str,
+        ts: u64,
+        pairs: &TracedPairs,
+        positions: &[HslPosition],
+        fills_now: &[HslFill],
+        boot_fills: &[HslFill],
+        lookback_ms: Option<u64>,
+        c_mults: &BTreeMap<String, f64>,
+    ) -> Result<()> {
+        for ((pside, symbol), (peak, last, upnl, _, _, reset_ts)) in pairs {
+            let l = format!("{label}.{}:{symbol}", ["long", "short"][*pside]);
+            let (rs_peak, rs_last) =
+                coin_realized_pnl_peak_last(fills_now, *pside, symbol, ts, lookback_ms, *reset_ts);
+            let (boot_peak, boot_last) =
+                coin_realized_pnl_peak_last(boot_fills, *pside, symbol, ts, lookback_ms, *reset_ts);
+            par.float_or_stale(
+                &format!("{l}.peak_realized"),
+                Some(*peak),
+                rs_peak,
+                boot_peak,
+            );
+            par.float_or_stale(
+                &format!("{l}.last_realized"),
+                Some(*last),
+                rs_last,
+                boot_last,
+            );
+            let mut rs_upnl = 0.0;
+            for p in positions
+                .iter()
+                .filter(|p| p.pside == *pside && p.symbol == *symbol)
+            {
+                let price = self
+                    .store
+                    .close_at(coin_of(&p.symbol), ts)
+                    .ok_or_else(|| anyhow!("no step price for {} at {ts}", p.symbol))?;
+                rs_upnl += hsl_pnl(
+                    *pside,
+                    p.price,
+                    price,
+                    p.size,
+                    c_mults.get(&p.symbol).copied().unwrap_or(1.0),
+                );
+            }
+            par.float(&format!("{l}.unrealized_pnl"), Some(*upnl), rs_upnl);
+        }
+        Ok(())
+    }
+
+    /// Rebuild one protective-panic recording of the coin RED supervisor
+    /// (`calc_protective_panic_ideal_orders_orchestrator`): the recorded
+    /// symbols are the target symbols holding a position, `targets` the
+    /// traced `_protective_panic_target_psides_by_symbol`, cross-checked
+    /// against the Rust mode overrides of the recorded position psides.
+    fn run_protective(
+        &mut self,
+        file: &Path,
+        names: Vec<String>,
+        targets: &BTreeMap<String, BTreeSet<String>>,
+        par: &mut Parity,
+    ) -> Result<()> {
+        let rec: Value = parse_exact(&std::fs::read_to_string(file)?)?;
+        let ts = rec["timestamp_ms"].as_u64().unwrap();
+        let n_rec = rec["symbols"].as_array().map_or(0, Vec::len);
+        if names.len() != n_rec {
+            bail!(
+                "{}: {} recorded symbols but the trace names {}",
+                file.display(),
+                n_rec,
+                names.len()
+            );
+        }
+        let rec_idx: BTreeMap<&str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
+        let incumbents: HashSet<(usize, &str)> = ["long", "short"]
+            .iter()
+            .flat_map(|p| {
+                rec["forager_hysteresis"][format!("incumbent_{p}")]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| (v.as_u64().unwrap() as usize, *p))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let builder = SnapshotBuilder::new(self.cfg)?.with_hsl(&self.cycle.hsl);
+        let mut states = Vec::new();
+        let mut derived: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for symbol in &names {
+            let idx = rec_idx[symbol.as_str()];
+            let rs = &rec["symbols"][idx];
+            let ex = &rs["exchange"];
+            let market = MarketParams {
+                qty_step: num(&ex["qty_step"]),
+                price_step: num(&ex["price_step"]),
+                min_qty: num(&ex["min_qty"]),
+                min_cost: num(&ex["min_cost"]),
+                c_mult: num(&ex["c_mult"]),
+                maker_fee: num(&ex["maker_fee"]),
+                taker_fee: num(&ex["taker_fee"]),
+            };
+            let side = |pside: &str| -> SnapSide {
+                let r = &rs[pside];
+                let has_entry = incumbents.contains(&(idx, pside));
+                SnapSide {
+                    position_size: num(&r["position"]["size"]),
+                    position_price: num(&r["position"]["price"]),
+                    has_entry_order: has_entry,
+                    has_open_order: has_entry,
+                    ..SnapSide::default()
+                }
+            };
+            let state = SymbolState {
+                symbol: symbol.clone(),
+                market,
+                active: true,
+                bid: num(&rs["order_book"]["bid"]),
+                ask: num(&rs["order_book"]["ask"]),
+                min_cost_price: num(&rs["order_book"]["bid"]),
+                candles_1m: Vec::new(),
+                candles_1h: None,
+                candles_available: false,
+                long: side("long"),
+                short: side("short"),
+            };
+            for pside in ["long", "short"] {
+                let size = if pside == "long" {
+                    state.long.position_size
+                } else {
+                    state.short.position_size
+                };
+                if size != 0.0 && builder.mode_override(pside, &state)?.as_deref() == Some("panic")
+                {
+                    derived
+                        .entry(symbol.clone())
+                        .or_default()
+                        .insert(pside.to_string());
+                }
+            }
+            states.push(state);
+        }
+        // The traced targets restricted to the recorded position psides.
+        let traced: BTreeMap<String, BTreeSet<String>> = names
+            .iter()
+            .filter_map(|symbol| {
+                let psides: BTreeSet<String> = targets
+                    .get(symbol)?
+                    .iter()
+                    .filter(|p| {
+                        num(
+                            &rec["symbols"][rec_idx[symbol.as_str()]][p.as_str()]["position"]
+                                ["size"],
+                        ) != 0.0
+                    })
+                    .cloned()
+                    .collect();
+                (!psides.is_empty()).then(|| (symbol.clone(), psides))
+            })
+            .collect();
+        par.eq(&format!("protective@{ts}.targets"), traced, derived);
+        let account = AccountState {
+            timestamp_ms: ts,
+            balance: num(&rec["balance"]),
+            balance_raw: num(&rec["balance_raw"]),
+            realized_pnl_cumsum_max: 0.0,
+            realized_pnl_cumsum_last: 0.0,
+        };
+        let Some(snap) = builder.build_protective(&account, &states, targets)? else {
+            bail!("{}: no target symbol holds a position", file.display());
+        };
+        let mut d = Vec::new();
+        diff("", &snap.input, &rec, &mut d);
+        if d.is_empty() {
+            self.clean += 1;
+        }
+        for (p, msg) in d {
+            *self.totals.entry(p.clone()).or_default() += 1;
+            let ex = self.examples.entry(p).or_default();
+            if self.verbose || ex.len() < 3 {
+                ex.push(format!(
+                    "{}: {}",
+                    file.file_name().unwrap().to_string_lossy(),
+                    msg
+                ));
+            }
+        }
+        self.n += 1;
         Ok(())
     }
 
@@ -1031,12 +1648,258 @@ fn replay_with_trace(
     // (supervisor_begin record, its positions, first `counts` consumed)
     let mut supervisor: Option<(Value, Vec<HslPosition>, bool)> = None;
     let (mut checks, mut inits, mut supervisions, mut finalizes, mut resets) = (0, 0, 0, 0, 0);
+    let (mut iterations, mut protectives, mut flattens, mut stale_flattens) = (0, 0, 0, 0);
     let lookback = hsl.cfg.lookback;
+    let coin = hsl.cfg.coin_mode();
     let mut boot_fills: Vec<HslFill> = Vec::new();
+    // Coin mode: the traced targets of the current supervisor iteration and
+    // the pairs the Rust supervisor left active after it.
+    let mut targets: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut active_after: Option<Vec<(usize, String)>> = None;
+    let c_mult_of = |s: &str| c_mults.get(s).copied().unwrap_or(1.0);
+    let qty_step_of = |s: &str| qty_steps.get(s).copied().unwrap_or(0.0);
+    let known_market = |s: &str| c_mults.contains_key(s);
     for ev in trace {
         let kind = ev["kind"].as_str().unwrap_or("");
         let ts = ev["ts"].as_u64().unwrap_or(0);
+        if coin && !kind.starts_with("coin_") && kind != "compute" {
+            continue;
+        }
         match kind {
+            "coin_init" | "coin_check_begin" | "coin_iter_begin" => {
+                if kind == "coin_iter_begin" && ev["ok"].as_bool() != Some(true) {
+                    continue;
+                }
+                let positions = trace_positions(&ev["positions"]);
+                let fills_now = fills_until(fills, ts);
+                if kind == "coin_init" {
+                    inits += 1;
+                    boot_fills = fills_now.clone();
+                }
+                let pairs = traced_pairs(ev);
+                let known = traced_symbols(ev);
+                checker.check_coin_inputs(
+                    &mut par,
+                    &format!("{kind}@{ts}"),
+                    ts,
+                    &pairs,
+                    &positions,
+                    &fills_now,
+                    &boot_fills,
+                    lookback.hsl_window_ms(),
+                    c_mults,
+                )?;
+                let upnl = |pside: usize, symbol: &str| -> Result<f64> {
+                    match pairs.get(&(pside, symbol.to_string())) {
+                        Some(p) => Ok(p.2),
+                        None if positions
+                            .iter()
+                            .any(|q| q.pside == pside && q.symbol == symbol) =>
+                        {
+                            bail!("no traced unrealized pnl for {pside}:{symbol} at {ts}")
+                        }
+                        None => Ok(0.0),
+                    }
+                };
+                // The traced realized peak/last are Python's ledger values
+                // when the record was written. Inside a supervisor iteration
+                // a flat pair's flatten lookup refreshes that ledger
+                // (`_flatten_fill_timestamp_with_refresh` -> `update_pnls`)
+                // before the sample refresh, so for flat pairs the sample
+                // must read the full ledger like the runner does.
+                let supervisor_iteration = kind == "coin_iter_begin";
+                let realized = |pside: usize, symbol: &str, _ts: u64, _reset: Option<u64>| {
+                    let held = positions
+                        .iter()
+                        .any(|p| p.pside == pside && p.symbol == symbol && p.size != 0.0);
+                    if supervisor_iteration && !held {
+                        return None;
+                    }
+                    pairs.get(&(pside, symbol.to_string())).map(|p| (p.0, p.1))
+                };
+                let blocking = |pside: usize, symbol: &str| {
+                    pairs
+                        .get(&(pside, symbol.to_string()))
+                        .map_or((0, 0), |p| (p.3, p.4))
+                };
+                let env = CoinEnv {
+                    upnl: &upnl,
+                    realized: Some(&realized),
+                    blocking_orders: &blocking,
+                };
+                let inp = CoinInputs {
+                    now_ms: ts,
+                    balance: num(&ev["balance"]),
+                    positions: &positions,
+                    fills: &fills_now,
+                    known_symbols: &known,
+                };
+                match kind {
+                    "coin_init" => {
+                        let history = {
+                            let store = &*checker.store;
+                            let close_at =
+                                |symbol: &str, minute: u64| store.close_at(coin_of(symbol), minute);
+                            coin_history(&ReplayInputs {
+                                now_ms: ts,
+                                balance_now: num(&ev["balance"]),
+                                lookback,
+                                fills: &fills_now,
+                                positions: &positions,
+                                known_positions: &known,
+                                close_at: &close_at,
+                                c_mult: &c_mult_of,
+                                qty_step: &qty_step_of,
+                                known_market: &known_market,
+                            })
+                        };
+                        hsl.initialize_coin_from_history(
+                            &inp,
+                            &env,
+                            &history,
+                            &qty_step_of,
+                            &known_market,
+                        )?;
+                        compare_coin_states(&mut par, &format!("init@{ts}"), &ev["after"], hsl);
+                        compare_coin_modes(&mut par, &format!("init@{ts}"), &ev["modes"], hsl);
+                    }
+                    "coin_check_begin" => {
+                        checks += 1;
+                        hsl.check_coin(&inp, &env)?;
+                    }
+                    _ => {
+                        iterations += 1;
+                        let step = hsl.supervise_coin_red(&inp, &env)?;
+                        par.eq(
+                            &format!("iter@{ts}#{}.active", ev["iteration"]),
+                            traced_pairs_list(&ev["active"]),
+                            step.active_before,
+                        );
+                        active_after = Some(step.active_after);
+                    }
+                }
+                checker.cycle.hsl = hsl.modes();
+            }
+            "coin_check_end" => {
+                // A compacted fixture trace keeps the pair states of the
+                // kept and transition cycles only (`select_fixtures.py`).
+                if ev["after"].is_object() {
+                    compare_coin_states(&mut par, &format!("check@{ts}"), &ev["after"], hsl);
+                }
+                compare_coin_modes(&mut par, &format!("check@{ts}"), &ev["modes"], hsl);
+            }
+            "coin_supervisor_begin" => {
+                supervisions += 1;
+                par.eq(
+                    &format!("supervisor@{ts}.active"),
+                    traced_pairs_list(&ev["active"]),
+                    hsl.coin_panic_pairs(),
+                );
+            }
+            "coin_iter_end" | "coin_supervisor_end" => {
+                let label = if kind == "coin_iter_end" {
+                    format!("iter@{ts}#{}", ev["iteration"])
+                } else {
+                    format!("supervisor@{ts}")
+                };
+                if let Some(after) = active_after.take() {
+                    par.eq(
+                        &format!("{label}.active_after"),
+                        traced_pairs_list(&ev["active"]),
+                        after,
+                    );
+                }
+                compare_coin_states(&mut par, &label, &ev["after"], hsl);
+                compare_coin_modes(&mut par, &label, &ev["modes"], hsl);
+                if kind == "coin_iter_end" {
+                    targets = ev["targets"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                v.as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|p| p.as_str().map(str::to_string))
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                }
+                checker.cycle.hsl = hsl.modes();
+            }
+            "coin_flatten" => {
+                // The flatten-fill lookup Python made (on its own ledger)
+                // against the runner's lookup on the full ledger.
+                flattens += 1;
+                let pside = pside_index(ev["pside"].as_str().unwrap_or("long"));
+                let symbol = ev["symbol"].as_str().unwrap_or("");
+                let since = ev["since_ms"].as_u64();
+                let sizes: Option<BTreeMap<String, f64>> = ev["replay_start_sizes"]
+                    .as_object()
+                    .map(|o| o.iter().map(|(k, v)| (k.clone(), num(v))).collect());
+                let rs = since.and_then(|s| {
+                    latest_flatten_fill_timestamp(
+                        &fills_until(fills, ts),
+                        pside,
+                        Some(symbol),
+                        Some(s),
+                        sizes.as_ref(),
+                    )
+                });
+                let py = ev["result"].as_u64();
+                if py != rs {
+                    let boot = since.and_then(|s| {
+                        latest_flatten_fill_timestamp(
+                            &boot_fills,
+                            pside,
+                            Some(symbol),
+                            Some(s),
+                            sizes.as_ref(),
+                        )
+                    });
+                    if py == boot {
+                        stale_flattens += 1;
+                    } else {
+                        par.mismatches.push(format!(
+                            "flatten@{ts}.{}:{symbol}: python {py:?} vs rust {rs:?}",
+                            ["long", "short"][pside]
+                        ));
+                    }
+                }
+            }
+            "coin_finalize" => finalizes += 1,
+            "coin_reset" => resets += 1,
+            "compute" if coin => {
+                let Some(file) = files.get(rec_i) else {
+                    continue;
+                };
+                if ev["hash"].as_str() != Some(stem_hash(file).as_str()) {
+                    continue;
+                }
+                let names: Option<Vec<String>> = ev["symbols"].as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                });
+                if ev["protective"].as_bool() == Some(true) {
+                    protectives += 1;
+                    checker.run_protective(file, names.unwrap_or_default(), &targets, &mut par)?;
+                } else {
+                    checker.run(rec_i, file, names)?;
+                }
+                modes_by_hash.insert(
+                    stem_hash(file),
+                    format!(
+                        "forced_long={:?} forced_short={:?}",
+                        checker.cycle.hsl.runtime_forced[LONG],
+                        checker.cycle.hsl.runtime_forced[SHORT]
+                    ),
+                );
+                rec_i += 1;
+            }
             "init" => {
                 inits += 1;
                 let positions = trace_positions(&ev["positions"]);
@@ -1199,10 +2062,17 @@ fn replay_with_trace(
             files.len()
         );
     }
-    println!(
-        "hsl trace: {inits} init, {checks} checks, {supervisions} supervisor steps, {finalizes} finalizations, {resets} resets; {} floats compared, {} bit-exact, max rel dev {:.3e} ({}); {} realized-pnl inputs explained by the harness's stale fill ledger",
-        par.floats, par.exact, par.max_rel, par.max_rel_at, par.stale_ledger
-    );
+    if coin {
+        println!(
+            "hsl coin trace: {inits} init, {checks} checks, {supervisions} supervisor runs ({iterations} iterations, {protectives} protective recordings), {finalizes} finalizations, {resets} resets, {flattens} flatten lookups ({stale_flattens} explained by the stale ledger); {} floats compared, {} bit-exact, max rel dev {:.3e} ({}); {} realized-pnl inputs explained by the harness's stale fill ledger",
+            par.floats, par.exact, par.max_rel, par.max_rel_at, par.stale_ledger
+        );
+    } else {
+        println!(
+            "hsl trace: {inits} init, {checks} checks, {supervisions} supervisor steps, {finalizes} finalizations, {resets} resets; {} floats compared, {} bit-exact, max rel dev {:.3e} ({}); {} realized-pnl inputs explained by the harness's stale fill ledger",
+            par.floats, par.exact, par.max_rel, par.max_rel_at, par.stale_ledger
+        );
+    }
     Ok((par, modes_by_hash))
 }
 

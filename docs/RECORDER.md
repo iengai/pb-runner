@@ -144,6 +144,31 @@ check reports those deviations as "stale ledger"), and the boot index
 leaves only 1690 h of history, so the 1909 h log-range span is short and
 every 1h EMA map is empty (Python's all-or-nothing rule, now ported).
 
+HSL coin set (2026-09-08, D20): `tests/fixtures/configs/fake_v8/grid_v7_hsl_coin.json`
+is `grid_v7_hsl.json` with `live.hsl_signal_mode = coin` (the default) and
+`coin_overrides.BTC.bot.long.hsl.red_threshold = 0.3` (BTC stays green
+while ADA / DOGE, red 0.06 on a 333 USDT slot budget, latch red in the Oct
+10 crash), recorded with the same
+`--boot-index 102000 --max-steps 400 --seed-positions 3 --seed-we 0.3` into
+`.local/fake_v8_hsl_coin`. In coin mode `fake_live_clock.py` adds the
+`coin_*` records (`coin_init`, `coin_check_begin`/`coin_check_end` with the
+per-pair realized peak/last, unrealized pnl and blocking-order counts,
+`coin_sample`, `coin_flatten`, `coin_finalize`, `coin_reset`,
+`coin_cooldown_handle`, `coin_supervisor_begin`/`coin_supervisor_end`,
+`coin_iter_begin` after every `refresh_protective_authoritative_state` of
+the production coin RED supervisor and `coin_iter_end` when its protective
+planning starts, with the target pairs) and flags the `compute` records of
+the protective-panic input (`protective: true`, the input's symbol order).
+`select_fixtures.py` drops `coin_sample` too and treats any pair's
+tier / red latch / halted or runtime forced mode change as a transition.
+Harness facts specific to this set: the fake harness runs the *production*
+coin supervisor loop inside one scenario minute (several iterations at the
+same `ts`, `asyncio.sleep(execution_delay_seconds)` between them, the panic
+limit orders fill immediately at the fake exchange), and
+`_equity_hard_stop_refresh_coin_cooldown_after_repanic` is not bound on
+`Passivbot` in the v8.1.0 checkout (hsl:4776 exists as a module function
+only), so the wrapper only patches it when present.
+
 ### B. Real market data (local, NOT committable)
 
 Running the real bot locally needs a trading key, which we do not have on the

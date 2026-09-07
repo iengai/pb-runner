@@ -6,16 +6,19 @@ cycles x 3 configs would be >100 MB. This keeps the informative cycles:
 - every cycle whose output order set differs from the previous kept cycle
   (state transitions: new entries, fills, closes, trailing updates),
 - every cycle where the HSL side state (tier / red latch / halted) changed,
-  when the source carries an `hsl_trace.jsonl`, and
+  when the source carries an `hsl_trace.jsonl` (coin mode: any pair's
+  tier / red latch / halted or a runtime forced mode), and
 - every `--stride`-th cycle regardless,
 
 capped at `--max` per source (transitions first, then evenly spaced
 regulars). `MANIFEST.json` from the source is copied with the selection
 parameters appended. An HSL run also gets its full `fills.json` and a
 compacted `hsl_trace.jsonl` (the `sample` records and the `before` states,
-which `pb-snapcheck` does not read, are dropped): the trace must stay
-complete because the Rust state machine is replayed through every cycle,
-not only the kept ones.
+which `pb-snapcheck` does not read, are dropped; in coin mode also the
+account-level `check_*` records and the pair states of the checks between
+kept cycles that changed nothing, see `compact_trace`): the trace must stay
+complete in its inputs because the Rust state machine is replayed through
+every cycle, not only the kept ones.
 
     python tools/select_fixtures.py --src .local/fake_v8/iter7/recordings \
         --dst tests/fixtures/recordings/fake_v8/iter7 --stride 20 --max 60
@@ -41,6 +44,21 @@ def order_key(out_path: Path) -> str:
     )
 
 
+def coin_mode_key(rec: dict) -> str:
+    """Per-pair `tier/red_latched/halted` plus the runtime forced modes of a
+    coin-mode trace record (`after` = `_hsl_coin_states`, `modes` =
+    `_hsl_coin_modes`)."""
+    parts = []
+    for pside in ("long", "short"):
+        for symbol, st in sorted((rec.get("after") or {}).get(pside, {}).items()):
+            parts.append("%s:%s=%s/%s/%s" % (pside, symbol.split("/")[0], st.get("tier"),
+                                             st.get("red_latched"), st.get("halted")))
+        forced = ((rec.get("modes") or {}).get("forced") or {}).get(pside, {})
+        for symbol, mode in sorted(forced.items()):
+            parts.append("%s:%s!%s" % (pside, symbol.split("/")[0], mode))
+    return " ".join(parts)
+
+
 def hsl_mode_keys(src: Path) -> dict[str, list[str]]:
     """`compute` input hash -> HSL side-state keys at that compute (in order)."""
     trace = src / "hsl_trace.jsonl"
@@ -53,7 +71,9 @@ def hsl_mode_keys(src: Path) -> dict[str, list[str]]:
             continue
         rec = json.loads(line)
         kind = rec.get("kind")
-        if kind in ("init", "check_end", "supervisor_end", "sync_flat", "finalize"):
+        if kind in ("coin_init", "coin_check_end", "coin_iter_end", "coin_supervisor_end"):
+            last = coin_mode_key(rec)
+        elif kind in ("init", "check_end", "supervisor_end", "sync_flat", "finalize"):
             after = rec.get("after") or {}
             sides = after if "long" in after or "short" in after else {rec.get("pside", "long"): after}
             parts = []
@@ -73,16 +93,46 @@ def hsl_mode_keys(src: Path) -> dict[str, list[str]]:
     return out
 
 
-def compact_trace(src: Path, dst: Path) -> int:
+def compact_trace(src: Path, dst: Path, kept_hashes: set[str]) -> int:
+    """Coin mode carries ten pair states per check (~13 KB): the account-level
+    `check_*` records (unused there) and the `after` states of
+    `coin_cooldown_handle` (not compared) are dropped, and `coin_check_end`
+    keeps its `after` states only for the kept cycles and the cycles where a
+    pair state or forced mode changed; every check is still replayed from
+    its `coin_check_begin` inputs, the states are asserted where kept."""
+    lines = [l for l in (src / "hsl_trace.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    recs = [json.loads(l) for l in lines]
+    coin = any(r.get("kind", "").startswith("coin_") for r in recs)
+    # cycle index -> kept (a kept recording's compute belongs to the cycle)
+    kept_cycles: set[int] = set()
+    cycle = -1
+    for rec in recs:
+        if rec.get("kind") == "coin_check_begin":
+            cycle += 1
+        elif rec.get("kind") == "compute" and rec.get("hash") in kept_hashes:
+            kept_cycles.add(cycle)
     n = 0
+    cycle = -1
+    last_key = None
     with (dst / "hsl_trace.jsonl").open("w", encoding="utf-8", newline="\n") as f:
-        for line in (src / "hsl_trace.jsonl").read_text(encoding="utf-8").splitlines():
-            if not line.strip():
+        for rec in recs:
+            kind = rec.get("kind")
+            if kind in ("sample", "coin_sample"):
                 continue
-            rec = json.loads(line)
-            if rec.get("kind") == "sample":
+            if coin and kind in ("check_begin", "check_end"):
                 continue
             rec.pop("before", None)
+            if kind == "coin_check_begin":
+                cycle += 1
+            elif kind == "coin_cooldown_handle":
+                rec.pop("after", None)
+            elif kind == "coin_check_end":
+                key = coin_mode_key(rec)
+                if cycle not in kept_cycles and key == last_key:
+                    rec.pop("after", None)
+                last_key = key
+            elif kind in ("coin_init", "coin_iter_end", "coin_supervisor_end"):
+                last_key = coin_mode_key(rec)
             f.write(json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n")
             n += 1
     return n
@@ -138,7 +188,8 @@ def main() -> int:
 
     extras = {}
     if (src / "hsl_trace.jsonl").exists():
-        extras["hsl_trace_lines"] = compact_trace(src, dst)
+        kept_hashes = {p.name.split("_", 1)[1].split(".")[0] for p in selected}
+        extras["hsl_trace_lines"] = compact_trace(src, dst, kept_hashes)
         shutil.copy2(src / "fills.json", dst / "fills.json")
         extras["fills"] = len(json.loads((src / "fills.json").read_text(encoding="utf-8")))
 

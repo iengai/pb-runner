@@ -19,6 +19,8 @@ pub mod exchange_config;
 pub mod execute;
 #[cfg(feature = "engine-v8")]
 pub mod hsl;
+#[cfg(feature = "engine-v8")]
+pub mod hsl_coin;
 pub mod jsonexact;
 #[cfg(feature = "engine-v8")]
 pub mod live;

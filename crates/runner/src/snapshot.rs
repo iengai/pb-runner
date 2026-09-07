@@ -657,13 +657,15 @@ impl<'a> SnapshotBuilder<'a> {
         }
     }
 
-    /// `_orchestrator_mode_override` steps 1 and 4-7 (HSL account-level
-    /// modes and config forced modes; coin-mode replay, operator runtime
-    /// overrides and `ineligible_symbols` are not modelled; exchange
-    /// cooldowns are applied by `build`).
+    /// `_orchestrator_mode_override` steps 1-7 (HSL account-level modes,
+    /// coin-mode replay pending and the runtime forced modes the coin
+    /// machine sets, config forced modes; operator runtime overrides and
+    /// `ineligible_symbols` are not modelled; exchange cooldowns are
+    /// applied by `build`).
     pub fn mode_override(&self, pside: &str, s: &SymbolState) -> Result<Option<String>> {
         // Step 1: HSL (`_equity_hard_stop_enabled(pside)`): red -> panic,
         // halted -> `_equity_hard_stop_halted_mode`, orange -> its mode.
+        // A no-op in coin mode (the account-level machine is never fed).
         let side_size = s.side(pside).position_size;
         if let Some(m) = self.hsl.side(pside).symbol_override(side_size != 0.0) {
             return Ok(Some(m));
@@ -680,6 +682,19 @@ impl<'a> SnapshotBuilder<'a> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
         });
+        // Step 2: HSL coin mode with replay pending: the configured forced
+        // mode unless normal, else graceful_stop (both through eligibility).
+        if self.hsl.replay_pending(pside, &s.symbol) {
+            let mode = match expand_pb_mode(raw)? {
+                Some(m) if m != "normal" => m,
+                _ => "graceful_stop".to_string(),
+            };
+            return Ok(self.apply_entry_eligibility(pside, &s.symbol, Some(mode)));
+        }
+        // Step 3: `_runtime_forced_modes[pside][symbol]` (coin HSL).
+        if let Some(mode) = self.hsl.runtime_forced(pside, &s.symbol) {
+            return Ok(self.apply_entry_eligibility(pside, &s.symbol, Some(mode.to_string())));
+        }
         if let Some(mode) = expand_pb_mode(raw)? {
             return Ok(self.apply_entry_eligibility(pside, &s.symbol, Some(mode)));
         }
@@ -1255,6 +1270,131 @@ impl<'a> SnapshotBuilder<'a> {
             mode_overrides,
         })
     }
+
+    /// `calc_protective_panic_ideal_orders_orchestrator` (pb:16516): the
+    /// reduced orchestrator input of the coin RED supervisor for the
+    /// symbols holding a position on a `panic` pside (`targets`, from
+    /// `_protective_panic_target_psides_by_symbol`); every other pside is
+    /// `manual`. No EMAs, no trailing state, no fill timestamps, no forager
+    /// inputs; `auto_unstuck_allowed` false and a zero realized-pnl cumsum.
+    /// `None` when no target symbol holds a position (Python returns `{}`).
+    pub fn build_protective(
+        &self,
+        account: &AccountState,
+        states: &[SymbolState],
+        targets: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Result<Option<Snapshot>> {
+        let by_symbol: BTreeMap<&str, &SymbolState> =
+            states.iter().map(|s| (s.symbol.as_str(), s)).collect();
+        let symbols: Vec<String> = targets
+            .iter()
+            .filter(|(symbol, psides)| {
+                by_symbol.get(symbol.as_str()).is_some_and(|s| {
+                    psides
+                        .iter()
+                        .any(|pside| s.side(pside).position_size != 0.0)
+                })
+            })
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
+        if symbols.is_empty() {
+            return Ok(None);
+        }
+        let mut peek: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        let mut incumbents: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        let mut sym_values = Vec::new();
+        let mut mode_overrides = Vec::new();
+        for (idx, symbol) in symbols.iter().enumerate() {
+            let s = by_symbol[symbol.as_str()];
+            let mut sides = Map::new();
+            let mut modes: [Option<String>; 2] = [None, None];
+            for (i, pside) in PSIDES.iter().enumerate() {
+                let side = s.side(pside);
+                if side.position_size != 0.0 {
+                    peek.entry(pside).or_default().push(idx);
+                } else if side.has_entry_order {
+                    incumbents.entry(pside).or_default().push(idx);
+                }
+                let mode = if targets.get(symbol).is_some_and(|p| p.contains(*pside)) {
+                    "panic"
+                } else {
+                    "manual"
+                };
+                modes[i] = Some(mode.to_string());
+                let t = TrailingPriceBundle::default();
+                sides.insert(
+                    pside.to_string(),
+                    json!({
+                        "mode": mode,
+                        "position": {"size": side.position_size, "price": side.position_price},
+                        "trailing": {
+                            "min_since_open": t.min_since_open,
+                            "max_since_min": t.max_since_min,
+                            "max_since_open": t.max_since_open,
+                            "min_since_max": t.min_since_max,
+                        },
+                        "last_increase_fill_timestamp_ms": Value::Null,
+                        "bot_params": self.cfg.bot_params(pside, Some(symbol))?,
+                        "strategy_params": self.cfg.strategy_params(pside, Some(symbol))?,
+                    }),
+                );
+            }
+            let m = &s.market;
+            let mut sym = json!({
+                "symbol_idx": idx,
+                "order_book": {"bid": s.bid, "ask": s.ask},
+                "exchange": {
+                    "qty_step": m.qty_step, "price_step": m.price_step, "min_qty": m.min_qty,
+                    "min_cost": m.min_cost, "c_mult": m.c_mult, "maker_fee": m.maker_fee, "taker_fee": m.taker_fee,
+                },
+                "tradable": s.active,
+                "next_candle": Value::Null,
+                "effective_min_cost": Self::effective_min_cost(m, s.min_cost_price),
+                "emas": {
+                    "m1": {"close": [], "log_range": [], "volume": []},
+                    "h1": {"close": [], "log_range": [], "volume": []},
+                },
+            });
+            for (k, v) in sides {
+                sym[k] = v;
+            }
+            sym_values.push(sym);
+            let [l, sh] = modes;
+            mode_overrides.push((l, sh));
+        }
+        let mut global = self.global(account)?;
+        global["auto_unstuck_allowed"] = Value::Bool(false);
+        global["realized_pnl_cumsum_max"] = json!(0.0);
+        global["realized_pnl_cumsum_last"] = json!(0.0);
+        let hyst_pct = self
+            .cfg
+            .live("forager_score_hysteresis_pct")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let input = json!({
+            "timestamp_ms": account.timestamp_ms,
+            "balance": account.balance,
+            "balance_raw": account.balance_raw,
+            "global": global,
+            "symbols": sym_values,
+            "peek_hints": {
+                "expand_grid_long": peek.get("long").cloned().unwrap_or_default(),
+                "expand_grid_short": peek.get("short").cloned().unwrap_or_default(),
+                "expand_close_long": peek.get("long").cloned().unwrap_or_default(),
+                "expand_close_short": peek.get("short").cloned().unwrap_or_default(),
+            },
+            "forager_hysteresis": {
+                "score_hysteresis_pct": hyst_pct,
+                "incumbent_long": incumbents.get("long").cloned().unwrap_or_default(),
+                "incumbent_short": incumbents.get("short").cloned().unwrap_or_default(),
+            },
+        });
+        Ok(Some(Snapshot {
+            input,
+            symbols,
+            mode_overrides,
+        }))
+    }
 }
 
 fn truthy(v: &Value) -> bool {
@@ -1728,6 +1868,123 @@ mod tests {
         assert!(!b2.is_forager_mode("long").unwrap());
     }
 
+    /// SPEC 2.3 steps 2-3 (coin HSL, D20): a replay-pending pair takes the
+    /// configured forced mode unless normal, else `graceful_stop`; the coin
+    /// machine's runtime forced modes go through entry eligibility; the
+    /// universe and the forager flag are untouched; a protective input
+    /// covers the target symbols holding a position only.
+    #[test]
+    fn hsl_coin_modes_override_steps_two_three_and_protective_input() {
+        use crate::hsl::HslModes;
+        let cfg = public_config(|v| {
+            v["coin_overrides"]["ADA"]["live"]["forced_mode_long"] = Value::from("tp_only");
+            v["coin_overrides"]["XRP"]["live"]["forced_mode_long"] = Value::from("n");
+        });
+        let builder = SnapshotBuilder::new(&cfg).unwrap();
+        let c = warm(&builder, NOW);
+        let mut states = states_all(&builder, &c);
+        let names: Vec<String> = states.iter().map(|s| s.symbol.clone()).collect();
+        let idx = |sym: &str| names.iter().position(|s| s == sym).unwrap();
+        let (ada, doge, xrp) = (
+            idx("ADA/USDT:USDT"),
+            idx("DOGE/USDT:USDT"),
+            idx("XRP/USDT:USDT"),
+        );
+        states[ada].long.position_size = 100.0;
+        states[doge].long.position_size = 1000.0;
+        let mut modes = HslModes {
+            coin_enabled: [true, false],
+            ..HslModes::default()
+        };
+        modes
+            .replay_pending
+            .insert((crate::hsl::LONG, "ADA/USDT:USDT".to_string()));
+        modes
+            .replay_pending
+            .insert((crate::hsl::LONG, "XRP/USDT:USDT".to_string()));
+        modes.runtime_forced[crate::hsl::LONG]
+            .insert("DOGE/USDT:USDT".to_string(), "panic".to_string());
+        modes.runtime_forced[crate::hsl::LONG].insert(
+            "ETH/USDT:USDT".to_string(),
+            "tp_only_with_active_entry_cancellation".to_string(),
+        );
+        let b = SnapshotBuilder::new(&cfg).unwrap().with_hsl(&modes);
+        // step 2: configured `tp_only` wins; a configured `normal` -> gs
+        assert_eq!(
+            b.mode_override("long", &states[ada]).unwrap().as_deref(),
+            Some("tp_only")
+        );
+        assert_eq!(
+            b.mode_override("long", &states[xrp]).unwrap().as_deref(),
+            Some("graceful_stop")
+        );
+        // step 3: the coin machine's forced modes
+        assert_eq!(
+            b.mode_override("long", &states[doge]).unwrap().as_deref(),
+            Some("panic")
+        );
+        assert_eq!(
+            b.mode_override("long", &states[idx("ETH/USDT:USDT")])
+                .unwrap()
+                .as_deref(),
+            Some("tp_only_with_active_entry_cancellation")
+        );
+        // untouched pairs and the other side fall through to the config
+        assert_eq!(
+            b.mode_override("long", &states[idx("BTC/USDT:USDT")])
+                .unwrap(),
+            builder
+                .mode_override("long", &states[idx("BTC/USDT:USDT")])
+                .unwrap()
+        );
+        assert_eq!(
+            b.mode_override("short", &states[doge]).unwrap(),
+            builder.mode_override("short", &states[doge]).unwrap()
+        );
+        assert_eq!(
+            b.universe(&[], &BTreeSet::new()),
+            builder.universe(&[], &BTreeSet::new())
+        );
+        assert_eq!(
+            b.is_forager_mode("long").unwrap(),
+            builder.is_forager_mode("long").unwrap()
+        );
+        // protective input: DOGE (held, panic) only; XRP is a target without
+        // a position and ADA a held non-target
+        let mut targets: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        targets.insert(
+            "DOGE/USDT:USDT".to_string(),
+            ["long".to_string()].into_iter().collect(),
+        );
+        targets.insert(
+            "XRP/USDT:USDT".to_string(),
+            ["long".to_string()].into_iter().collect(),
+        );
+        let snap = b
+            .build_protective(&account(NOW), &states, &targets)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.symbols, ["DOGE/USDT:USDT"]);
+        let s0 = &snap.input["symbols"][0];
+        assert_eq!(s0["long"]["mode"], "panic");
+        assert_eq!(s0["short"]["mode"], "manual");
+        assert_eq!(s0["long"]["position"]["size"], 1000.0);
+        assert_eq!(s0["long"]["last_increase_fill_timestamp_ms"], Value::Null);
+        assert!(s0.get("trailing_available").is_none());
+        assert!(s0.get("forager_m1").is_none());
+        assert_eq!(s0["emas"]["m1"]["close"].as_array().unwrap().len(), 0);
+        assert_eq!(snap.input["global"]["auto_unstuck_allowed"], false);
+        assert_eq!(snap.input["global"]["realized_pnl_cumsum_last"], 0.0);
+        assert_eq!(snap.input["peek_hints"]["expand_grid_long"], json!([0]));
+        assert_eq!(snap.mode_overrides[0].0.as_deref(), Some("panic"));
+        // no target holds a position -> Python's `{}`
+        targets.remove("DOGE/USDT:USDT");
+        assert!(b
+            .build_protective(&account(NOW), &states, &targets)
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn hsl_side_modes_override_step_one_and_keep_known_symbols() {
         use crate::hsl::{CooldownPositionPolicy, HslModes, HslSideMode};
@@ -1741,6 +1998,7 @@ mod tests {
         let with = |mode: HslSideMode| {
             let modes = HslModes {
                 sides: [mode, HslSideMode::None],
+                ..HslModes::default()
             };
             SnapshotBuilder::new(&cfg).unwrap().with_hsl(&modes)
         };

@@ -17,13 +17,12 @@
 //! closes (`get_balance_equity_history`, pb:14661) with `latch_red = false`,
 //! then samples the present.
 //!
-//! Not ported (D16): `hsl_signal_mode = coin` (per-coin runtimes, slot-budget
-//! signal, coin history replay; the runner refuses such configs while any
-//! side has HSL enabled), panic-marker reconstruction from fills
-//! (`pb_order_type` is `unknown` on the fake exchange and the runner does not
-//! decode custom ids), the replay-matrix caches, the operator runtime forced
-//! modes (they never change `_orchestrator_mode_override` for HSL: step 1
-//! already answers) and the latch files (write-only diagnostics in Python).
+//! `hsl_signal_mode = coin` (the default): per-(pside, symbol) runtimes fed
+//! with the slot-budget drawdown signal, the coin history replay with panic
+//! markers decoded from the fills' custom ids and the runtime forced modes
+//! live in `hsl_coin.rs` (D20). Not ported: the replay-matrix caches (an
+//! accelerator that never changes a decision, hsl:1874), the operator runtime
+//! forced modes and the latch files (write-only diagnostics in Python).
 
 use crate::bot_params::{ConfigView, PSIDES};
 use anyhow::{anyhow, bail, Result};
@@ -109,7 +108,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    fn from_engine(t: ehsl::HardStopTier) -> Self {
+    pub(crate) fn from_engine(t: ehsl::HardStopTier) -> Self {
         match t {
             ehsl::HardStopTier::Green => Self::Green,
             ehsl::HardStopTier::Yellow => Self::Yellow,
@@ -262,6 +261,15 @@ pub struct HslConfig {
     pub lookback: PnlsLookback,
     pub fee: FeePolicy,
     pub sides: [SideConfig; 2],
+    /// Coin mode only: `_equity_hard_stop_config(pside, symbol)` for every
+    /// `coin_overrides` coin (symbol -> per-side config; `bp(pside,
+    /// "hsl_*", symbol)` with the override's `tier_ratios` merged over the
+    /// global ones, no `no_restart >= red` clamp on this path).
+    pub coin_overrides: BTreeMap<String, [SideConfig; 2]>,
+    /// `bot_value(pside, "n_positions")` / `total_wallet_exposure_limit`
+    /// as floats (`_equity_hard_stop_coin_active_pside`).
+    pub n_positions: [f64; 2],
+    pub twel: [f64; 2],
 }
 
 fn str_of(v: &Value) -> String {
@@ -352,10 +360,56 @@ impl HslConfig {
             });
         }
         let sides: [SideConfig; 2] = [sides.remove(0), sides.remove(0)];
-        if signal_mode == SignalMode::Coin && sides.iter().any(|s| s.enabled) {
-            bail!(
-                "live.hsl_signal_mode = \"coin\" with HSL enabled is not supported by pb-runner (D16): use \"unified\" or \"pside\", or disable bot.<pside>.hsl.enabled"
-            );
+        let mut n_positions = [0.0; 2];
+        let mut twel = [0.0; 2];
+        for (i, pside) in PSIDES.iter().enumerate() {
+            n_positions[i] = py_float(&cfg.bot_value(pside, "n_positions")?);
+            twel[i] = py_float(&cfg.bot_value(pside, "total_wallet_exposure_limit")?);
+        }
+        // `_equity_hard_stop_config(pside, symbol)`: only coin mode reads
+        // per-symbol values, and only for `coin_overrides` coins.
+        let mut coin_overrides = BTreeMap::new();
+        if signal_mode == SignalMode::Coin {
+            for coin in cfg.override_coins() {
+                let symbol = format!("{coin}/USDT:USDT");
+                let mut per_side = Vec::with_capacity(2);
+                for (i, pside) in PSIDES.iter().enumerate() {
+                    let g = &sides[i];
+                    let bp = |k: &str| cfg.bp(pside, k, Some(&symbol));
+                    let mut ratio_yellow = g.ratio_yellow;
+                    let mut ratio_orange = g.ratio_orange;
+                    if let Some(r) = bp("hsl_tier_ratios")?.as_object() {
+                        if let Some(y) = r.get("yellow").and_then(Value::as_f64) {
+                            ratio_yellow = y;
+                        }
+                        if let Some(o) = r.get("orange").and_then(Value::as_f64) {
+                            ratio_orange = o;
+                        }
+                    }
+                    let restart = bp("hsl_restart_after_red_policy")?;
+                    let restart = str_of(&restart).trim().to_ascii_lowercase();
+                    if !["always", "threshold", "never"].contains(&restart.as_str()) {
+                        bail!("coin HSL {symbol} {pside}.restart_after_red_policy must be one of always, threshold, never, got {restart:?}");
+                    }
+                    per_side.push(SideConfig {
+                        enabled: truthy(&bp("hsl_enabled")?),
+                        red_threshold: py_float(&bp("hsl_red_threshold")?),
+                        ema_span_minutes: py_float(&bp("hsl_ema_span_minutes")?),
+                        cooldown_minutes_after_red: py_float(&bp(
+                            "hsl_cooldown_minutes_after_red",
+                        )?),
+                        no_restart_drawdown_threshold: py_float(&bp(
+                            "hsl_no_restart_drawdown_threshold",
+                        )?),
+                        ratio_yellow,
+                        ratio_orange,
+                        orange_tier_mode: str_of(&bp("hsl_orange_tier_mode")?),
+                        panic_close_order_type: str_of(&bp("hsl_panic_close_order_type")?),
+                        restart_after_red_policy: restart,
+                    });
+                }
+                coin_overrides.insert(symbol, [per_side.remove(0), per_side.remove(0)]);
+            }
         }
         Ok(Self {
             signal_mode,
@@ -363,15 +417,97 @@ impl HslConfig {
             lookback,
             fee: FeePolicy::from_config(cfg),
             sides,
+            coin_overrides,
+            n_positions,
+            twel,
         })
     }
 
-    /// `_equity_hard_stop_enabled(pside)` for the non-coin modes.
+    pub fn coin_mode(&self) -> bool {
+        self.signal_mode == SignalMode::Coin
+    }
+
+    /// `_equity_hard_stop_config(pside, symbol)`.
+    pub fn side_config(&self, pside: usize, symbol: Option<&str>) -> &SideConfig {
+        match symbol {
+            Some(s) if self.coin_mode() => self
+                .coin_overrides
+                .get(s)
+                .map_or(&self.sides[pside], |o| &o[pside]),
+            _ => &self.sides[pside],
+        }
+    }
+
+    /// `_equity_hard_stop_enabled(pside)`: the global flag, or in coin mode
+    /// also any `coin_overrides` coin enabling the side.
     pub fn enabled(&self, pside: usize) -> bool {
         self.sides[pside].enabled
+            || (self.coin_mode() && self.coin_overrides.values().any(|o| o[pside].enabled))
+    }
+    /// `_equity_hard_stop_enabled(pside, symbol=symbol)`.
+    pub fn enabled_symbol(&self, pside: usize, symbol: &str) -> bool {
+        self.side_config(pside, Some(symbol)).enabled
     }
     pub fn any_enabled(&self) -> bool {
-        self.sides.iter().any(|s| s.enabled)
+        self.enabled(LONG) || self.enabled(SHORT)
+    }
+
+    /// `_equity_hard_stop_coin_active_pside(pside, symbol)` (hsl:2471).
+    pub fn coin_active_pside(&self, pside: usize, symbol: Option<&str>) -> Result<bool> {
+        let enabled = match symbol {
+            Some(s) => self.enabled_symbol(pside, s),
+            None => self.enabled(pside),
+        };
+        if !enabled {
+            return Ok(false);
+        }
+        let n_raw = self.n_positions[pside];
+        if !n_raw.is_finite() || n_raw < 0.0 {
+            bail!(
+                "coin HSL n_positions must be finite and >= 0 for {}, got {n_raw}",
+                PSIDES[pside]
+            );
+        }
+        let n = n_raw.round_ties_even() as i64;
+        if n <= 0 {
+            if n_raw == 0.0 {
+                return Ok(false);
+            }
+            bail!(
+                "coin HSL n_positions must round to > 0 for {}, got {n_raw}",
+                PSIDES[pside]
+            );
+        }
+        let twel = self.twel[pside];
+        if !twel.is_finite() || twel < 0.0 {
+            bail!(
+                "coin HSL total_wallet_exposure_limit must be finite and >= 0 for {}, got {twel}",
+                PSIDES[pside]
+            );
+        }
+        Ok(twel > 0.0)
+    }
+}
+
+/// Python `float(value)` for the JSON scalars a config carries (`NaN` when
+/// it cannot convert; the callers validate finiteness).
+fn py_float(v: &Value) -> f64 {
+    match v {
+        Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+        Value::Bool(b) => f64::from(*b as u8),
+        Value::String(s) => s.trim().parse().unwrap_or(f64::NAN),
+        _ => f64::NAN,
+    }
+}
+
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|x| x != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
     }
 }
 
@@ -389,6 +525,18 @@ pub struct HslFill {
     pub pnl: f64,
     /// Signed cashflow: paid fees are negative.
     pub fee_paid: f64,
+    /// `FillEvent.pb_order_type` (snake case, lower; `unknown` when the
+    /// custom id carries no type marker): `panic` markers anchor coin
+    /// episodes (`_equity_hard_stop_infer_coin_replay_contract`,
+    /// `panic_flatten_events`).
+    pub pb_order_type: String,
+}
+
+impl HslFill {
+    /// `"panic" in pb_order_type`.
+    pub fn is_panic(&self) -> bool {
+        self.pb_order_type.contains("panic")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -463,16 +611,22 @@ pub fn flat_epsilon(qty_step: f64) -> f64 {
     (step * 0.5).max(1e-12)
 }
 
-/// `_equity_hard_stop_latest_flatten_fill_timestamp_optional_ms` (hsl:3122).
+/// `_equity_hard_stop_latest_flatten_fill_timestamp_optional_ms` (hsl:3122);
+/// `symbol` scopes the lookup to one coin (coin mode).
 pub fn latest_flatten_fill_timestamp(
     fills: &[HslFill],
     pside: usize,
+    symbol: Option<&str>,
     since_ms: Option<u64>,
     replay_start_sizes: Option<&BTreeMap<String, f64>>,
 ) -> Option<u64> {
     let candidates: Vec<&HslFill> = fills
         .iter()
-        .filter(|f| f.pside == pside && since_ms.is_none_or(|s| f.timestamp_ms >= s))
+        .filter(|f| {
+            f.pside == pside
+                && symbol.is_none_or(|s| f.symbol == s)
+                && since_ms.is_none_or(|s| f.timestamp_ms >= s)
+        })
         .collect();
     let Some(start) = replay_start_sizes else {
         return candidates.iter().map(|f| f.timestamp_ms).max();
@@ -585,6 +739,10 @@ pub struct LatchPayload {
     pub cooldown_until_ms: Option<u64>,
     pub no_restart_peak_strategy_equity: f64,
     pub no_restart_drawdown_raw: f64,
+    /// `false` for the payload the coin replay synthesises from a panic
+    /// contract without a reconstructed stop sample (hsl:6772: only
+    /// `stop_event_timestamp_ms`, `cooldown_until_ms`, `no_restart_latched`).
+    pub complete: bool,
 }
 
 /// `_equity_hard_stop_make_state` (hsl:2430) minus logging throttles.
@@ -683,15 +841,36 @@ pub fn halted_mode(
     }
 }
 
-/// Per-side HSL modes carried into the snapshot builder (`CycleState.hsl`).
+/// Per-side HSL modes carried into the snapshot builder (`CycleState.hsl`),
+/// plus the coin-mode state `_orchestrator_mode_override` steps 2-3 read:
+/// the replay-pending pairs and the runtime forced modes the coin machine
+/// sets (`_equity_hard_stop_set_coin_runtime_forced_mode`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HslModes {
     pub sides: [HslSideMode; 2],
+    /// `_equity_hard_stop_enabled(pside) and hsl_signal_mode == "coin"`.
+    pub coin_enabled: [bool; 2],
+    /// `_equity_hard_stop_coin_replay_pending_pairs`.
+    pub replay_pending: BTreeSet<(usize, String)>,
+    /// `_runtime_forced_modes[pside][symbol]`.
+    pub runtime_forced: [BTreeMap<String, String>; 2],
 }
 
 impl HslModes {
     pub fn side(&self, pside: &str) -> &HslSideMode {
         &self.sides[pside_index(pside)]
+    }
+    /// Coin-mode replay pending for `(pside, symbol)` (step 2).
+    pub fn replay_pending(&self, pside: &str, symbol: &str) -> bool {
+        let i = pside_index(pside);
+        self.coin_enabled[i] && self.replay_pending.contains(&(i, symbol.to_string()))
+    }
+    /// `_runtime_forced_modes[pside].get(symbol)` (step 3).
+    pub fn runtime_forced(&self, pside: &str, symbol: &str) -> Option<&str> {
+        self.runtime_forced[pside_index(pside)]
+            .get(symbol)
+            .map(String::as_str)
+            .filter(|m| !m.is_empty())
     }
 }
 
@@ -755,6 +934,15 @@ pub struct TimelineRow {
 pub struct HslState {
     pub cfg: HslConfig,
     pub sides: [SideState; 2],
+    /// Coin mode: `_equity_hard_stop_coin[pside][symbol]` (`hsl_coin.rs`).
+    pub coin: [BTreeMap<String, crate::hsl_coin::CoinState>; 2],
+    /// `_runtime_forced_modes[pside][symbol]` as the coin machine sets them.
+    pub runtime_forced: [BTreeMap<String, String>; 2],
+    /// `_equity_hard_stop_coin_initialized`.
+    pub coin_initialized: bool,
+    /// `_equity_hard_stop_coin_replay_pending_pairs` (empty once the
+    /// synchronous history replay of `hsl_coin.rs` completed).
+    pub replay_pending: BTreeSet<(usize, String)>,
 }
 
 impl HslState {
@@ -762,6 +950,10 @@ impl HslState {
         Self {
             cfg,
             sides: [SideState::default(), SideState::default()],
+            coin: [BTreeMap::new(), BTreeMap::new()],
+            runtime_forced: [BTreeMap::new(), BTreeMap::new()],
+            coin_initialized: false,
+            replay_pending: BTreeSet::new(),
         }
     }
 
@@ -774,6 +966,13 @@ impl HslState {
         for s in &mut self.sides {
             *s = SideState::default();
         }
+        for m in &mut self.coin {
+            m.clear();
+        }
+        for m in &mut self.runtime_forced {
+            m.clear();
+        }
+        self.replay_pending.clear();
     }
 
     fn lookback_ms(&self) -> Option<u64> {
@@ -1017,6 +1216,7 @@ impl HslState {
             cooldown_until_ms: fin.cooldown_until_ms,
             no_restart_peak_strategy_equity: fin.no_restart_peak_strategy_equity,
             no_restart_drawdown_raw: fin.no_restart_drawdown_raw,
+            complete: true,
         });
         state.halted = true;
         state.no_restart_latched = fin.no_restart_latched;
@@ -1054,7 +1254,7 @@ impl HslState {
         // `_flatten_fill_timestamp_with_refresh`: no `since` -> deferred.
         let Some(since) = since else { return Ok(false) };
         let Some(stop_ts) =
-            latest_flatten_fill_timestamp(inp.fills, pside, Some(since), Some(&start_sizes))
+            latest_flatten_fill_timestamp(inp.fills, pside, None, Some(since), Some(&start_sizes))
         else {
             return Ok(false);
         };
@@ -1073,6 +1273,7 @@ impl HslState {
             cooldown_until_ms,
             no_restart_peak_strategy_equity: ev.peak_strategy_equity,
             no_restart_drawdown_raw: ev.drawdown_raw,
+            complete: true,
         });
         state.cooldown_until_ms = cooldown_until_ms;
         state.cooldown_intervention_active = false;
@@ -1161,7 +1362,7 @@ impl HslState {
             return Ok(());
         }
         if self.cfg.signal_mode == SignalMode::Coin {
-            bail!("HSL coin signal mode is not modelled");
+            bail!("HSL coin signal mode: use HslState::check_coin (hsl_coin.rs)");
         }
         let ts_ms = inp.now_ms;
         let unrealized_total = self.unrealized_total(&inp.unrealized_pnl);
@@ -1242,7 +1443,7 @@ impl HslState {
                 Supervision::Production => {
                     let since = self.sides[pside].pending_red_since_ms;
                     let stop_ts = since.and_then(|since| {
-                        latest_flatten_fill_timestamp(inp.fills, pside, Some(since), None)
+                        latest_flatten_fill_timestamp(inp.fills, pside, None, Some(since), None)
                     });
                     match stop_ts {
                         Some(stop_ts) => {
@@ -1313,9 +1514,20 @@ impl HslState {
         Ok(true)
     }
 
-    /// The per-side modes for the snapshot builder.
+    /// The per-side modes for the snapshot builder; in coin mode the
+    /// account-level sides stay `None` (their states are never fed,
+    /// pb:17115 step 1 is a no-op) and the coin fields carry the runtime
+    /// forced modes and the replay-pending pairs (steps 2-3).
     pub fn modes(&self) -> HslModes {
         let mut out = HslModes::default();
+        if self.cfg.coin_mode() {
+            for pside in [LONG, SHORT] {
+                out.coin_enabled[pside] = self.cfg.enabled(pside);
+            }
+            out.replay_pending = self.replay_pending.clone();
+            out.runtime_forced = self.runtime_forced.clone();
+            return out;
+        }
         for pside in [LONG, SHORT] {
             if !self.cfg.enabled(pside) {
                 continue;
@@ -1454,6 +1666,7 @@ impl HslState {
                     cooldown_until_ms: fin.cooldown_until_ms,
                     no_restart_peak_strategy_equity: fin.no_restart_peak_strategy_equity,
                     no_restart_drawdown_raw: fin.no_restart_drawdown_raw,
+                    complete: true,
                 });
                 s.halted = true;
                 s.no_restart_latched = fin.no_restart_latched;
@@ -1495,7 +1708,7 @@ impl HslState {
 }
 
 /// Python `max(a, b)`: the first argument wins ties (relevant for NaN/-0.0 only).
-fn py_max2(a: f64, b: f64) -> f64 {
+pub(crate) fn py_max2(a: f64, b: f64) -> f64 {
     if b > a {
         b
     } else {
@@ -1508,6 +1721,70 @@ fn py_min2(a: f64, b: f64) -> f64 {
     } else {
         a
     }
+}
+
+/// One reconstructed panic flatten of the history replay
+/// (`panic_flatten_events`, pb:15436): a `panic` fill after which the
+/// scope is flat by the replay's own accounting (`psize` from
+/// `compute_psize_pprice`, the current flat position or the replay slot).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanicFlatten {
+    pub timestamp: u64,
+    pub minute_timestamp: u64,
+    pub pside: usize,
+    pub symbol: String,
+}
+
+/// One coin's per-minute series of the compact coin replay; `NaN` = no
+/// value for that minute (pb:15368: realized only once the coin had a fill,
+/// unrealized only while priced or once flat).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PairSeries {
+    pub realized: Vec<f64>,
+    pub unrealized: Vec<f64>,
+}
+
+/// `get_balance_equity_history(hsl_replay_signal_mode="coin",
+/// hsl_coin_compact_replay=True)` (pb:14661): the account minute grid from
+/// the lookback start (or the first fill) to `now`, the per-pair series and
+/// the panic flatten markers.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CoinHistory {
+    pub timestamps: Vec<u64>,
+    pub balances: Vec<f64>,
+    pub realized_pnl: Vec<f64>,
+    pub pair_values: BTreeMap<(usize, String), PairSeries>,
+    pub panic_flatten_events: Vec<PanicFlatten>,
+    /// `fill_events`: the normalised events in replay order
+    /// (`_hsl_extract_fill_events`).
+    pub fill_events: Vec<HslFill>,
+}
+
+/// Everything the replay needs to know about the account besides the fills.
+pub struct ReplayInputs<'a> {
+    pub now_ms: u64,
+    pub balance_now: f64,
+    pub lookback: PnlsLookback,
+    pub fills: &'a [HslFill],
+    /// Non-flat positions now (`fetched_positions`).
+    pub positions: &'a [HslPosition],
+    /// Symbols with an entry in `self.positions` (zero-size ones included:
+    /// every symbol of the planning universe, SPEC 2.1); their flat sides
+    /// count as "authoritatively flat" for the panic markers.
+    pub known_positions: &'a BTreeSet<String>,
+    /// 1m close of `(symbol, minute)` (`> 0`) or `None`; only consulted for
+    /// finalized minutes (`< floor(now)`), rounded to f32 like the candle
+    /// manager's storage.
+    pub close_at: &'a dyn Fn(&str, u64) -> Option<f64>,
+    pub c_mult: &'a dyn Fn(&str) -> f64,
+    pub qty_step: &'a dyn Fn(&str) -> f64,
+    /// `symbol in self.c_mults`.
+    pub known_market: &'a dyn Fn(&str) -> bool,
+}
+
+enum ReplayOutput {
+    Timeline(Vec<TimelineRow>),
+    Coin(CoinHistory),
 }
 
 /// `get_balance_equity_history` timeline (pb:14661-15700) for the account
@@ -1530,8 +1807,85 @@ pub fn balance_equity_timeline(
     qty_step: &dyn Fn(&str) -> f64,
     known_market: &dyn Fn(&str) -> bool,
 ) -> Vec<TimelineRow> {
-    let is_flat = |symbol: &str, size: f64| size.abs() <= flat_epsilon(qty_step(symbol));
-    let mut events: Vec<&HslFill> = fills.iter().collect();
+    let known_positions: BTreeSet<String> = positions.iter().map(|p| p.symbol.clone()).collect();
+    let inputs = ReplayInputs {
+        now_ms,
+        balance_now,
+        lookback,
+        fills,
+        positions,
+        known_positions: &known_positions,
+        close_at,
+        c_mult,
+        qty_step,
+        known_market,
+    };
+    match replay_history(&inputs, false) {
+        ReplayOutput::Timeline(t) => t,
+        ReplayOutput::Coin(_) => unreachable!(),
+    }
+}
+
+/// The coin-mode history (`hsl_coin_compact_replay=True`).
+pub fn coin_history(inputs: &ReplayInputs) -> CoinHistory {
+    match replay_history(inputs, true) {
+        ReplayOutput::Coin(c) => c,
+        ReplayOutput::Timeline(_) => unreachable!(),
+    }
+}
+
+/// `compute_psize_pprice(events)` as `get_balance_equity_history` ends up
+/// calling it (pb:14783: the `final_state=` keyword raises `TypeError`, the
+/// fallback runs forward from zero with the *unsigned* `qty` of the
+/// extracted events): per (symbol, pside) group in first-appearance order,
+/// `qty * c_mult` always adds to a long and always reduces a short, so a
+/// long's `psize` never returns to zero and a short's stays zero. Returned
+/// per event index, rounded to 12 decimals like Python.
+fn psize_after_quirk(events: &[&HslFill], c_mult: &dyn Fn(&str) -> f64) -> Vec<f64> {
+    let mut out = vec![0.0; events.len()];
+    let mut groups: Vec<((String, usize), Vec<usize>)> = Vec::new();
+    for (i, e) in events.iter().enumerate() {
+        let key = (e.symbol.clone(), e.pside);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, idxs)) => idxs.push(i),
+            None => groups.push((key, vec![i])),
+        }
+    }
+    for ((symbol, pside), idxs) in groups {
+        let mut psize = 0.0f64;
+        for i in idxs {
+            let qty_signed = events[i].qty * c_mult(&symbol);
+            let (add, reduce) = if pside == SHORT {
+                ((-qty_signed).max(0.0), qty_signed.max(0.0))
+            } else {
+                (qty_signed.max(0.0), (-qty_signed).max(0.0))
+            };
+            if add > 0.0 {
+                psize += add;
+            }
+            if reduce > 0.0 {
+                psize = (psize - reduce).max(0.0);
+                if psize <= 1e-12 {
+                    psize = 0.0;
+                }
+            }
+            out[i] = (psize * 1e12).round() / 1e12;
+        }
+    }
+    out
+}
+
+fn replay_history(inp: &ReplayInputs, coin: bool) -> ReplayOutput {
+    let now_ms = inp.now_ms;
+    let is_flat = |symbol: &str, size: f64| size.abs() <= flat_epsilon((inp.qty_step)(symbol));
+    let c_mult = inp.c_mult;
+    // `_hsl_extract_fill_events`: valid quantities and prices, sorted by
+    // timestamp (stable: the ledger order breaks ties).
+    let mut events: Vec<&HslFill> = inp
+        .fills
+        .iter()
+        .filter(|f| f.qty > 0.0 && f.price > 0.0 && !f.symbol.is_empty())
+        .collect();
     events.sort_by_key(|f| f.timestamp_ms);
     let single_point = |b: f64| TimelineRow {
         timestamp: now_ms,
@@ -1543,10 +1897,20 @@ pub fn balance_equity_timeline(
         is_flat_by_pside: [true, true],
     };
     if events.is_empty() {
-        return vec![single_point(balance_now)];
+        return if coin {
+            ReplayOutput::Coin(CoinHistory {
+                timestamps: vec![now_ms],
+                balances: vec![inp.balance_now],
+                realized_pnl: vec![0.0],
+                ..CoinHistory::default()
+            })
+        } else {
+            ReplayOutput::Timeline(vec![single_point(inp.balance_now)])
+        };
     }
-    let lookback_start = lookback.balance_history_start_ms(now_ms);
-    let balance_now = balance_now.max(0.0);
+    let psize_after = psize_after_quirk(&events, c_mult);
+    let lookback_start = inp.lookback.balance_history_start_ms(now_ms);
+    let balance_now = inp.balance_now.max(0.0);
     let mut total_realised = 0.0;
     for e in &events {
         if e.timestamp_ms <= now_ms {
@@ -1567,7 +1931,8 @@ pub fn balance_equity_timeline(
     if end_minute < record_start_minute {
         end_minute = record_start_minute;
     }
-    let current_position_symbols: BTreeSet<String> = positions
+    let current_position_symbols: BTreeSet<String> = inp
+        .positions
         .iter()
         .filter(|p| !is_flat(&p.symbol, p.size))
         .map(|p| p.symbol.clone())
@@ -1582,89 +1947,167 @@ pub fn balance_equity_timeline(
         .map(|e| e.symbol.clone())
         .collect();
     symbols.extend(current_position_symbols.iter().cloned());
-    let price_replay_symbols: BTreeSet<String> = symbols
+    let panic_event_symbols: BTreeSet<&str> = events
         .iter()
-        .filter(|s| known_market(s) || current_position_symbols.contains(*s))
-        .cloned()
+        .filter(|e| e.is_panic())
+        .map(|e| e.symbol.as_str())
         .collect();
+    let mut price_replay_symbols: BTreeSet<String> = symbols.clone();
+    if coin {
+        price_replay_symbols.retain(|s| {
+            current_position_symbols.contains(s) || panic_event_symbols.contains(s.as_str())
+        });
+    }
+    price_replay_symbols.retain(|s| (inp.known_market)(s) || current_position_symbols.contains(s));
+
+    // `actual_symbol_pside_flat` over `self.positions` (zero entries too)
+    // and the newest event per scope, for the panic markers.
+    let mut actual_flat: BTreeMap<(String, usize), bool> = BTreeMap::new();
+    for s in inp.known_positions {
+        for pside in [LONG, SHORT] {
+            actual_flat.insert((s.clone(), pside), true);
+        }
+    }
+    for p in inp.positions {
+        actual_flat.insert(
+            (p.symbol.clone(), p.pside),
+            is_flat(&p.symbol, p.size.abs()),
+        );
+    }
+    let mut last_event_ts: BTreeMap<(String, usize), u64> = BTreeMap::new();
+    for e in &events {
+        let t = last_event_ts
+            .entry((e.symbol.clone(), e.pside))
+            .or_insert(0);
+        *t = (*t).max(e.timestamp_ms);
+    }
 
     #[derive(Default, Clone, Copy)]
     struct Slot {
         size: f64,
         price: f64,
     }
-    let mut slots: BTreeMap<String, [Slot; 2]> = BTreeMap::new();
-    let mut active: BTreeSet<String> = BTreeSet::new();
-    let mut realized_running = [0.0f64; 2];
-    let mut balance = baseline_balance;
-    let apply = |e: &HslFill,
-                 slots: &mut BTreeMap<String, [Slot; 2]>,
-                 active: &mut BTreeSet<String>,
-                 balance: &mut f64,
-                 realized_running: &mut [f64; 2]| {
-        let sides = slots.entry(e.symbol.clone()).or_default();
-        let slot = &mut sides[e.pside];
-        if e.increase {
-            let old_size = slot.size;
-            let new_size = old_size + e.qty;
-            if new_size <= 0.0 {
-                slot.size = 0.0;
-                slot.price = 0.0;
-            } else if old_size <= 0.0 {
-                slot.size = new_size;
-                slot.price = e.price;
+    #[derive(Default)]
+    struct Replay {
+        slots: BTreeMap<String, [Slot; 2]>,
+        active: BTreeSet<String>,
+        realized_running: [f64; 2],
+        realized_coin: BTreeMap<String, [f64; 2]>,
+        balance: f64,
+        panic_flatten: Vec<PanicFlatten>,
+    }
+    struct Marker<'m> {
+        psize_after: &'m [f64],
+        actual_flat: &'m BTreeMap<(String, usize), bool>,
+        last_event_ts: &'m BTreeMap<(String, usize), u64>,
+    }
+    impl Replay {
+        /// `apply_event_and_account`.
+        fn apply(
+            &mut self,
+            e: &HslFill,
+            i: usize,
+            minute_for_panic: Option<u64>,
+            is_flat: &dyn Fn(&str, f64) -> bool,
+            marker: &Marker,
+        ) {
+            let sides = self.slots.entry(e.symbol.clone()).or_default();
+            let slot = &mut sides[e.pside];
+            if e.increase {
+                let old_size = slot.size;
+                let new_size = old_size + e.qty;
+                if new_size <= 0.0 {
+                    slot.size = 0.0;
+                    slot.price = 0.0;
+                } else if old_size <= 0.0 {
+                    slot.size = new_size;
+                    slot.price = e.price;
+                } else {
+                    slot.price = ((old_size * slot.price + e.qty * e.price) / new_size).max(0.0);
+                    slot.size = new_size;
+                }
             } else {
-                slot.price = ((old_size * slot.price + e.qty * e.price) / new_size).max(0.0);
-                slot.size = new_size;
+                slot.size = (slot.size - e.qty).max(0.0);
+                if slot.size <= 0.0 {
+                    slot.price = 0.0;
+                }
             }
-        } else {
-            slot.size = (slot.size - e.qty).max(0.0);
-            if slot.size <= 0.0 {
-                slot.price = 0.0;
+            let has_pos = !is_flat(&e.symbol, sides[e.pside].size);
+            let slot_flat = !has_pos;
+            if has_pos {
+                self.active.insert(e.symbol.clone());
+            } else if sides.iter().all(|s| is_flat(&e.symbol, s.size)) {
+                self.active.remove(&e.symbol);
+            }
+            let realized_delta = e.pnl + e.fee_paid;
+            self.balance += realized_delta;
+            self.realized_running[e.pside] += realized_delta;
+            self.realized_coin.entry(e.symbol.clone()).or_default()[e.pside] += realized_delta;
+            let Some(minute) = minute_for_panic else {
+                return;
+            };
+            if !e.is_panic() {
+                return;
+            }
+            let key = (e.symbol.clone(), e.pside);
+            let after_psize = marker.psize_after[i];
+            let override_flat = marker.actual_flat.get(&key).copied().unwrap_or(false)
+                && marker.last_event_ts.get(&key).copied() == Some(e.timestamp_ms);
+            if (after_psize.is_finite() && is_flat(&e.symbol, after_psize))
+                || override_flat
+                || slot_flat
+            {
+                self.panic_flatten.push(PanicFlatten {
+                    timestamp: e.timestamp_ms,
+                    minute_timestamp: minute,
+                    pside: e.pside,
+                    symbol: e.symbol.clone(),
+                });
             }
         }
-        let has_pos = !is_flat(&e.symbol, sides[e.pside].size);
-        if has_pos {
-            active.insert(e.symbol.clone());
-        } else if sides.iter().all(|s| is_flat(&e.symbol, s.size)) {
-            active.remove(&e.symbol);
-        }
-        let realized_delta = e.pnl + e.fee_paid;
-        *balance += realized_delta;
-        realized_running[e.pside] += realized_delta;
+    }
+    let marker = Marker {
+        psize_after: &psize_after,
+        actual_flat: &actual_flat,
+        last_event_ts: &last_event_ts,
+    };
+    let mut rp = Replay {
+        balance: baseline_balance,
+        ..Replay::default()
     };
 
     let mut idx = 0usize;
     while idx < events.len() && events[idx].timestamp_ms < record_start_ts {
-        apply(
-            events[idx],
-            &mut slots,
-            &mut active,
-            &mut balance,
-            &mut realized_running,
-        );
+        rp.apply(events[idx], idx, None, &is_flat, &marker);
         idx += 1;
     }
-    let record_start_balance = balance;
-    let record_start_realized = realized_running;
+    let record_start_balance = rp.balance;
+    let record_start_realized = rp.realized_running;
+    let record_start_coin = rp.realized_coin.clone();
 
+    // Coin mode: the pair grid is `sorted(symbols) x psides`.
+    let mut history = CoinHistory::default();
+    if coin {
+        for s in &symbols {
+            for pside in [LONG, SHORT] {
+                history
+                    .pair_values
+                    .insert((pside, s.clone()), PairSeries::default());
+            }
+        }
+    }
     let mut last_price: BTreeMap<String, f64> = BTreeMap::new();
     let mut timeline = Vec::new();
     let mut minute = start_minute;
     while minute <= end_minute {
         let boundary = minute + ONE_MIN_MS;
         while idx < events.len() && events[idx].timestamp_ms < boundary {
-            apply(
-                events[idx],
-                &mut slots,
-                &mut active,
-                &mut balance,
-                &mut realized_running,
-            );
+            rp.apply(events[idx], idx, Some(minute), &is_flat, &marker);
             idx += 1;
         }
         let mut upnl_by_pside = [0.0f64; 2];
-        for symbol in active.iter() {
+        let mut upnl_by_coin: BTreeMap<&str, [f64; 2]> = BTreeMap::new();
+        for symbol in rp.active.iter() {
             if !price_replay_symbols.contains(symbol) {
                 continue;
             }
@@ -1674,7 +2117,7 @@ pub fn balance_equity_timeline(
             let close = if minute >= floor_min(now_ms) {
                 None
             } else {
-                close_at(symbol, minute)
+                (inp.close_at)(symbol, minute)
             };
             // The manager stores candles as float32 (`CandlestickManager`
             // dtype): the replay sees the close rounded to f32.
@@ -1689,7 +2132,7 @@ pub fn balance_equity_timeline(
             if price <= 0.0 {
                 continue;
             }
-            let Some(sides) = slots.get(symbol) else {
+            let Some(sides) = rp.slots.get(symbol) else {
                 continue;
             };
             for pside in [LONG, SHORT] {
@@ -1697,35 +2140,74 @@ pub fn balance_equity_timeline(
                 if slot.size <= 0.0 || slot.price <= 0.0 {
                     continue;
                 }
-                upnl_by_pside[pside] +=
-                    hsl_pnl(pside, slot.price, price, slot.size, c_mult(symbol));
+                let u = hsl_pnl(pside, slot.price, price, slot.size, c_mult(symbol));
+                upnl_by_pside[pside] += u;
+                upnl_by_coin.entry(symbol.as_str()).or_default()[pside] += u;
             }
         }
         if minute >= record_start_minute {
-            let flat_side = |pside: usize| {
-                !slots
-                    .iter()
-                    .any(|(sym, sides)| !is_flat(sym, sides[pside].size))
-            };
-            timeline.push(TimelineRow {
-                timestamp: minute,
-                balance,
-                realized_pnl: balance - record_start_balance,
-                unrealized_pnl: upnl_by_pside,
-                realized_pnl_by_pside: [
-                    realized_running[LONG] - record_start_realized[LONG],
-                    realized_running[SHORT] - record_start_realized[SHORT],
-                ],
-                is_flat: active.is_empty(),
-                is_flat_by_pside: [flat_side(LONG), flat_side(SHORT)],
-            });
+            if coin {
+                history.timestamps.push(minute);
+                history.balances.push(rp.balance);
+                history.realized_pnl.push(rp.balance - record_start_balance);
+                let row = history.timestamps.len() - 1;
+                for series in history.pair_values.values_mut() {
+                    series.realized.push(f64::NAN);
+                    series.unrealized.push(f64::NAN);
+                }
+                for (sym, values) in &rp.realized_coin {
+                    let anchor = record_start_coin.get(sym).copied().unwrap_or([0.0; 2]);
+                    for pside in [LONG, SHORT] {
+                        let Some(series) = history.pair_values.get_mut(&(pside, sym.clone()))
+                        else {
+                            continue;
+                        };
+                        series.realized[row] = values[pside] - anchor[pside];
+                        if !rp.active.contains(sym) {
+                            series.unrealized[row] = 0.0;
+                        }
+                    }
+                }
+                for (sym, values) in &upnl_by_coin {
+                    for pside in [LONG, SHORT] {
+                        if let Some(series) = history.pair_values.get_mut(&(pside, sym.to_string()))
+                        {
+                            series.unrealized[row] = values[pside];
+                        }
+                    }
+                }
+            } else {
+                let flat_side = |pside: usize| {
+                    !rp.slots
+                        .iter()
+                        .any(|(sym, sides)| !is_flat(sym, sides[pside].size))
+                };
+                timeline.push(TimelineRow {
+                    timestamp: minute,
+                    balance: rp.balance,
+                    realized_pnl: rp.balance - record_start_balance,
+                    unrealized_pnl: upnl_by_pside,
+                    realized_pnl_by_pside: [
+                        rp.realized_running[LONG] - record_start_realized[LONG],
+                        rp.realized_running[SHORT] - record_start_realized[SHORT],
+                    ],
+                    is_flat: rp.active.is_empty(),
+                    is_flat_by_pside: [flat_side(LONG), flat_side(SHORT)],
+                });
+            }
         }
         minute += ONE_MIN_MS;
     }
-    if timeline.is_empty() {
-        timeline.push(single_point(balance_now));
+    if coin {
+        history.panic_flatten_events = rp.panic_flatten;
+        history.fill_events = events.into_iter().cloned().collect();
+        ReplayOutput::Coin(history)
+    } else {
+        if timeline.is_empty() {
+            timeline.push(single_point(balance_now));
+        }
+        ReplayOutput::Timeline(timeline)
     }
-    timeline
 }
 
 #[cfg(test)]
@@ -1951,6 +2433,7 @@ mod tests {
             increase,
             pnl: 0.0,
             fee_paid: 0.0,
+            pb_order_type: "unknown".into(),
         }
     }
 
@@ -2175,16 +2658,47 @@ mod tests {
     }
 
     #[test]
-    fn coin_mode_with_hsl_enabled_is_refused_and_disabled_is_fine() {
+    fn coin_mode_is_accepted_with_per_coin_overrides() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/configs/fake_v8/grid_v7.json");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let cfg = HslConfig::from_config(&ConfigView::new(v.clone()).unwrap()).unwrap();
         assert_eq!(cfg.signal_mode, SignalMode::Coin);
         assert!(!cfg.any_enabled());
+        // grid_v7's XRP / DOGE overrides carry no `hsl` block: their per-coin
+        // config is the global one.
+        assert_eq!(
+            cfg.coin_overrides.keys().cloned().collect::<Vec<_>>(),
+            vec!["DOGE/USDT:USDT".to_string(), "XRP/USDT:USDT".to_string()]
+        );
+        assert_eq!(
+            cfg.side_config(LONG, Some("XRP/USDT:USDT")).red_threshold,
+            0.15
+        );
         let mut on = v;
         on["bot"]["long"]["hsl"]["enabled"] = Value::Bool(true);
-        assert!(HslConfig::from_config(&ConfigView::new(on).unwrap()).is_err());
+        on["bot"]["long"]["hsl"]["red_threshold"] = serde_json::json!(0.06);
+        on["coin_overrides"]["BTC"] = serde_json::json!({
+            "bot": {"long": {"hsl": {"red_threshold": 0.3, "tier_ratios": {"yellow": 0.4}}}}
+        });
+        let cfg = HslConfig::from_config(&ConfigView::new(on).unwrap()).unwrap();
+        assert!(cfg.coin_mode());
+        assert!(cfg.enabled(LONG));
+        assert!(!cfg.enabled(SHORT));
+        assert_eq!(cfg.n_positions[LONG], 3.0);
+        let btc = cfg.side_config(LONG, Some("BTC/USDT:USDT"));
+        assert_eq!(btc.red_threshold, 0.3);
+        assert_eq!(btc.ratio_yellow, 0.4);
+        assert_eq!(btc.ratio_orange, cfg.sides[LONG].ratio_orange);
+        let ada = cfg.side_config(LONG, Some("ADA/USDT:USDT"));
+        assert_eq!(ada.red_threshold, 0.06);
+        // Existing non-HSL overrides (XRP, DOGE) inherit the global HSL block.
+        assert_eq!(
+            cfg.side_config(LONG, Some("DOGE/USDT:USDT")).red_threshold,
+            0.06
+        );
+        assert!(cfg.coin_active_pside(LONG, Some("BTC/USDT:USDT")).unwrap());
+        assert!(!cfg.coin_active_pside(SHORT, None).unwrap());
     }
 
     #[test]
@@ -2199,21 +2713,21 @@ mod tests {
             fill(300, "A/USDT:USDT", 2.0, false),
         ];
         assert_eq!(
-            latest_flatten_fill_timestamp(&fills, LONG, None, None),
+            latest_flatten_fill_timestamp(&fills, LONG, None, None, None),
             Some(300)
         );
         assert_eq!(
-            latest_flatten_fill_timestamp(&fills, LONG, Some(400), None),
+            latest_flatten_fill_timestamp(&fills, LONG, None, Some(400), None),
             None
         );
         let start: BTreeMap<String, f64> = [("A/USDT:USDT".to_string(), 1.0)].into();
         // 1 -> 0 at 100 already flattens the replayed scope.
         assert_eq!(
-            latest_flatten_fill_timestamp(&fills, LONG, Some(0), Some(&start)),
+            latest_flatten_fill_timestamp(&fills, LONG, None, Some(0), Some(&start)),
             Some(100)
         );
         assert_eq!(
-            latest_flatten_fill_timestamp(&fills, LONG, Some(150), Some(&start)),
+            latest_flatten_fill_timestamp(&fills, LONG, None, Some(150), Some(&start)),
             Some(300)
         );
         assert!(approx(realized_pnl_now(&fills, None, None), -2.1));

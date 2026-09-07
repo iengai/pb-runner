@@ -376,8 +376,8 @@ symbol; then `_apply_exchange_symbol_unavailable_planning_policy`
 `_orchestrator_mode_override`:
 
 1. HSL (`_equity_hard_stop_enabled(pside)`): red latched and not halted -> `panic`; halted -> `_equity_hard_stop_halted_mode` (hsl:2924: when the symbol holds a position, `panic` if the cooldown residue is unresolved, else `panic|manual|tp_only|graceful_stop` per `live.hsl_position_during_cooldown_policy` (default `panic`; `normal` and `graceful_stop` both give `graceful_stop`); flat symbols -> `graceful_stop`); orange tier -> `hsl_orange_tier_mode` (`graceful_stop` or `tp_only_with_active_entry_cancellation`). **Modelled** (2026-09-08, D16): `hsl.rs` owns the per-side state machine (`HslState`, engine `HardStopState` + `RollingPeakTracker`, `_equity_hard_stop_check`, the RED supervisor's flat confirmations and `finalize_red_stop`, cooldown handling, start-up replay from the fill history); `HslState::modes()` -> `CycleState.hsl` -> `SnapshotBuilder::with_hsl`, which applies this step in `mode_override` and, through `side_forced_mode` (= `get_forced_PB_mode(pside)`), in `_pside_blocks_new_entries` for the universe. Note `is_forager_mode` (pb:8243) only reads the *configured* forced mode, so a red/halted side keeps its forager flag and only loses its candidates from the universe; the symbols already in `self.positions` stay (`CycleState.known_symbols`). Verified by the `grid_v7_hsl` set (README in `tests/fixtures/recordings`).
-2. HSL coin mode with replay pending for `(pside, symbol)` -> configured forced mode if not normal, else `graceful_stop` (both through `_apply_entry_eligibility_mode`). Not modelled: `hsl::HslConfig::from_config` refuses `live.hsl_signal_mode = "coin"` while a side enables HSL (D16); the default is `coin`, so a config that enables HSL must set `unified` or `pside` explicitly for the runner.
-3. `self._runtime_forced_modes[pside][symbol]` (operator runtime overrides) -> `_apply_entry_eligibility_mode(pside, symbol, mode)`.
+2. HSL coin mode with replay pending for `(pside, symbol)` -> configured forced mode if not normal, else `graceful_stop` (both through `_apply_entry_eligibility_mode`). **Modelled** (2026-09-08, D20): `hsl_coin.rs` owns the per-pair machine of `live.hsl_signal_mode = "coin"` (the default): one engine `HardStopState` per `(pside, symbol)` fed with `hsl_coin_drawdown_signal` (`slot_budget = balance / n_positions`, `drawdown_usd = peak_realized - (last_realized + upnl)` over the pair's fills since `max(now - lookback, pnl_reset_timestamp_ms)`; synthetic equity `max(1 - drawdown_raw, 1e-12)` against a peak of 1), the per-pair latch / halt / cooldown / flat-confirmation bookkeeping (`_equity_hard_stop_check_coin`, hsl:7409), the production coin RED supervisor (`_equity_hard_stop_run_coin_red_supervisor`, hsl:8205, one iteration per cycle) and the start-up reconstruction from the fill history with the panic markers decoded from the fills' `pb_order_type` (`_equity_hard_stop_initialize_coin_from_history`, hsl:5569, over `hsl::coin_history` = `get_balance_equity_history(coin, compact)`). In coin mode the account-level state of step 1 is never fed (step 1 and `get_forced_PB_mode(pside)` are no-ops: the universe and the forager flag are untouched); the pair modes reach the orchestrator through `HslModes.replay_pending` (this step; empty once the synchronous replay finished) and `HslModes.runtime_forced` (step 3). Per-coin `hsl_*` values come from `coin_overrides` (`HslConfig::coin_overrides`, `side_config(pside, symbol)`). Verified by the `grid_v7_hsl_coin` set (README in `tests/fixtures/recordings`).
+3. `self._runtime_forced_modes[pside][symbol]` (operator runtime overrides and the coin HSL machine's forced modes: `panic` on a red pair, `tp_only_with_active_entry_cancellation` on a recovered red-seen pair or an orange pair, `graceful_stop` on a halted pair, the cooldown-policy mode on a position held during a cooldown) -> `_apply_entry_eligibility_mode(pside, symbol, mode)`. **Modelled** for the coin machine's entries (D20); operator overrides have no source in the runner.
 4. `config_get(["live", f"forced_mode_{pside}"], symbol)` (per-symbol override or global `live.forced_mode_long/short`) -> `expand_PB_mode` (`config/overrides.py:798`: `gs|graceful_stop|graceful-stop`, `m|manual`, `n|normal`, `p|panic`, `t|tp|tp_only|tp-only`; anything else raises) -> `_apply_entry_eligibility_mode`.
 5. `not markets_dict[symbol]["active"]` -> `tp_only`.
 6. `self.ineligible_symbols.get(symbol)` (exchange eligibility, e.g. wrong quote/margin): `"not active"` -> `tp_only`, else `manual`.
@@ -941,12 +941,35 @@ validated; a per-symbol `forager_score_weights` is canonicalised at use.
      only finalized minutes, so the replay row of the current minute
      carries the previous close forward; `reset_after_restart` keeps
      `last_stop_event`; the history replay's stop-event anchor is the latest
-     scope fill inside the flatten window. Not modelled: coin mode (refused),
-     panic-marker reconstruction from `pb_order_type`, operator runtime
-     forced modes, the production protective-panic input path (the runner
-     runs red supervision through the normal planning path with `panic`
-     overrides like the fake harness; `Supervision::Production` anchors the
-     stop event at the flattening fill, hsl:8068).
+     scope fill inside the flatten window. Coin mode (`hsl_coin.rs`, D20):
+     **modelled** -- per-pair states in `HslState.coin`, the runtime forced
+     modes in `HslState.runtime_forced` (`HslModes` carries both plus the
+     replay-pending pairs into `mode_override` steps 2-3), the start-up
+     reconstruction in `HslState::initialize_coin_from_history` over
+     `hsl::coin_history` (the shared fill replay: minute grid, per-pair
+     realized/unrealized series, panic flatten markers from the fills'
+     `pb_order_type` with Python's `compute_psize_pprice` fallback quirk,
+     `psize_after_quirk`), dense rows for held / ambiguous pairs and the
+     change-point rows (`compact_sparse_replay_indices`) for the rest, the
+     cooldown contract inferred from the panic fills
+     (`infer_coin_replay_contract`). The replay-matrix cache is only an
+     accelerator in Python ("never becomes authoritative", hsl:1874) and is
+     not ported; the background/partial replay (`mark_protective_ready`) is
+     not either -- the runner replays synchronously at warmup. Per cycle
+     `LiveRunner` runs `check_coin`; when pairs still need panic
+     supervision it runs one production supervisor iteration
+     (`supervise_coin_red`: flat confirmations, sample refresh, finalization)
+     and then plans the protective-panic input
+     (`SnapshotBuilder::build_protective`,
+     `calc_protective_panic_ideal_orders_orchestrator` pb:16516: target
+     symbols holding a position, `panic` / `manual` per pside, no EMAs, no
+     trailing, `auto_unstuck_allowed = false`, zero realized cumsum;
+     reconciliation limited to the target pairs without mode filters,
+     `PB_modes` untouched) instead of the normal one, as the production loop
+     does at `execution_delay_seconds` cadence. Not modelled: operator
+     runtime forced modes (the runner's map is written by the coin machine
+     only), the account-level modes' protective path (unified / pside keep
+     D16 item 3).
    A cold-started runner reproduces the *first* cycle of a cold-started
    Python bot; both then diverge from each other only through the items
    still marked open.
@@ -982,8 +1005,9 @@ validated; a per-symbol `forager_score_weights` is canonicalised at use.
 8. **Not traced:** `refresh_approved_ignored_coins_lists` beyond the
    disabled-side rule (approved/ignored resolution, external lists, market
    filters, pb:~22190-22300), open-tail projection maths
-   (`get_projected_open_tail_ema_metrics`), the protective-panic input path,
-   `_terminal_same_timestamp_fill_index`, the trailing fill-confirmation
+   (`get_projected_open_tail_ema_metrics`), the protective-panic input path
+   for the account-level modes (the coin-mode one is ported and verified,
+   D20), `_terminal_same_timestamp_fill_index`, the trailing fill-confirmation
    state machine, exchange adapter normalisation of open orders
    (`position_side`, `reduceOnly`, custom-id decoding) and market specs
    (`set_market_specific_settings` per exchange).

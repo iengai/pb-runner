@@ -1,0 +1,132 @@
+[
+  {
+    "amount": 391.0,
+    "clientOrderId": "",
+    "datetime": "2025-10-10T19:59:00",
+    "fee": {
+      "cost": 0.0,
+      "currency": "USDT"
+    },
+    "id": "1",
+    "info": {
+      "contractMultiplier": 1.0,
+      "fee": 0.0,
+      "liquidity": "historical",
+      "positionSide": "LONG",
+      "realizedPnl": 0.0,
+      "reduceOnly": false
+    },
+    "order": "1000",
+    "pnl": 0.0,
+    "position_side": "long",
+    "price": 0.782136,
+    "reduceOnly": false,
+    "side": "buy",
+    "symbol": "ADA/USDT:USDT",
+    "timestamp": 1760126340000
+  },
+  {
+    "amount": 0.002,
+    "clientOrderId": "",
+    "datetime": "2025-10-10T19:59:00",
+    "fee": {
+      "cost": 0.0,
+      "currency": "USDT"
+    },
+    "id": "2",
+    "info": {
+      "contractMultiplier": 1.0,
+      "fee": 0.0,
+      "liquidity": "historical",
+      "positionSide": "LONG",
+      "realizedPnl": 0.0,
+      "reduceOnly": false
+    },
+    "order": "1001",
+    "pnl": 0.0,
+    "position_side": "long",
+    "price": 119001.258,
+    "reduceOnly": false,
+    "side": "buy",
+    "symbol": "BTC/USDT:USDT",
+    "timestamp": 1760126340000
+  },
+  {
+    "amount": 1295.0,
+    "clientOrderId": "",
+    "datetime": "2025-10-10T19:59:00",
+    "fee": {
+      "cost": 0.0,
+      "currency": "USDT"
+    },
+    "id": "3",
+    "info": {
+      "contractMultiplier": 1.0,
+      "fee": 0.0,
+      "liquidity": "historical",
+      "positionSide": "LONG",
+      "realizedPnl": 0.0,
+      "reduceOnly": false
+    },
+    "order": "1002",
+    "pnl": 0.0,
+    "position_side": "long",
+    "price": 0.2362014,
+    "reduceOnly": false,
+    "side": "buy",
+    "symbol": "DOGE/USDT:USDT",
+    "timestamp": 1760126340000
+  },
+  {
+    "amount": 391.0,
+    "clientOrderId": "0x0016e14339b5d369414ab74f85b0aa4d93",
+    "datetime": "2025-10-10T21:08:00",
+    "fee": {
+      "cost": 0.02807771,
+      "currency": "USDT"
+    },
+    "id": "4",
+    "info": {
+      "contractMultiplier": 1.0,
+      "fee": 0.02807771,
+      "liquidity": "maker",
+      "positionSide": "LONG",
+      "realizedPnl": -25.038076000000036,
+      "reduceOnly": true
+    },
+    "order": "1006",
+    "pnl": -25.038076000000036,
+    "position_side": "long",
+    "price": 0.7181,
+    "reduceOnly": true,
+    "side": "sell",
+    "symbol": "ADA/USDT:USDT",
+    "timestamp": 1760130480000
+  },
+  {
+    "amount": 1295.0,
+    "clientOrderId": "0x00161079f52590a74aadb685b60ce9b0f5",
+    "datetime": "2025-10-10T21:10:00",
+    "fee": {
+      "cost": 0.028164955,
+      "currency": "USDT"
+    },
+    "id": "5",
+    "info": {
+      "contractMultiplier": 1.0,
+      "fee": 0.028164955,
+      "liquidity": "maker",
+      "positionSide": "LONG",
+      "realizedPnl": -24.231263000000023,
+      "reduceOnly": true
+    },
+    "order": "1007",
+    "pnl": -24.231263000000023,
+    "position_side": "long",
+    "price": 0.21749,
+    "reduceOnly": true,
+    "side": "sell",
+    "symbol": "DOGE/USDT:USDT",
+    "timestamp": 1760130600000
+  }
+]

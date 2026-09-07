@@ -12,9 +12,11 @@ use crate::churn::{self, ChurnGate, ChurnParams};
 use crate::cooldown::ExchangeCooldowns;
 use crate::emas::{aggregate_1h, Candle, ONE_HOUR_MS, ONE_MIN_MS};
 use crate::hsl::{
-    balance_equity_timeline, hsl_pnl, realized_pnl_now, CycleInputs, FeePolicy, HslConfig, HslFill,
-    HslPosition, HslState, RedObservation, Supervision, LONG, SHORT,
+    balance_equity_timeline, coin_history, hsl_pnl, realized_pnl_now, CycleInputs, FeePolicy,
+    HslConfig, HslFill, HslPosition, HslState, RedObservation, ReplayInputs, Supervision, LONG,
+    SHORT,
 };
+use crate::hsl_coin::{CoinEnv, CoinInputs};
 use crate::market_filter::{
     fetch_max_age_ms, MarketFilter, MarketSnapshot, SnapshotProvider,
     LIVE_MARKET_SNAPSHOT_MAX_AGE_MS,
@@ -35,7 +37,7 @@ use pb_exchange_bybit::{
     Side,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -498,7 +500,20 @@ impl LiveRunner {
     /// Python timeline), and the present sample uses the newest 1m close.
     async fn initialize_hsl(&mut self, now: u64) -> Result<()> {
         let balance = self.client.fetch_balance().await?.total_usdt;
-        let positions = hsl_positions(&self.client.fetch_positions().await?);
+        let raw_positions = self.client.fetch_positions().await?;
+        let positions = hsl_positions(&raw_positions);
+        let coin_mode = self.hsl.as_ref().is_some_and(|h| h.cfg.coin_mode());
+        // Coin mode reads the open orders (blocking-order counts of the
+        // present sample).
+        let orders = if coin_mode {
+            self.client.fetch_open_orders().await?
+        } else {
+            Vec::new()
+        };
+        // At this point Python's `self.positions` holds the fetched
+        // positions only (the planning universe is prepared by the first
+        // cycle); the remaining pairs get their state at the first check.
+        let known: BTreeSet<String> = positions.iter().map(|p| p.symbol.clone()).collect();
         let Some(hsl) = self.hsl.as_mut() else {
             return Ok(());
         };
@@ -514,11 +529,64 @@ impl LiveRunner {
         let c_mult = |symbol: &str| markets.get(symbol).map_or(1.0, |m| m.contract_size);
         let fills = hsl_fills(&self.fills, &self.closed_pnl, &hsl.cfg.fee, &c_mult);
         let qty_step = |symbol: &str| markets.get(symbol).map_or(0.0, |m| m.qty_step);
-        let known = |symbol: &str| markets.contains_key(symbol);
-        let timeline = balance_equity_timeline(
-            now, balance, lookback, &fills, &positions, &close_at, &c_mult, &qty_step, &known,
-        );
+        let known_market = |symbol: &str| markets.contains_key(symbol);
         let latest = |symbol: &str| candles.get(symbol).and_then(|b| b.m1.last()).map(|c| c[4]);
+        if coin_mode {
+            // `_equity_hard_stop_initialize_coin_from_history` (D20) over the
+            // compact coin replay (`get_balance_equity_history(coin)`).
+            let inputs = ReplayInputs {
+                now_ms: now,
+                balance_now: balance,
+                lookback,
+                fills: &fills,
+                positions: &positions,
+                known_positions: &known,
+                close_at: &close_at,
+                c_mult: &c_mult,
+                qty_step: &qty_step,
+                known_market: &known_market,
+            };
+            let history = coin_history(&inputs);
+            let upnl = |pside: usize, symbol: &str| -> Result<f64> {
+                coin_upnl(&positions, pside, symbol, &latest, &c_mult)
+            };
+            let blocking =
+                |pside: usize, symbol: &str| blocking_orders_symbol(&orders, pside, symbol);
+            let env = CoinEnv {
+                upnl: &upnl,
+                realized: None,
+                blocking_orders: &blocking,
+            };
+            let inp = CoinInputs {
+                now_ms: now,
+                balance,
+                positions: &positions,
+                fills: &fills,
+                known_symbols: &known,
+            };
+            hsl.initialize_coin_from_history(&inp, &env, &history, &qty_step, &known_market)?;
+            self.cycle.hsl = hsl.modes();
+            tracing::info!(
+                history_rows = history.timestamps.len(),
+                panic_markers = history.panic_flatten_events.len(),
+                pairs = hsl.coin[LONG].len() + hsl.coin[SHORT].len(),
+                forced_long = ?self.cycle.hsl.runtime_forced[LONG],
+                forced_short = ?self.cycle.hsl.runtime_forced[SHORT],
+                "hsl coin mode initialized from history"
+            );
+            return Ok(());
+        }
+        let timeline = balance_equity_timeline(
+            now,
+            balance,
+            lookback,
+            &fills,
+            &positions,
+            &close_at,
+            &c_mult,
+            &qty_step,
+            &known_market,
+        );
         let mut unrealized = [0.0; 2];
         for p in &positions {
             let Some(price) = latest(&p.symbol) else {
@@ -697,51 +765,96 @@ impl LiveRunner {
         if !raw.is_finite() {
             bail!("exchange balance is not finite");
         }
-        // HSL (SNAPSHOT_SPEC 2.3 step 1): sample the raw balance and the
+        // HSL (SNAPSHOT_SPEC 2.3 steps 1-3): sample the raw balance and the
         // realized/unrealized pnl, then run the red supervisor on the sides
-        // whose red latch is active; the side modes go into the snapshot.
+        // (account level) or pairs (coin mode, D20) whose red latch is
+        // active; the modes go into the snapshot. A coin-mode cycle with
+        // pairs still under panic supervision after the supervisor step
+        // plans the protective-panic input instead of the normal one
+        // (`_equity_hard_stop_run_coin_red_supervisor`).
+        let mut protective = false;
         if let Some(hsl) = self.hsl.as_mut() {
             let markets = &self.markets;
             let c_mult = |symbol: &str| markets.get(symbol).map_or(1.0, |m| m.contract_size);
             let fills = hsl_fills(&self.fills, &self.closed_pnl, &hsl.cfg.fee, &c_mult);
             let hsl_pos = hsl_positions(&positions);
-            let start = hsl.cfg.lookback.event_history_start_ms(now);
-            let mut unrealized = [0.0; 2];
-            for p in &hsl_pos {
-                let Some(t) = planning.get(&p.symbol) else {
-                    continue;
+            if hsl.cfg.coin_mode() {
+                let mut known: BTreeSet<String> = self.cycle.known_symbols.clone();
+                known.extend(symbols.iter().cloned());
+                let price = |symbol: &str| planning.get(symbol).map(|t| t.last);
+                let upnl = |pside: usize, symbol: &str| -> Result<f64> {
+                    coin_upnl(&hsl_pos, pside, symbol, &price, &c_mult)
                 };
-                unrealized[p.pside] += hsl_pnl(p.pside, p.price, t.last, p.size, c_mult(&p.symbol));
-            }
-            let inp = CycleInputs {
-                now_ms: now,
-                balance: raw,
-                realized_pnl_total: realized_pnl_now(&fills, start, None),
-                realized_pnl: [
-                    realized_pnl_now(&fills, start, Some(LONG)),
-                    realized_pnl_now(&fills, start, Some(SHORT)),
-                ],
-                unrealized_pnl: unrealized,
-                positions: &hsl_pos,
-                fills: &fills,
-            };
-            hsl.check(&inp)?;
-            for pside in [LONG, SHORT] {
-                if !hsl.red_active(pside) {
-                    continue;
+                let blocking =
+                    |pside: usize, symbol: &str| blocking_orders_symbol(&orders, pside, symbol);
+                let env = CoinEnv {
+                    upnl: &upnl,
+                    realized: None,
+                    blocking_orders: &blocking,
+                };
+                let inp = CoinInputs {
+                    now_ms: now,
+                    balance: raw,
+                    positions: &hsl_pos,
+                    fills: &fills,
+                    known_symbols: &known,
+                };
+                hsl.check_coin(&inp, &env)?;
+                if hsl.coin_red_active() {
+                    let step = hsl.supervise_coin_red(&inp, &env)?;
+                    tracing::warn!(
+                        before = ?step.active_before,
+                        after = ?step.active_after,
+                        "hsl coin red supervisor"
+                    );
+                    protective = !step.active_after.is_empty();
                 }
-                let obs = hsl_observation(&positions, &orders, pside);
-                let step = hsl.supervise_red(pside, obs, &inp, Supervision::Production)?;
-                tracing::warn!(
-                    pside = PSIDES[pside],
-                    finalized = step.finalized,
-                    panic = step.needs_panic_execution,
-                    "hsl red supervisor"
-                );
+            } else {
+                let start = hsl.cfg.lookback.event_history_start_ms(now);
+                let mut unrealized = [0.0; 2];
+                for p in &hsl_pos {
+                    let Some(t) = planning.get(&p.symbol) else {
+                        continue;
+                    };
+                    unrealized[p.pside] +=
+                        hsl_pnl(p.pside, p.price, t.last, p.size, c_mult(&p.symbol));
+                }
+                let inp = CycleInputs {
+                    now_ms: now,
+                    balance: raw,
+                    realized_pnl_total: realized_pnl_now(&fills, start, None),
+                    realized_pnl: [
+                        realized_pnl_now(&fills, start, Some(LONG)),
+                        realized_pnl_now(&fills, start, Some(SHORT)),
+                    ],
+                    unrealized_pnl: unrealized,
+                    positions: &hsl_pos,
+                    fills: &fills,
+                };
+                hsl.check(&inp)?;
+                for pside in [LONG, SHORT] {
+                    if !hsl.red_active(pside) {
+                        continue;
+                    }
+                    let obs = hsl_observation(&positions, &orders, pside);
+                    let step = hsl.supervise_red(pside, obs, &inp, Supervision::Production)?;
+                    tracing::warn!(
+                        pside = PSIDES[pside],
+                        finalized = step.finalized,
+                        panic = step.needs_panic_execution,
+                        "hsl red supervisor"
+                    );
+                }
             }
             let modes = hsl.modes();
             if modes != self.cycle.hsl {
-                tracing::warn!(long = ?modes.sides[LONG], short = ?modes.sides[SHORT], "hsl modes");
+                tracing::warn!(
+                    long = ?modes.sides[LONG],
+                    short = ?modes.sides[SHORT],
+                    forced_long = ?modes.runtime_forced[LONG],
+                    forced_short = ?modes.runtime_forced[SHORT],
+                    "hsl modes"
+                );
             }
             self.cycle.hsl = modes;
         }
@@ -881,13 +994,64 @@ impl LiveRunner {
         // Exchange-unavailable cooldowns of this cycle (SPEC 2.3), then the
         // snapshot with the carried state.
         self.cycle.exchange_unavailable = self.cooldowns.active(now, Some(&symbols));
-        let snap = builder.build(&account, &states, &mut self.cycle)?;
-        // Same text round trip as the Python bot (D8).
-        let text = serde_json::to_string(&snap.input)?;
-        let input: OrchestratorInput =
-            serde_json::from_str(&text).context("engine input does not parse")?;
-        let out =
-            compute_ideal_orders(&input).map_err(|e| anyhow!("compute_ideal_orders: {e:?}"))?;
+        // Coin RED supervision (D20): `_protective_panic_target_psides_by_symbol`
+        // = the psides of the symbols with a position or an open order whose
+        // mode override is `panic`; the protective input covers the target
+        // symbols holding a position, the reconciliation every target pair.
+        let mut protective_targets: Option<BTreeMap<String, BTreeSet<String>>> = None;
+        if protective {
+            let mut targets: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for s in &states {
+                let candidate = positions
+                    .iter()
+                    .any(|p| p.symbol == s.symbol && p.size != 0.0)
+                    || orders.iter().any(|o| o.symbol == s.symbol);
+                if !candidate {
+                    continue;
+                }
+                for pside in PSIDES {
+                    if builder.mode_override(pside, s)?.as_deref() == Some("panic") {
+                        targets
+                            .entry(s.symbol.clone())
+                            .or_default()
+                            .insert(pside.to_string());
+                    }
+                }
+            }
+            protective_targets = Some(targets);
+        }
+        let (snap, out) = match &protective_targets {
+            Some(targets) => match builder.build_protective(&account, &states, targets)? {
+                Some(snap) => {
+                    let text = serde_json::to_string(&snap.input)?;
+                    let input: OrchestratorInput =
+                        serde_json::from_str(&text).context("engine input does not parse")?;
+                    let out = compute_ideal_orders(&input)
+                        .map_err(|e| anyhow!("compute_ideal_orders (protective): {e:?}"))?;
+                    (snap, out)
+                }
+                // No target symbol holds a position: Python plans `{}` and
+                // reconciles the target pairs' open orders against it.
+                None => (
+                    crate::snapshot::Snapshot {
+                        input: Value::Null,
+                        symbols: Vec::new(),
+                        mode_overrides: Vec::new(),
+                    },
+                    OrchestratorOutput::default(),
+                ),
+            },
+            None => {
+                let snap = builder.build(&account, &states, &mut self.cycle)?;
+                // Same text round trip as the Python bot (D8).
+                let text = serde_json::to_string(&snap.input)?;
+                let input: OrchestratorInput =
+                    serde_json::from_str(&text).context("engine input does not parse")?;
+                let out = compute_ideal_orders(&input)
+                    .map_err(|e| anyhow!("compute_ideal_orders: {e:?}"))?;
+                (snap, out)
+            }
+        };
         let planned = out
             .orders
             .iter()
@@ -896,26 +1060,30 @@ impl LiveRunner {
 
         // PB_modes from this output's symbol_states (SPEC 1.6), kept both
         // for the reconciler and for the next snapshot (SNAPSHOT_SPEC 3.6).
-        let active: Vec<(usize, bool, bool)> = out
-            .diagnostics
-            .symbol_states
-            .iter()
-            .map(|st| (st.symbol_idx, st.long.active, st.short.active))
-            .collect();
-        self.cycle.pb_modes = builder.pb_modes_after_cycle(&snap, &active);
-        self.pb_modes = self
-            .cycle
-            .pb_modes
-            .iter()
-            .map(|((symbol, pside), mode)| {
-                let ps = if pside == "long" {
-                    PositionSide::Long
-                } else {
-                    PositionSide::Short
-                };
-                ((symbol.clone(), ps), PbMode::parse(mode))
-            })
-            .collect();
+        // The protective path leaves them alone (Python only parses the
+        // orders of the protective output).
+        if protective_targets.is_none() {
+            let active: Vec<(usize, bool, bool)> = out
+                .diagnostics
+                .symbol_states
+                .iter()
+                .map(|st| (st.symbol_idx, st.long.active, st.short.active))
+                .collect();
+            self.cycle.pb_modes = builder.pb_modes_after_cycle(&snap, &active);
+            self.pb_modes = self
+                .cycle
+                .pb_modes
+                .iter()
+                .map(|((symbol, pside), mode)| {
+                    let ps = if pside == "long" {
+                        PositionSide::Long
+                    } else {
+                        PositionSide::Short
+                    };
+                    ((symbol.clone(), ps), PbMode::parse(mode))
+                })
+                .collect();
+        }
 
         // Reconcile (SPEC 2).
         let hedge_mode = self
@@ -954,14 +1122,29 @@ impl LiveRunner {
         let risk_pairs = risk_active_pairs(&out, &snap.symbols);
         self.churn.evaluate(&symbols, &mut ideal, &risk_pairs, mono);
         // Open orders of skipped symbols are not reconciled (they would be
-        // cancelled as unwanted otherwise).
+        // cancelled as unwanted otherwise). The protective path reconciles
+        // the target pairs only (`actual_symbols`, `actual_psides_by_symbol`)
+        // and applies no mode filters (`apply_mode_filters=False`).
         let open: Vec<OrderRec> = orders
             .iter()
             .filter(|o| !skipped_set.contains(&o.symbol))
+            .filter(|o| match &protective_targets {
+                Some(t) => t.get(&o.symbol).is_some_and(|psides| {
+                    psides.contains(if o.pside == PositionSide::Long {
+                        "long"
+                    } else {
+                        "short"
+                    })
+                }),
+                None => true,
+            })
             .map(|o| reconcile::normalize_open_order(o, hedge_mode))
             .collect();
         let pb_modes = &self.pb_modes;
         let modes = |symbol: &str, pside: PositionSide| -> PbMode {
+            if protective_targets.is_some() {
+                return PbMode::Normal;
+            }
             pb_modes
                 .get(&(symbol.to_string(), pside))
                 .copied()
@@ -1164,6 +1347,9 @@ pub fn hsl_fills(
                     increase: (pside == LONG) == (f.side == Side::Buy),
                     pnl,
                     fee_paid,
+                    pb_order_type: crate::reconcile::pb_order_type_from_custom_id(
+                        f.client_id.as_deref(),
+                    ),
                 },
             )
         })
@@ -1210,6 +1396,47 @@ pub fn hsl_observation(
         }
     }
     obs
+}
+
+/// `_equity_hard_stop_count_blocking_open_orders_symbol(pside, symbol)`:
+/// `(entry_orders, nonpanic_close_orders)` of one pair.
+pub fn blocking_orders_symbol(orders: &[OpenOrder], pside: usize, symbol: &str) -> (usize, usize) {
+    let mut entry = 0;
+    let mut nonpanic = 0;
+    for o in orders
+        .iter()
+        .filter(|o| pside_idx(o.pside) == pside && o.symbol == symbol)
+    {
+        if !o.reduce_only {
+            entry += 1;
+        } else if !reconcile::pb_order_type_from_custom_id(o.client_id.as_deref()).contains("panic")
+        {
+            nonpanic += 1;
+        }
+    }
+    (entry, nonpanic)
+}
+
+/// `_calc_upnl_sum_strict(pside, symbol)`: the pair's unrealized pnl at the
+/// last price; `0.0` without a position, an error without a price.
+pub fn coin_upnl(
+    positions: &[HslPosition],
+    pside: usize,
+    symbol: &str,
+    price: &dyn Fn(&str) -> Option<f64>,
+    c_mult: &dyn Fn(&str) -> f64,
+) -> Result<f64> {
+    let mut sum = 0.0;
+    for p in positions
+        .iter()
+        .filter(|p| p.pside == pside && p.symbol == symbol && p.size != 0.0)
+    {
+        let Some(px) = price(symbol) else {
+            bail!("missing last price for {symbol} while evaluating hard stop");
+        };
+        sum += hsl_pnl(pside, p.price, px, p.size, c_mult(symbol));
+    }
+    Ok(sum)
 }
 
 /// SPEC 4.4 `fill_ts` part: newest fill that increased the position on
