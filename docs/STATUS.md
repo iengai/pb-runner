@@ -4,6 +4,10 @@ Newest entry first. Each entry: what changed, what was verified, next action.
 
 ## 2026-09-07 (session 2) — P1 done except the P2-gated box
 
+**Remote (added later the same day):** `origin` = public repo
+`https://github.com/iengai/pb-runner`, branch `master`. All commits are
+authored as the private identity (AGENTS.md "Git identity").
+
 **State:** P1.1 done and pushed (`iengai/passivbot` branch
 `pb-runner/rlib-v8.1.0`, commit `e808cfd33` = tag v8.1.0 + build plumbing).
 P1.2 implemented; the `passivbot_rust` git dependency is enabled in
