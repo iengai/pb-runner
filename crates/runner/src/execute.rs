@@ -8,7 +8,7 @@
 
 use crate::reconcile::{OrderRec, Plan, RecentExecution};
 use anyhow::Result;
-use pb_exchange_bybit::{ExchangeClient, NewOrder};
+use pb_exchange_bybit::{ExchangeClient, ExchangeError, NewOrder};
 use std::sync::Arc;
 
 pub const ERROR_BUDGET_PER_HOUR: usize = 10;
@@ -24,6 +24,10 @@ pub struct WaveReport {
     /// creating in its scope (cancel-first barrier, the loop refreshes all
     /// surfaces at the start of every cycle anyway).
     pub full_refresh_requested: bool,
+    /// Every rejected write as `(symbol, error)`, in wave order: the input of
+    /// `_handle_order_write_failures` (exchange-unavailable cooldowns,
+    /// `cooldown.rs`).
+    pub write_failures: Vec<(String, ExchangeError)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +122,7 @@ impl Executor {
                         Err(e) => {
                             failed = true;
                             report.failures += 1;
+                            report.write_failures.push((symbol.clone(), e.clone()));
                             tracing::warn!(%symbol, %id, error = %e, "[order] cancel not acknowledged");
                         }
                     }
@@ -157,6 +162,7 @@ impl Executor {
                         Err(e) => {
                             failed = true;
                             report.failures += 1;
+                            report.write_failures.push((o.symbol.clone(), e.clone()));
                             tracing::warn!(symbol = %o.symbol, error = %e, "[order] create not acknowledged");
                         }
                     }

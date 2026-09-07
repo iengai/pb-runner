@@ -322,3 +322,60 @@ refresh fails or returns a stale/missing snapshot places no orders at all,
 market orders included, and logs Python's `[market] skipping order creation`
 line; a fake-harness scenario cannot exercise the stale path because its
 clock is pinned (plancheck reports the skip count instead).
+
+## D15 (2026-09-08) Snapshot cross-cycle state: `CycleState` carried by the runner; cooldowns dormant on Bybit; cached forager metrics not ported
+
+Facts (SNAPSHOT_SPEC 8, traced in `src/passivbot.py` at e808cfd33):
+
+- The tradable/unavailable decision for a symbol with missing required EMAs
+  depends on the previous cycle's `PB_modes` and
+  `_orchestrator_dynamic_forager_eligibility_psides_by_symbol`; missing
+  required *forager* spans raise (cycle aborts) whenever
+  `required_ema_can_mark_nontradable` is false (pb:19340), not merely when
+  the symbol is a priority symbol. The builder used the latter until
+  2026-09-08; no fixture distinguished the two.
+- `fetch_close_map` reuses the previous cycle's close EMA for at most
+  `_close_ema_fallback_max_age_ms` (10 min by default) and only when no
+  open-tail projection context exists; the projection
+  (`cm.get_projected_open_tail_ema_metrics`) is stateless.
+- `_activate_exchange_symbol_unavailable_cooldown` needs a connector
+  classifier; only `exchanges/weex.py` has one (`-1058`). On Bybit the
+  cooldown never arms.
+- `fetch_cached_forager_metrics` (forager `qv`/`log_range` computed on a
+  window ending at the last cached candle, within a staleness budget) is
+  the Python bot's way to keep ranking candidates while candles lag. The
+  runner fetches every universe symbol's candles each cycle, so candle lag
+  only occurs when the exchange itself is behind.
+- The fake harness primes the full 1m array for every coin each step, so
+  neither the carry-forward nor the projection ever fires in a fake run:
+  `pb-snapcheck` is 600/600 on both full public runs with the new code, the
+  same as before it. The new behaviour is covered by unit tests only.
+
+Decision:
+
+1. The builder takes `&mut CycleState` (`pb_modes`,
+   `dynamic_forager_eligibility`, `prev_close_ema`, `exchange_unavailable`)
+   instead of reading bot-private attributes. `LiveRunner` owns it;
+   `pb-snapcheck` derives `pb_modes` from the previous recording's output,
+   which is the previous cycle only for unsubsampled sets (subsampled sets
+   were verified not to depend on it: no fixture has an active side without
+   a position or order).
+2. Port the cooldown state machine and planning policy faithfully
+   (`cooldown.rs`, `snapshot::cooldown_mode`) but keep
+   `classify_symbol_unavailable` returning `None` for Bybit, so the runner
+   matches the Python Bybit bot; a future exact-code classifier is a
+   one-function change with the state machine already tested.
+3. Port the health-based open-tail projection (close; `qv`/`log_range`
+   when forager is off; required strategy `log_range` when on) and the
+   close-EMA carry-forward. Do not port the cached forager-metric fallback
+   or the forager stale-tail context: on a lagging exchange a forager
+   priority symbol with a missing required forager span makes the runner
+   skip the cycle with an error (Python would rank on stale metrics). Revisit
+   if the shadow run (P5.2) shows Bybit candle lag beyond one minute.
+4. `_orchestrator_ema_entry_cancellation_order_keys` (resting entries
+   authorised while forager rank features were missing) is treated as
+   empty; it only widens the set of symbols the bot may mark nontradable.
+5. Runtime operator forced modes (`_runtime_forced_modes`) have no source in
+   the runner and are not modelled; config forced modes (global and
+   `coin_overrides.<coin>.live.forced_mode_*`) are, verified by the
+   `grid_v7_forced` fixture set. HSL modes remain a separate task.

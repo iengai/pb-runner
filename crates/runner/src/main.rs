@@ -164,12 +164,15 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
                     }
                 } else {
                     match executor.execute(p, now).await {
-                        Ok(r) => tracing::info!(
-                            cancels_ok = r.cancels_ok,
-                            creates_ok = r.creates_ok,
-                            failures = r.failures,
-                            "wave done"
-                        ),
+                        Ok(r) => {
+                            runner.note_write_failures(&r.write_failures, now);
+                            tracing::info!(
+                                cancels_ok = r.cancels_ok,
+                                creates_ok = r.creates_ok,
+                                failures = r.failures,
+                                "wave done"
+                            )
+                        }
                         Err(e) => {
                             tracing::error!(error = %e, "restart requested");
                             std::process::exit(30);

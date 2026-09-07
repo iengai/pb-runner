@@ -105,6 +105,20 @@ changes tracked passivbot files):
 5. **Speed.** `_prime_fake_candles` rebuilds the 1m array row by row per
    step; with 120k rows x 10 coins that is >1M Python iterations per cycle.
    The wrapper swaps in a vectorised version (same output).
+6. **Console codepage (2026-09-08).** The harness prints UTF-8; on a
+   Japanese Windows box `subprocess.run(text=True)` decoded it as cp932 and
+   raised after a complete 400-cycle run, losing `run.log`, the dedupe and
+   `MANIFEST.json` (the recordings themselves were intact). The tool now
+   decodes with `encoding="utf-8", errors="replace"`.
+
+Forced-mode set (2026-09-08): `tests/fixtures/configs/fake_v8/grid_v7_forced.json`
+is `grid_v7.json` plus `coin_overrides.{ADA,BTC,DOGE}.live.forced_mode_long`
+= `gs` / `tp_only` / `m`, recorded with `--seed-positions 3` (positions on
+exactly those coins) and 400 steps into `.local/fake_v8_forced`, subsampled
+to `tests/fixtures/recordings/fake_v8/grid_v7_forced` (stride 20, max 30).
+It exercises `_apply_entry_eligibility_mode` with per-symbol config modes on
+held positions: graceful_stop (closes + grid re-entries, no initials),
+tp_only (closes only), manual (no orders).
 
 ### B. Real market data (local, NOT committable)
 

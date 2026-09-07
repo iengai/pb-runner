@@ -31,7 +31,8 @@ use pb_runner::bot_params::ConfigView;
 use pb_runner::emas::Candle;
 use pb_runner::jsonexact::parse_exact;
 use pb_runner::snapshot::{
-    trailing_bundle, AccountState, MarketParams, SideState, SnapshotBuilder, SymbolState,
+    trailing_bundle, AccountState, CycleState, MarketParams, SideState, SnapshotBuilder,
+    SymbolState,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -312,6 +313,10 @@ fn main() -> Result<()> {
     let mut totals: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut prev_out_symbols: HashSet<usize> = HashSet::new();
+    // Cross-cycle state (SPEC 8): `PB_modes` from the previous recording's
+    // output (the previous *cycle* when the set is not subsampled), the
+    // dynamic forager eligibility and the close-EMA carry-forward cache.
+    let mut cycle = CycleState::default();
     let mut n = 0usize;
     let mut clean = 0usize;
     for (fi, file) in files.iter().enumerate() {
@@ -412,7 +417,20 @@ fn main() -> Result<()> {
             realized_pnl_cumsum_max: num(&rec["global"]["realized_pnl_cumsum_max"]),
             realized_pnl_cumsum_last: num(&rec["global"]["realized_pnl_cumsum_last"]),
         };
-        let snap = builder.build(&account, &states)?;
+        let snap = builder.build(&account, &states, &mut cycle)?;
+        let active: Vec<(usize, bool, bool)> = rec_out["diagnostics"]["symbol_states"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|st| {
+                (
+                    st["symbol_idx"].as_u64().unwrap_or(u64::MAX) as usize,
+                    st["long"]["active"].as_bool().unwrap_or(false),
+                    st["short"]["active"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        cycle.pb_modes = builder.pb_modes_after_cycle(&snap, &active);
         let mut d = Vec::new();
         diff("", &snap.input, &rec, &mut d);
         if d.is_empty() {

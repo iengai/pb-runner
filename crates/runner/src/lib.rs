@@ -10,6 +10,8 @@ pub mod bot_params;
 pub mod churn;
 pub mod config;
 #[cfg(feature = "engine-v8")]
+pub mod cooldown;
+#[cfg(feature = "engine-v8")]
 pub mod emas;
 #[cfg(feature = "engine-v8")]
 pub mod execute;

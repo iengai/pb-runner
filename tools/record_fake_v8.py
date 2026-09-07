@@ -246,7 +246,11 @@ def run_one(args, name: str, config_path: Path) -> dict:
            "--log-level", str(args.log_level)]
     print(f"[{name}] running: {' '.join(cmd)}", flush=True)
     t0 = time.time()
+    # The harness prints UTF-8 (symbol names, box drawing); decoding with the
+    # console codepage (cp932 on a Japanese Windows box) raised after a
+    # complete 400-cycle run on 2026-09-08 and lost the MANIFEST.
     proc = subprocess.run(cmd, cwd=str(checkout), env=env, text=True,
+                          encoding="utf-8", errors="replace",
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     elapsed = time.time() - t0
     (out_dir / "run.log").write_text(proc.stdout, encoding="utf-8")

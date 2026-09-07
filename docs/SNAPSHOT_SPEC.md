@@ -395,7 +395,13 @@ selection or forced-normal-by-config is handled in Rust via `n_positions`,
 Exchange-unavailable cooldown (pb:10098-10114): for each cooled symbol and
 each side, if the normalised mode is `None`/`normal`, or the symbol has a
 position and mode is `graceful_stop`, set `tp_only` when
-`has_position(symbol)` else `graceful_stop`.
+`has_position(symbol)` else `graceful_stop`. `has_position(symbol=...)` is
+symbol-level (either side), so a held long's disabled short side goes from
+`graceful_stop` to `tp_only` as well. Cooldowns are armed by
+`_handle_order_write_failures` (pb:1195) through the connector's
+`_classify_exchange_symbol_unavailable_error`; only `exchanges/weex.py`
+overrides it at v8.1.0, the Bybit adapter never activates one. Runner:
+`cooldown.rs`, `snapshot::cooldown_mode`.
 
 Recording: `long` is `null` everywhere (forager long, no forced modes),
 `short` is `graceful_stop` everywhere although `live.forced_mode_short` is
@@ -593,12 +599,15 @@ Inside `load_symbol_bundle` an exception of type `MissingCloseEma` /
   return the partial maps; `tradable` stays true.
 - Any other exception propagates (cycle aborts).
 
-Then (pb:19303-19340): missing *required forager* spans -> raise for
-active/normal symbols, else mark unavailable
-(`missing_required_forager_volume` / `..._log_range`). Cache-only symbols
-missing any global forager span are marked unavailable too (`missing_volume`,
+Then (pb:19303-19340): missing *required forager* spans -> `RuntimeError`
+(cycle aborts) when `required_ema_can_mark_nontradable(sym)` is false, else
+mark unavailable (`missing_required_forager_volume` / `..._log_range`).
+Note the condition is the same predicate as for missing close/1h spans, not
+"has a position or order": a flat deselected symbol with a resting entry
+and no retained dynamic eligibility raises. Cache-only symbols missing any
+global forager span are marked unavailable too (`missing_volume`,
 `missing_log_range`) and return empty maps unless a required-forager reason
-already applied.
+already applied. Runner: both rules in `SnapshotBuilder::build`.
 
 Helper predicates the runner needs (all closures over `modes` and bot state):
 
@@ -838,22 +847,84 @@ validated; a per-symbol `forager_score_weights` is canonicalised at use.
 
 ## 8. Open questions / what the runner cannot know from REST alone
 
-1. **Cross-cycle private state** that feeds the input and has no REST source:
+1. **Cross-cycle private state** that feeds the input and has no REST source.
+   The runner carries it in `snapshot::CycleState` (owned by `LiveRunner`,
+   replayed by `pb-snapcheck` from the previous recording's output); status
+   per item as of 2026-09-08:
    - `PB_modes` from the previous engine output (used by `normal_planning_psides`)
-     and `_orchestrator_dynamic_forager_eligibility_psides_by_symbol`,
-     `_orchestrator_ema_entry_cancellation_order_keys` (section 3.6). Affects
-     only the tradable/unavailable decision for symbols with missing EMAs, but
-     it does affect it.
-   - `_orchestrator_prev_close_ema` carry-forward with 10-minute TTL (3.3).
-   - `_entry_cooldown_prev_pos_sizes` / `_entry_cooldown_pos_increase_detected_ts` (4.4).
+     and `_orchestrator_dynamic_forager_eligibility_psides_by_symbol`
+     (section 3.6): **modelled** — `CycleState.pb_modes` is rebuilt after
+     every engine call by `SnapshotBuilder::pb_modes_after_cycle`
+     (`_python_mode_from_orchestrator_state`: explicit override, else
+     `normal` when the side is active, else `PB_mode_stop`);
+     `CycleState.dynamic_forager_eligibility` is rewritten by `build`.
+     `normal_planning_psides`, `dynamic_forager_normal_psides`,
+     `dynamic_forager_managed_entry_psides`, `flat_forager_default_normal`,
+     `candidate_only` and `required_ema_can_mark_nontradable` are ported
+     verbatim in `snapshot.rs` (unit test
+     `pb_modes_carry_over_decides_unavailable_vs_allow_missing`). Not
+     modelled: `_orchestrator_ema_entry_cancellation_order_keys` (the
+     "previously authorised resting entry" branch, only populated when
+     forager rank features go missing for a managed side); treated as empty.
+     In every fake run an active side always had a position or an order, so
+     the carry-over never changed a fixture (checked over all 600-cycle runs).
+   - `_orchestrator_prev_close_ema` carry-forward with 10-minute TTL (3.3):
+     **modelled** — `CycleState.prev_close_ema`, TTL from
+     `close_ema_fallback_max_age_ms` (unit test
+     `close_ema_carry_forward_within_ttl_then_stale`). Applied only when no
+     open-tail projection context exists, like `fetch_close_map`. Never
+     fires in the fake runs: the harness primes the full 1m array for every
+     coin each step (`_prime_fake_candles`) and the replay timeline
+     synthesises a flat candle for coins missing a step, so the last closed
+     minute is always present (`pb-snapcheck` 600/600 on both full public
+     runs with and without the fallback code).
+   - Open-tail projection (3.7): **modelled** for the health-based context
+     (`emas::open_tail_gap`, `live.max_active_candle_tail_gap_minutes`) with
+     `emas::open_tail_rows` / `projected_ema` = `cm.get_projected_open_tail_ema_metrics`
+     (window `min(latest_expected - (ceil(max_span)-1) min, last_cached)`,
+     provisional internal gaps, flat zero-volume tail rows, per-span EMA over
+     the last `ceil(span)` rows). Metric set as in
+     `load_projected_open_tail_bundle`: close always; `qv` and `log_range`
+     when forager is off; required strategy `log_range` only for non
+     cache-only symbols when forager is on. Not modelled: the forager
+     stale-tail context for cache-only symbols
+     (`forager_projection_max_age_by_symbol`) and the cached forager-metric
+     fallback (`fetch_cached_forager_metrics`, 3.7): the runner refreshes
+     every symbol's candles each cycle, so a missing tail means the exchange
+     lags, and a forager priority symbol whose required forager span is then
+     missing makes the cycle fail (`bail!`) where Python would carry the
+     metric forward within its staleness budget. Never fires in the fake runs
+     (same reason as the carry-forward).
+   - `_entry_cooldown_prev_pos_sizes` / `_entry_cooldown_pos_increase_detected_ts` (4.4):
+     open.
    - Trailing epochs and the fill-confirmation state machine (4.1);
-     `previous_hysteresis_balance` (5.1).
-   - Exchange-unavailable cooldowns (`_exchange_symbol_unavailable_until_ms`)
-     and `ineligible_symbols`, populated from exchange error classification.
+     `previous_hysteresis_balance` (5.1): `live.rs` keeps the hysteresis
+     balance; the fill-confirmation machine is open.
+   - Exchange-unavailable cooldowns (`_exchange_symbol_unavailable_until_ms`):
+     **modelled** — `cooldown::ExchangeCooldowns` (activation with the
+     `live.exchange_symbol_unavailable_cooldown_hours` validation, expiry on
+     the bot clock, refresh), fed by `execute::WaveReport.write_failures`
+     through `LiveRunner::note_write_failures`; the planning policy is
+     `snapshot::cooldown_mode` plus the flat-symbol tradability rule in
+     `build` (unit tests `cooldown_mode_table_matches_python`,
+     `exchange_cooldown_blocks_flat_symbols_and_reduces_held_ones`).
+     `cooldown::classify_symbol_unavailable` returns `None` for every Bybit
+     error because v8.1.0 only ships a WEEX classifier (`-1058`); the state
+     machine is therefore dormant on Bybit, exactly like the Python bot.
+     `ineligible_symbols` (step 6 of 2.3) is still open.
+   - Config-driven forced modes (2.3 step 4, `expand_PB_mode`,
+     `_apply_entry_eligibility_mode`): **modelled** in `mode_override` and
+     verified by the `grid_v7_forced` fixture set (per-symbol
+     `coin_overrides.<coin>.live.forced_mode_long` = `gs` / `tp_only` / `m`
+     on seeded positions; 400/400 identical on the full run). Operator
+     runtime overrides (`_runtime_forced_modes`, step 3) have no source in
+     the runner and are not modelled.
    - HSL runtime state (`_equity_hard_stop[pside]`, engine-owned state machine
-     fed by Python with equity samples and fills; `_hsl_state`, hsl:2426).
+     fed by Python with equity samples and fills; `_hsl_state`, hsl:2426):
+     open (separate task).
    A cold-started runner reproduces the *first* cycle of a cold-started
-   Python bot; both then diverge from each other only through these caches.
+   Python bot; both then diverge from each other only through the items
+   still marked open.
 2. **Candle cache identity.** EMAs are only bit-identical if the candle
    arrays are identical: same source (REST `fetch_ohlcv` paging vs the
    candle websocket in `live/candle_ws.py`), same gap synthesis

@@ -143,6 +143,113 @@ pub fn latest_ema(
     }
 }
 
+/// `floor(now / 1m) * 1m - 1m`: the minute the planner expects to be closed.
+pub fn latest_expected_minute(now_ms: u64) -> u64 {
+    (now_ms / ONE_MIN_MS) * ONE_MIN_MS - ONE_MIN_MS
+}
+
+/// Open-tail projection context (`_active_tail_gap_projection_context`,
+/// pb:11823, on `cm.get_completed_candle_health(symbol, {"1m": 1})` and
+/// `_completed_candle_tail_gap_fallback_signature`, pb:11764).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenTailGap {
+    pub latest_expected_ts: u64,
+    pub last_cached_ts: u64,
+    pub tail_gap_ms: u64,
+}
+
+/// `Some` when the last closed minute is missing from `candles`, a cached
+/// candle exists before it, and the gap is within `max_tail_gap_ms`
+/// (`live.max_active_candle_tail_gap_minutes`, default 10 min). Bounded
+/// historical gaps are not the concern here: the health window is the single
+/// bucket at `latest_expected`, so the only missing span is that bucket.
+pub fn open_tail_gap(candles: &[Candle], now_ms: u64, max_tail_gap_ms: u64) -> Option<OpenTailGap> {
+    let latest_expected = latest_expected_minute(now_ms);
+    let hi = candles.partition_point(|c| (c[0] as u64) <= latest_expected);
+    let last = candles[..hi].last()?;
+    let last_ts = last[0] as u64;
+    if last_ts == latest_expected || last_ts == 0 {
+        return None;
+    }
+    let tail_gap_ms = latest_expected - last_ts;
+    if tail_gap_ms > max_tail_gap_ms {
+        return None;
+    }
+    Some(OpenTailGap {
+        latest_expected_ts: latest_expected,
+        last_cached_ts: last_ts,
+        tail_gap_ms,
+    })
+}
+
+/// Candle rows of `cm.get_projected_open_tail_ema_metrics` (cm:9221) for 1m:
+/// the cached rows in `[min(latest_expected - (ceil(max_span) - 1) min,
+/// last_cached), latest_expected]` with internal gaps synthesised (the
+/// `allow_provisional_internal_gaps=True` read), plus flat zero-volume rows
+/// at the previous close for every minute after the newest cached row up to
+/// `latest_expected`. `None` reproduces the reader's `RuntimeError`s (no
+/// local candles, newest cached row older than the anchor).
+pub fn open_tail_rows(candles: &[Candle], gap: &OpenTailGap, max_span: f64) -> Option<Vec<Candle>> {
+    if gap.latest_expected_ts < gap.last_cached_ts {
+        return None;
+    }
+    let window_candles = (max_span.ceil() as u64).max(1);
+    let start_ts =
+        (gap.latest_expected_ts - ONE_MIN_MS * (window_candles - 1)).min(gap.last_cached_ts);
+    let lo = candles.partition_point(|c| (c[0] as u64) < start_ts);
+    let hi = candles.partition_point(|c| (c[0] as u64) <= gap.latest_expected_ts);
+    let rows = &candles[lo..hi];
+    let newest = rows.last()?;
+    if (newest[0] as u64) < gap.last_cached_ts {
+        return None;
+    }
+    let mut out: Vec<Candle> =
+        Vec::with_capacity(rows.len() + (gap.tail_gap_ms / ONE_MIN_MS) as usize);
+    for c in rows {
+        if let Some(prev) = out.last().copied() {
+            let mut t = prev[0] as u64 + ONE_MIN_MS;
+            while t < c[0] as u64 {
+                out.push([t as f64, prev[4], prev[4], prev[4], prev[4], 0.0]);
+                t += ONE_MIN_MS;
+            }
+        }
+        out.push(*c);
+    }
+    let newest_ts = newest[0] as u64;
+    if newest_ts < gap.latest_expected_ts {
+        let prev_close = f32r(newest[4]);
+        let mut t = newest_ts + ONE_MIN_MS;
+        while t <= gap.latest_expected_ts {
+            out.push([
+                t as f64, prev_close, prev_close, prev_close, prev_close, 0.0,
+            ]);
+            t += ONE_MIN_MS;
+        }
+    }
+    Some(out)
+}
+
+/// Per-span value of the projection: `_ema(series[-ceil(span):], span)`
+/// (all rows when fewer). `None` for an empty tail or a non-finite result.
+pub fn projected_ema(rows: &[Candle], span: f64, metric: Metric) -> Option<f64> {
+    if !(span.is_finite() && span > 0.0) || rows.is_empty() {
+        return None;
+    }
+    let n = (span.ceil() as usize).max(1);
+    let tail = if rows.len() > n {
+        &rows[rows.len() - n..]
+    } else {
+        rows
+    };
+    let values: Vec<f64> = tail.iter().map(|c| series_value(c, metric)).collect();
+    let v = ema_last_f64(&values, span);
+    if v.is_finite() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +365,95 @@ mod tests {
             GapPolicy::Strict
         )
         .is_none()); // needs 3 full buckets
+    }
+
+    #[test]
+    fn open_tail_gap_detection() {
+        let t0 = 1_700_000_040_000u64;
+        let candles: Vec<Candle> = (0..10)
+            .map(|i| flat(t0 + i * ONE_MIN_MS, 1.0 + i as f64))
+            .collect();
+        let max = 10 * ONE_MIN_MS;
+        // last closed minute present -> no context
+        assert_eq!(open_tail_gap(&candles, t0 + 10 * ONE_MIN_MS + 5, max), None);
+        // three minutes missing -> context anchored at the last cached row
+        let now = t0 + 13 * ONE_MIN_MS + 5;
+        assert_eq!(
+            open_tail_gap(&candles, now, max),
+            Some(OpenTailGap {
+                latest_expected_ts: t0 + 12 * ONE_MIN_MS,
+                last_cached_ts: t0 + 9 * ONE_MIN_MS,
+                tail_gap_ms: 3 * ONE_MIN_MS,
+            })
+        );
+        // beyond the budget, or no candles at all -> none
+        assert_eq!(open_tail_gap(&candles, t0 + 21 * ONE_MIN_MS, max), None);
+        assert_eq!(open_tail_gap(&[], now, max), None);
+        // an open (current) minute in the buffer is ignored
+        let mut with_open = candles.clone();
+        with_open.push(flat(t0 + 13 * ONE_MIN_MS, 9.0));
+        assert_eq!(
+            open_tail_gap(&with_open, now, max).map(|g| g.last_cached_ts),
+            Some(t0 + 9 * ONE_MIN_MS)
+        );
+    }
+
+    #[test]
+    fn open_tail_rows_and_projected_ema_match_python_arithmetic() {
+        // cm:9221: window start = min(latest_expected - (ceil(span)-1) min,
+        // last_cached); internal gaps synthesised; flat zero-volume tail at
+        // the previous close; per span EMA over the last ceil(span) rows.
+        let t0 = 1_700_000_040_000u64;
+        let candles = vec![
+            flat(t0, 1.0),
+            flat(t0 + ONE_MIN_MS, 2.0),
+            flat(t0 + 3 * ONE_MIN_MS, 4.0), // minute 2 missing (internal gap)
+        ];
+        let gap = OpenTailGap {
+            latest_expected_ts: t0 + 5 * ONE_MIN_MS,
+            last_cached_ts: t0 + 3 * ONE_MIN_MS,
+            tail_gap_ms: 2 * ONE_MIN_MS,
+        };
+        // span 3: window start = min(t0+3, t0+3) -> the anchor row plus two flat rows
+        let rows3 = open_tail_rows(&candles, &gap, 3.0).unwrap();
+        let ts3: Vec<u64> = rows3.iter().map(|c| c[0] as u64).collect();
+        assert_eq!(ts3, (3..6).map(|i| t0 + i * ONE_MIN_MS).collect::<Vec<_>>());
+        // span 10: the whole history, internal gap synthesised
+        let rows = open_tail_rows(&candles, &gap, 10.0).unwrap();
+        let ts: Vec<u64> = rows.iter().map(|c| c[0] as u64).collect();
+        assert_eq!(ts, (0..6).map(|i| t0 + i * ONE_MIN_MS).collect::<Vec<_>>());
+        assert_eq!(
+            rows[2],
+            [(t0 + 2 * ONE_MIN_MS) as f64, 2.0, 2.0, 2.0, 2.0, 0.0]
+        );
+        assert_eq!(
+            rows[4],
+            [(t0 + 4 * ONE_MIN_MS) as f64, 4.0, 4.0, 4.0, 4.0, 0.0]
+        );
+        assert_eq!(rows[5][4], 4.0);
+        // span 3 -> the last three closes [4, 4, 4]; span 10 -> all six rows
+        assert_eq!(
+            projected_ema(&rows, 3.0, Metric::Close),
+            Some(ema_last_f64(&[4.0, 4.0, 4.0], 3.0))
+        );
+        assert_eq!(
+            projected_ema(&rows, 10.0, Metric::Close),
+            Some(ema_last_f64(&[1.0, 2.0, 2.0, 4.0, 4.0, 4.0], 10.0))
+        );
+        // the tail rows carry zero volume
+        assert_eq!(
+            projected_ema(&rows, 2.0, Metric::QuoteVolume),
+            Some(ema_last_f64(&[0.0, 0.0], 2.0))
+        );
+        // anchor missing from the local candles -> reader RuntimeError
+        let stale = OpenTailGap {
+            latest_expected_ts: t0 + 5 * ONE_MIN_MS,
+            last_cached_ts: t0 + 4 * ONE_MIN_MS,
+            tail_gap_ms: ONE_MIN_MS,
+        };
+        assert_eq!(open_tail_rows(&candles, &stale, 3.0), None);
+        assert_eq!(open_tail_rows(&[], &gap, 3.0), None);
+        assert_eq!(projected_ema(&[], 3.0, Metric::Close), None);
     }
 
     #[test]

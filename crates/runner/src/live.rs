@@ -9,6 +9,7 @@
 
 use crate::bot_params::{ConfigView, PSIDES};
 use crate::churn::{self, ChurnGate, ChurnParams};
+use crate::cooldown::ExchangeCooldowns;
 use crate::emas::{aggregate_1h, Candle, ONE_HOUR_MS, ONE_MIN_MS};
 use crate::market_filter::{
     fetch_max_age_ms, MarketFilter, MarketSnapshot, SnapshotProvider,
@@ -16,7 +17,8 @@ use crate::market_filter::{
 };
 use crate::reconcile::{self, OrderRec, PbMode, Plan, RecentExecution, ReconcileParams};
 use crate::snapshot::{
-    trailing_bundle, AccountState, MarketParams, SideState, SnapshotBuilder, SymbolState,
+    trailing_bundle, AccountState, CycleState, MarketParams, SideState, SnapshotBuilder,
+    SymbolState,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use passivbot_rust::orchestrator::{
@@ -25,7 +27,8 @@ use passivbot_rust::orchestrator::{
 use passivbot_rust::types::TrailingPriceBundle;
 use passivbot_rust::utils::hysteresis;
 use pb_exchange_bybit::{
-    ClosedPnl, ExchangeClient, Fill, MarketSpec, OpenOrder, Position, PositionSide, Side,
+    ClosedPnl, ExchangeClient, ExchangeError, Fill, MarketSpec, OpenOrder, Position, PositionSide,
+    Side,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -115,6 +118,11 @@ pub struct LiveRunner {
     warmup_1h_hours: u64,
     /// `PB_modes[(symbol, pside)]` from the previous engine output (SPEC 1.6).
     pb_modes: HashMap<(String, PositionSide), PbMode>,
+    /// Snapshot builder cross-cycle state (SNAPSHOT_SPEC 8): `PB_modes`,
+    /// dynamic forager eligibility, close-EMA carry-forward, cooled symbols.
+    cycle: CycleState,
+    /// Exchange-unavailable symbol cooldowns fed by write failures.
+    cooldowns: ExchangeCooldowns,
     /// Order churn gate history and create-attempt window (SPEC 2.9).
     churn: ChurnGate,
     /// Ticker snapshot cache (`MarketSnapshotProvider`): planning reads it
@@ -145,6 +153,8 @@ impl LiveRunner {
             warmup_1m_minutes: 0,
             warmup_1h_hours: 0,
             pb_modes: HashMap::new(),
+            cycle: CycleState::default(),
+            cooldowns: ExchangeCooldowns::new(),
             churn,
             snapshots: SnapshotProvider::new(),
             market_filter,
@@ -154,6 +164,16 @@ impl LiveRunner {
 
     pub fn config(&self) -> &ConfigView {
         &self.cfg
+    }
+
+    /// `_handle_order_write_failures`: classify every rejected write and arm
+    /// the exchange-unavailable cooldown for proven suspensions
+    /// (`cooldown.rs`; no Bybit error classifies at v8.1.0).
+    pub fn note_write_failures(&mut self, failures: &[(String, ExchangeError)], now_ms: u64) {
+        for (symbol, err) in failures {
+            self.cooldowns
+                .note_write_failure(&self.cfg, symbol, err, now_ms);
+        }
     }
 
     /// Largest spans over the universe -> warmup lengths (Python fetches
@@ -502,7 +522,10 @@ impl LiveRunner {
                 short,
             });
         }
-        let snap = builder.build(&account, &states)?;
+        // Exchange-unavailable cooldowns of this cycle (SPEC 2.3), then the
+        // snapshot with the carried state.
+        self.cycle.exchange_unavailable = self.cooldowns.active(now, Some(&symbols));
+        let snap = builder.build(&account, &states, &mut self.cycle)?;
         // Same text round trip as the Python bot (D8).
         let text = serde_json::to_string(&snap.input)?;
         let input: OrchestratorInput =
@@ -515,28 +538,28 @@ impl LiveRunner {
             .map(|o| to_planned(o, &snap.symbols))
             .collect::<Result<Vec<_>>>()?;
 
-        // PB_modes from this output's symbol_states (SPEC 1.6).
-        let stop = PbMode::parse(builder.stop_mode());
-        let mut pb_modes: HashMap<(String, PositionSide), PbMode> = HashMap::new();
-        for st in &out.diagnostics.symbol_states {
-            let Some(symbol) = snap.symbols.get(st.symbol_idx) else {
-                continue;
-            };
-            let state = states.iter().find(|s| s.symbol == *symbol);
-            for (pside, name, active) in [
-                (PositionSide::Long, "long", st.long.active),
-                (PositionSide::Short, "short", st.short.active),
-            ] {
-                let explicit = state.and_then(|s| builder.mode_override(name, s).ok().flatten());
-                let mode = match explicit {
-                    Some(m) => PbMode::parse(&m),
-                    None if active => PbMode::Normal,
-                    None => stop,
+        // PB_modes from this output's symbol_states (SPEC 1.6), kept both
+        // for the reconciler and for the next snapshot (SNAPSHOT_SPEC 3.6).
+        let active: Vec<(usize, bool, bool)> = out
+            .diagnostics
+            .symbol_states
+            .iter()
+            .map(|st| (st.symbol_idx, st.long.active, st.short.active))
+            .collect();
+        self.cycle.pb_modes = builder.pb_modes_after_cycle(&snap, &active);
+        self.pb_modes = self
+            .cycle
+            .pb_modes
+            .iter()
+            .map(|((symbol, pside), mode)| {
+                let ps = if pside == "long" {
+                    PositionSide::Long
+                } else {
+                    PositionSide::Short
                 };
-                pb_modes.insert((symbol.clone(), pside), mode);
-            }
-        }
-        self.pb_modes = pb_modes;
+                ((symbol.clone(), ps), PbMode::parse(mode))
+            })
+            .collect();
 
         // Reconcile (SPEC 2).
         let hedge_mode = self

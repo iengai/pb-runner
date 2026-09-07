@@ -2,6 +2,58 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 (worktree agent) — SNAPSHOT_SPEC 8 gaps closed except HSL
+
+**Changed:** `crates/runner/src/snapshot.rs`: `CycleState` (previous
+`PB_modes`, dynamic forager eligibility, close-EMA carry-forward cache,
+cooled symbols) passed as `&mut` to `build`; `Snapshot.mode_overrides` and
+`pb_modes_after_cycle` (`_python_mode_from_orchestrator_state`); verbatim
+ports of `normal_planning_psides`, `dynamic_forager_normal_psides`,
+`dynamic_forager_managed_entry_psides`, `flat_forager_default_normal`,
+`candidate_only`, `required_ema_can_mark_nontradable`; the missing
+required-forager rule now raises on `!can_mark_nontradable` (was
+"priority") plus the cache-only rule; exchange-cooldown planning policy
+(`cooldown_mode`) and flat-symbol tradability; close-EMA carry-forward
+(`close_ema_fallback_max_age_ms`) and open-tail projection wiring.
+`crates/runner/src/emas.rs`: `open_tail_gap`, `open_tail_rows`,
+`projected_ema` (= `cm.get_projected_open_tail_ema_metrics`).
+New `crates/runner/src/cooldown.rs` (`ExchangeCooldowns`, config
+validation, Bybit classifier = `None` as in v8.1.0). `execute.rs`
+`WaveReport.write_failures`; `live.rs` owns `CycleState` +
+`ExchangeCooldowns`, `note_write_failures` (called from `main.rs`);
+`pb-snapcheck` replays `PB_modes` from the previous recording's output.
+Tools: `record_fake_v8.py` decodes the harness output as UTF-8 (cp932
+crash after a complete run, RECORDER pitfall 6). New fixture set
+`tests/fixtures/recordings/fake_v8/grid_v7_forced` (30 cycles) from
+`tests/fixtures/configs/fake_v8/grid_v7_forced.json` (grid_v7 +
+`coin_overrides.{ADA,BTC,DOGE}.live.forced_mode_long` = gs / tp_only / m,
+`--seed-positions 3`). Docs: SNAPSHOT_SPEC 2.3, 3.6, 8; PLAN P4.1/P4.2;
+RECORDER section A; D15.
+
+**Verified:** `pb-snapcheck` identical on grid_v7 30/30, grid_v7_seeded
+30/30, tm 30/30, tm_seeded 30/30, grid_v7_forced 30/30 (full local run
+400/400: ADA graceful_stop = 399 closes + 376 grid re-entries and no
+initials, BTC tp_only = closes only, DOGE manual = no orders), and on the
+full 600-cycle public runs grid_v7 600/600, tm 600/600. `pb-plancheck`
+unchanged: public grid_v7 600/600, tm 600/600; seeded grid_v7, tm, tm8,
+iter7 400/400 each. `cargo fmt --check`, clippy `-D warnings`,
+`cargo test --workspace` (71 tests; new: 3 cooldown, 2 emas, 7 snapshot).
+Evidence for (d): the fake harness primes every coin's full 1m array each
+step, so the last closed minute is never missing; neither the carry-forward
+nor the projection fires in any fake run (600/600 with and without the
+code). Their behaviour is covered by unit tests mirroring pb:18687-18830
+and cm:9221-9400.
+
+**Not modelled (D15):** HSL modes (separate task), runtime operator forced
+modes, `ineligible_symbols`, cached forager-metric fallback and forager
+stale-tail context (runner skips the cycle with an error where Python
+would rank on stale metrics), EMA-entry-cancellation order keys,
+entry-cooldown position-delta guard.
+
+**Next action:** HSL equity state machine (SPEC 2.3 steps 1-2, D15 item 5),
+then the P5.2 shadow run; the market-distance filter is in flight in a
+parallel worktree (`reconcile.rs`/`live.rs`).
+
 ## 2026-09-08 (worktree agent) — pre-create market snapshot gate + distance filter ported (RECONCILE_SPEC 2.10)
 
 **Changed:** new `crates/runner/src/market_filter.rs`: `MarketSnapshot`

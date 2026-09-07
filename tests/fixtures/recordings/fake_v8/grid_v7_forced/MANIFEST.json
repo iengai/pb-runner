@@ -1,0 +1,68 @@
+{
+  "producer": "tools/record_fake_v8.py + passivbot src/tools/run_fake_live.py (fake exchange, replay)",
+  "passivbot_commit": "e808cfd33fcd2bc086619cd56131744549161826",
+  "passivbot_describe": "v8.1.0-1-ge808cfd33",
+  "extension_source_fingerprint": "0cf730b52c50b9b640ddaa1118911f63acd5b7334315ef0f4e2c819a154871f1",
+  "python": "E:/projects/passivbot/.venv/Scripts/python.exe",
+  "config_name": "grid_v7_forced",
+  "config_source": "tests\\fixtures\\configs\\fake_v8\\grid_v7_forced.json",
+  "config_source_sha256": "e2873d06059c7c6f7bfcad15df3db8b6c7801448df9a219ce7a52cf35bff80a3",
+  "config_overrides": {
+    "live.minimum_coin_age_days": 0,
+    "live.user": "fake_grid_v7_forced"
+  },
+  "scenario": {
+    "coins": [
+      "ADA",
+      "BTC",
+      "DOGE",
+      "DOT",
+      "ETH",
+      "HBAR",
+      "SOL",
+      "TRX",
+      "XLM",
+      "XRP"
+    ],
+    "candle_dates": [
+      "2025-08-01",
+      "2025-10-28"
+    ],
+    "boot_index": 120960,
+    "balance": 1000.0,
+    "max_steps": 400,
+    "seeded_positions": [
+      {
+        "symbol": "ADA/USDT:USDT",
+        "position_side": "long",
+        "qty": 233.0,
+        "price": 0.655656
+      },
+      {
+        "symbol": "BTC/USDT:USDT",
+        "position_side": "long",
+        "qty": 0.001,
+        "price": 112239.78
+      },
+      {
+        "symbol": "DOGE/USDT:USDT",
+        "position_side": "long",
+        "qty": 769.0,
+        "price": 0.198798
+      }
+    ]
+  },
+  "calls_recorded": 400,
+  "unique_inputs_kept": 400,
+  "duplicates_dropped": 0,
+  "harness_seconds": 668.4,
+  "recorded_utc": "2026-09-07T15:37:31Z",
+  "selection": {
+    "source_recordings": 400,
+    "transitions_available": 331,
+    "stride": 20,
+    "max": 30,
+    "kept": 30,
+    "kept_transitions": 30
+  }
+}

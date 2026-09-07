@@ -13,9 +13,24 @@ un-ignored and committed:
   `tests/fixtures/configs/fake_v8/` (D10), subsampled by
   `tools/select_fixtures.py`; each `MANIFEST.json` records the passivbot
   commit, extension fingerprint, config sha256, overrides, scenario and
-  selection parameters.
+  selection parameters. Sets: `grid_v7`, `tm` (unseeded), `grid_v7_seeded`,
+  `tm_seeded` (two seeded long positions), `grid_v7_forced` (three seeded
+  positions under per-symbol `live.forced_mode_long` = gs / tp_only / m).
 
 Anything else must be scrubbed with `tools/scrub.py` (P2.3) before it is
 un-ignored.
 
 Check: `cargo run -p pb-diffcheck --features engine -- --dir tests/fixtures/recordings/synthetic_v8`
+
+Snapshot parity (P4.2) per fake_v8 set, with the dev box's candle cache:
+
+```bash
+./target/debug/pb-snapcheck --config tests/fixtures/configs/fake_v8/<config>.json \
+  --recordings tests/fixtures/recordings/fake_v8/<name> \
+  --candles E:/projects/passivbot/historical_data/ohlcvs_bybit --dates 2025-08-01:2025-10-28 \
+  [--scenario .local/<run>/<name>/scenario.json]   # seeded sets: boot fills -> trailing anchors
+```
+
+`<config>` is `grid_v7` for `grid_v7` / `grid_v7_seeded`, `tm` for `tm` /
+`tm_seeded`, `grid_v7_forced` for `grid_v7_forced`; the scenario files of
+the seeded runs live in the gitignored `.local/` of the recording box.
