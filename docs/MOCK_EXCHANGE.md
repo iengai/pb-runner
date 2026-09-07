@@ -112,22 +112,22 @@ Compared per step:
 |---|---|---|---|---|---|---|---|
 | public grid_v7 (both artifact dirs) | 600 | 600/600 | 600/600 / 600/600 | 600/600 | 600/600 | 600/600 | 600/600 |
 | public tm | 600 | 600/600 | 600/600 / 600/600 | 600/600 | 600/600 | 600/600 | 600/600 |
-| seeded2 grid_v7 | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 0/400 (*) |
-| seeded2 tm | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 0/400 (*) |
-| seeded2 tm8 | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 0/400 (*) |
-| seeded2 iter7 | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 0/400 (*) |
+| seeded2 grid_v7 | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 400/400 (*) |
+| seeded2 tm | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 400/400 (*) |
+| seeded2 tm8 | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 400/400 (*) |
+| seeded2 iter7 | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 400/400 (*) |
 
 Create order/id sequence and cancel id set: 0 differing steps in every run.
 Final state identical in every run. tm8 places no order in 400 steps
 (Python neither).
 
-(*) The only differing field is `global.realized_pnl_cumsum_last`
-(`0.0` vs recorded `-0.0530015256`, every step): the seeded boot fills carry
-`fee.cost = 0.0`, and Python's fill-event manager charges
-`live.fee_pct_fallback` (0.0002) on fills without a fee, the runner does
-not. `uses_realized_pnl` is on in these configs, but a 0.053 USDT offset of
-the cumsum did not change any order in 1600 steps. Bybit fills always carry
-a fee, so the fallback never fires on the live account; not ported.
+(*) Until 2026-09-08 the only differing field was
+`global.realized_pnl_cumsum_last` (`0.0` vs recorded `-0.0530015256`, every
+step): the seeded boot fills carry `fee.cost = 0.0`, and Python's
+fill-event manager charges `live.fee_pct_fallback` (0.0002) on fills
+without a fee. `live::realized_pnl_cumsum` now applies the same
+normalisation (`hsl::FeePolicy`, D20 item 6), and the four seeded2 runs are
+identical in every engine-input field.
 
 Control runs (both expected to fail):
 
@@ -165,7 +165,10 @@ cache once at boot and the bot never calls `fetch_my_trades` in any run,
 `remote_calls.json` has zero such calls), while the runner refetches fills
 each cycle and its series reaches `12.129308092`. Neither value changed an
 order here (positions were flat, no unstuck). A real Python bot polls
-fills, so this is a harness limit, not a runner deviation (D17.4).
+fills, so this is a harness limit, not a runner deviation (D17.4). With
+the fee fallback ported (D20 item 6) the two steps before the first fill
+are identical (2/150); the remaining 148 differ only through the live
+fills.
 
 ## 6. Harness quirks the runner reproduces only under `pb-mockrun` (D17)
 

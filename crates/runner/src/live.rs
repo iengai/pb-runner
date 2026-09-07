@@ -142,6 +142,10 @@ pub struct LiveRunner {
     /// Equity hard-stop-loss state machine (SNAPSHOT_SPEC 2.3 step 1,
     /// `hsl.rs`); `None` when no side enables it.
     hsl: Option<HslState>,
+    /// Fill-manager fee normalisation (`live.fee_pct_fallback` /
+    /// `fee_pct_sanity_abs_max`) shared by the realized-pnl cumsum and the
+    /// HSL ledger.
+    fee: FeePolicy,
     /// Exchange-unavailable symbol cooldowns fed by write failures.
     cooldowns: ExchangeCooldowns,
     /// Order churn gate history and create-attempt window (SPEC 2.9).
@@ -199,6 +203,7 @@ impl LiveRunner {
         let churn = ChurnGate::new(ChurnParams::from_config(&cfg));
         let market_filter = MarketFilter::from_config(&cfg)?;
         let hsl_cfg = HslConfig::from_config(&cfg)?;
+        let fee = hsl_cfg.fee;
         let hsl = hsl_cfg.any_enabled().then(|| HslState::new(hsl_cfg));
         Ok(Self {
             cfg,
@@ -214,6 +219,7 @@ impl LiveRunner {
             pb_modes: HashMap::new(),
             cycle: CycleState::default(),
             hsl,
+            fee,
             cooldowns: ExchangeCooldowns::new(),
             churn,
             snapshots: SnapshotProvider::new(),
@@ -870,10 +876,14 @@ impl LiveRunner {
         };
         self.prev_hysteresis_balance = snapped;
         let (cum_max, cum_last) = if builder.uses_realized_pnl()? {
+            let markets = &self.markets;
+            let c_mult = |symbol: &str| markets.get(symbol).map_or(1.0, |m| m.contract_size);
             realized_pnl_cumsum(
                 &self.fills,
                 &self.closed_pnl,
                 now.saturating_sub(self.lookback_ms()),
+                &self.fee,
+                &c_mult,
             )
         } else {
             (0.0, 0.0)
@@ -1257,9 +1267,18 @@ fn to_planned(o: &ExecutableOrder, symbols: &[String]) -> Result<PlannedOrder> {
 }
 
 /// SPEC 5.2: chronological net pnl (`closedPnl` of the order attached to its
-/// last fill, plus signed fees: paid fees are negative) over the lookback;
-/// returns `(max(0, running max), last)`.
-pub fn realized_pnl_cumsum(fills: &[Fill], closed: &[ClosedPnl], start_ms: u64) -> (f64, f64) {
+/// last fill, plus the fill manager's signed `fee_paid`: paid fees are
+/// negative, a zero/missing fee falls back to `live.fee_pct_fallback` x
+/// notional and outliers are replaced, `_normalize_fee_paid_from_payload`
+/// = [`FeePolicy::signed_fee_paid`], the same normalisation the HSL ledger
+/// uses) over the lookback; returns `(max(0, running max), last)`.
+pub fn realized_pnl_cumsum(
+    fills: &[Fill],
+    closed: &[ClosedPnl],
+    start_ms: u64,
+    fee: &FeePolicy,
+    c_mult: &dyn Fn(&str) -> f64,
+) -> (f64, f64) {
     let mut pnl_by_order: HashMap<&str, f64> = HashMap::new();
     for p in closed {
         *pnl_by_order.entry(p.order_id.as_str()).or_default() += p.pnl;
@@ -1280,11 +1299,7 @@ pub fn realized_pnl_cumsum(fills: &[Fill], closed: &[ClosedPnl], start_ms: u64) 
         } else {
             0.0
         };
-        let fee_paid = if f.fee < 0.0 {
-            f.fee.abs()
-        } else {
-            -f.fee.abs()
-        };
+        let fee_paid = fee.signed_fee_paid(f.fee, f.qty.abs() * f.price * c_mult(&f.symbol));
         cum += pnl + fee_paid;
         max = max.max(cum);
         any = true;
@@ -1557,11 +1572,18 @@ mod tests {
 
     #[test]
     fn realized_pnl_cumsum_attaches_closed_pnl_to_last_fill_and_negates_fees() {
-        let fills = vec![
+        // 0.1 on a 1000 notional = 0.01 %, inside the fee sanity ratio.
+        let fills: Vec<Fill> = vec![
             fill("f1", "o1", 100, Side::Buy, 0.1),
             fill("f2", "o2", 200, Side::Sell, 0.1),
             fill("f3", "o2", 300, Side::Sell, 0.1),
-        ];
+        ]
+        .into_iter()
+        .map(|mut f| {
+            f.qty = 1000.0;
+            f
+        })
+        .collect();
         let closed = vec![ClosedPnl {
             order_id: "o2".into(),
             symbol: "A/USDT:USDT".into(),
@@ -1569,16 +1591,42 @@ mod tests {
             pnl: 5.0,
             timestamp_ms: 300,
         }];
+        let fee = FeePolicy::default();
+        let one = |_: &str| 1.0;
         // cumsum: -0.1, -0.2, -0.3 + 5 = 4.7 -> max 4.7, last 4.7
-        let (max, last) = realized_pnl_cumsum(&fills, &closed, 0);
+        let (max, last) = realized_pnl_cumsum(&fills, &closed, 0, &fee, &one);
         assert!((last - 4.7).abs() < 1e-12 && (max - 4.7).abs() < 1e-12);
         // losses only: max clamps at 0
-        let (max, last) = realized_pnl_cumsum(&fills[..1], &[], 0);
+        let (max, last) = realized_pnl_cumsum(&fills[..1], &[], 0, &fee, &one);
         assert_eq!(max, 0.0);
         assert!((last + 0.1).abs() < 1e-12);
         // lookback excludes old fills
-        let (_, last) = realized_pnl_cumsum(&fills, &closed, 250);
+        let (_, last) = realized_pnl_cumsum(&fills, &closed, 250, &fee, &one);
         assert!((last - 4.9).abs() < 1e-12);
+    }
+
+    /// SPEC 5.2 / D16.5: a zero-fee fill (the seeded boot fills, a venue
+    /// that reports no fee) gets the fill manager's fallback
+    /// (`live.fee_pct_fallback` x notional, default 0.02 %), so the cumsum
+    /// agrees with the HSL ledger (`hsl_fills`) and with Python.
+    #[test]
+    fn realized_pnl_cumsum_applies_the_zero_fee_fallback_like_the_hsl_ledger() {
+        let mut boot = fill("f1", "o1", 100, Side::Buy, 0.0);
+        boot.qty = 391.0;
+        boot.price = 0.782136;
+        let fee = FeePolicy::default();
+        let c_mult = |_: &str| 1.0;
+        let (max, last) = realized_pnl_cumsum(&[boot.clone()], &[], 0, &fee, &c_mult);
+        let expected = -(391.0 * 0.782136 * 0.0002);
+        assert!((last - expected).abs() < 1e-12, "{last} vs {expected}");
+        assert_eq!(max, 0.0);
+        let ledger = hsl_fills(&[boot], &[], &fee, &c_mult);
+        assert_eq!(ledger[0].fee_paid, last);
+        // A contract multiplier scales the notional.
+        let big = |_: &str| 10.0;
+        let boot2 = fill("f2", "o2", 100, Side::Buy, 0.0);
+        let (_, last) = realized_pnl_cumsum(&[boot2], &[], 0, &fee, &big);
+        assert!((last + 10.0 * 0.0002).abs() < 1e-12);
     }
 
     #[test]

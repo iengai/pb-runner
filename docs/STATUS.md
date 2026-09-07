@@ -2,6 +2,81 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 (worktree agent) — HSL coin mode ported (`hsl_coin.rs`, D20); `realized_pnl_cumsum` fee fallback (D16.5)
+
+**Changed:** `crates/runner/src/hsl_coin.rs` (new): the per-pair HSL
+machine of `live.hsl_signal_mode = "coin"` -- `CoinState` / `CoinMetrics`
+/ `CoinStopEvent`, `HslState::{check_coin, supervise_coin_red,
+initialize_coin_from_history, coin_panic_pairs, coin_red_active,
+finalize_coin_red_stop, reset_coin_after_restart,
+handle_coin_position_during_cooldown, refresh_coin_cooldown_after_repanic}`,
+`coin_realized_pnl_peak_last`, `coin_replay_events`,
+`coin_bounded_required_replay_start_ts`, `infer_coin_replay_contract`,
+`compact_sparse_replay_indices`, `RealizedWindow`; `CoinEnv` (unrealized
+pnl, blocking-order counts, optional traced realized override). `hsl.rs`:
+config accepts coin mode (D16 item 2 lifted), `coin_overrides` /
+`side_config` / `coin_active_pside`, `HslFill.pb_order_type` + `is_panic`,
+symbol-aware `latest_flatten_fill_timestamp`, `LatchPayload.complete`,
+`HslModes.{coin_enabled, replay_pending, runtime_forced}`,
+`HslState.{coin, runtime_forced, replay_pending}`, and the fill replay
+generalised into `coin_history` (`ReplayInputs`, `CoinHistory`,
+`PanicFlatten`, `psize_after_quirk`) with `balance_equity_timeline` as its
+timeline wrapper. `snapshot.rs`: `mode_override` steps 2-3 from
+`HslModes`, `SnapshotBuilder::build_protective` (the coin RED supervisor's
+reduced input, pb:16516). `live.rs`: coin initialization at warmup over
+`coin_history`, per cycle `check_coin` + one supervisor iteration +
+protective planning / reconciliation when pairs stay under panic
+supervision, `blocking_orders_symbol`, `coin_upnl`, `hsl_fills` decodes
+`pb_order_type` from the fill's client id. `bin/snapcheck.rs`: coin trace
+replay (`compare_coin_state(s)`, `compare_coin_modes`, traced per-pair
+inputs with the ledger cross-check, flatten-lookup cross-check,
+`run_protective`). Tools: `fake_live_clock.py` `coin_*` trace records and
+the `protective` flag on `compute`; `select_fixtures.py` coin transition
+keys and the coin trace compaction. Fixtures
+`tests/fixtures/configs/fake_v8/grid_v7_hsl_coin.json`,
+`tests/fixtures/recordings/fake_v8/grid_v7_hsl_coin` (25 cycles + trace +
+fills + scenario, 3.2 MB). Docs: SNAPSHOT_SPEC 2.3 steps 2-3 / 8, PLAN
+P4.1 / P4.2, RECORDER A, fixtures README, D20. Second commit:
+`live::realized_pnl_cumsum` takes `FeePolicy` + `c_mult` and applies the
+fill manager's zero-fee fallback / sanity replacement like `hsl_fills`
+(SPEC 5.2, D16 item 5), `LiveRunner.fee`; unit test.
+
+**Verified:** full coin run (`.local/fake_v8_hsl_coin/grid_v7_hsl_coin`,
+boot 2025-10-10 20:00, 400 cycles, 402 computes with 2 duplicate
+protective inputs): `pb-snapcheck` 400/400 identical including the two
+protective-panic recordings, "every traced state matches" over 1 init /
+400 checks / 2 supervisor runs (8 iterations) / 2 finalizations / 2 resets /
+4 flatten lookups, 87479/87479 floats bit-exact, 8 realized-pnl inputs
+explained by the stale ledger (the harness refreshes fills only inside the
+supervisor's flatten lookup). Per-coin timeline: ADA/DOGE yellow 58, orange
+61/62 (`tp_only`), red 68/70 (`panic`, finalized inside the cycle,
+`graceful_stop`), reset 188/190; BTC (red 0.3) green throughout. Committed
+subset 25/25. Regression: `pb-snapcheck` grid_v7, tm, grid_v7_seeded,
+tm_seeded, grid_v7_forced 30/30, grid_v7_hsl 27/27 (every traced state
+matches, 10822/10835 bit-exact); `pb-plancheck` public grid_v7 600/600, tm
+600/600, seeded2 grid_v7 / tm / tm8 / iter7 400/400; `pb-mockrun
+--diff-inputs` (after the fee fallback) public grid_v7 600/600, tm 600/600,
+seeded2 grid_v7 / tm / tm8 / iter7 400/400 in requests, account state and
+now also engine inputs (were 0/400 on `realized_pnl_cumsum_last`, D17.4),
+`.local/fake_v8_fills/grid_v7` 150/150 requests / account state, engine
+inputs 2/150 (148 differ only in `realized_pnl_cumsum_*` through the live
+fills the harness never refetches). `cargo fmt --all --check`, clippy `-D
+warnings`, `cargo test --workspace` (118 runner lib tests; new: 11
+hsl_coin, 1 snapshot `hsl_coin_modes_override_steps_two_three_and_protective_input`,
+1 live `realized_pnl_cumsum_applies_the_zero_fee_fallback_like_the_hsl_ledger`). Python facts found:
+`_equity_hard_stop_refresh_coin_cooldown_after_repanic` is not bound on
+`Passivbot` in v8.1.0 (hsl:4776; a repanic reset with the `panic` cooldown
+policy would raise), and the fake harness runs the production coin
+supervisor loop at one scenario minute (four iterations per red episode).
+
+**Not modelled (D20):** replay-matrix cache (accelerator only),
+background / partial replay, latch files, operator runtime forced modes,
+coin overrides of `n_positions`.
+
+**Next action:** P5.2 shadow run with an HSL-enabled config (coin mode
+default) to see `initialize_coin_from_history` against a live fill
+history; then the entry-cooldown position-delta guard.
+
 ## 2026-09-08 (session 4) — line 8 feature-complete for a shadow/small-capital run; all agent work merged on master
 
 Summary of the day (details in the worktree-agent entries below, newest

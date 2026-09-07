@@ -794,8 +794,12 @@ max  = max(0.0, cumsum.max());  last = cumsum[-1]
 ```
 
 Events are in chronological order (manager-owned). `fee_paid` is signed as
-stored by the fill normaliser (fees negative), **not traced**. Rust
-validates `max >= last` and finiteness.
+stored by the fill normaliser (`_normalize_fee_paid_from_payload`: paid
+fees negative, a zero / missing fee -> `-live.fee_pct_fallback` x notional,
+a fee beyond `live.fee_pct_sanity_abs_max` of the notional replaced by the
+fallback). Runner: `live::realized_pnl_cumsum` with `hsl::FeePolicy`
+(D20 item 6), the same normalisation the HSL ledger uses. Rust validates
+`max >= last` and finiteness.
 
 ### 5.3 Other account fields
 

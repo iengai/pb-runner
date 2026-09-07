@@ -502,11 +502,11 @@ Decision:
 3. The first-minute trailing rule is ported into `live.rs` for the live
    path too (it is Python's real behaviour after any fill), guarded by
    `latest_finalized >= first_full_minute_after(anchor)`.
-4. Not ported: `live.fee_pct_fallback` on fills without a fee (Python's
-   fill-event manager charges 0.02 % on the seeded boot fills, hence
-   `realized_pnl_cumsum_last = -0.053` in the seeded recordings vs `0.0`
-   in the runner). Bybit fills always carry a fee; revisit if a real
-   recording shows a fee-less fill. Related harness limit: the fill cache
+4. Not ported at the time: `live.fee_pct_fallback` on fills without a fee
+   (Python's fill-event manager charges 0.02 % on the seeded boot fills,
+   hence `realized_pnl_cumsum_last = -0.053` in the seeded recordings vs
+   `0.0` in the runner). Ported 2026-09-08 (D20 item 6): the seeded2 runs
+   are now identical in every engine-input field. Related harness limit: the fill cache
    is primed once at boot and the harnessed bot never calls
    `fetch_my_trades` (zero calls in every `remote_calls.json`), so live
    fills never enter Python's realized-pnl series in a fake run; the
@@ -739,3 +739,9 @@ Decision:
    forced modes (the runner's `runtime_forced` map is written only by the
    coin machine), coin overrides of `n_positions` (Python reads the global
    `bot_value`).
+6. `live::realized_pnl_cumsum` (SPEC 5.2) takes the fill manager's fee
+   normalisation (`hsl::FeePolicy::signed_fee_paid`: zero / missing fee ->
+   `live.fee_pct_fallback` x notional, outliers beyond
+   `fee_pct_sanity_abs_max` replaced) so the realized-pnl series and the
+   HSL ledger agree with Python's `fill_event_net_pnl` (closes D16 item 5
+   and D17 item 4; `pb-mockrun` seeded2 engine inputs 0/400 -> 400/400).
