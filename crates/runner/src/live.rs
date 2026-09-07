@@ -216,30 +216,40 @@ impl LiveRunner {
         set.into_iter().collect()
     }
 
+    /// Only finalized candles are ever read (`latest_finalized_range`,
+    /// `trailing_bundle`), so a timeframe is refetched only once a new
+    /// bucket has started since the last stored candle: one 1m and one 1h
+    /// request per symbol per minute/hour, as the Python candle manager
+    /// paces `update_ohlcvs_1m`, instead of two per cycle.
     async fn refresh_candles(&mut self, symbol: &str, now: u64) -> Result<()> {
         let (m1_since, h1_since) = {
             let buf = self.candles.entry(symbol.to_string()).or_default();
             let m1_since = match buf.m1.last() {
-                Some(c) => c[0] as u64,
-                None => now.saturating_sub(self.warmup_1m_minutes * ONE_MIN_MS),
+                Some(c) => candle_refresh_since(c[0] as u64, now, ONE_MIN_MS),
+                None => Some(now.saturating_sub(self.warmup_1m_minutes * ONE_MIN_MS)),
             };
             let h1_since = match buf.h1.last() {
-                Some(c) => c[0] as u64,
-                None => now.saturating_sub(self.warmup_1h_hours * ONE_HOUR_MS),
+                Some(c) => candle_refresh_since(c[0] as u64, now, ONE_HOUR_MS),
+                None => Some(now.saturating_sub(self.warmup_1h_hours * ONE_HOUR_MS)),
             };
             (m1_since, h1_since)
         };
-        let m1 = self
-            .client
-            .fetch_ohlcv(symbol, "1m", Some(m1_since), 1000)
-            .await?;
-        let h1 = self
-            .client
-            .fetch_ohlcv(symbol, "1h", Some(h1_since), 1000)
-            .await?;
-        let buf = self.candles.get_mut(symbol).expect("buffer");
-        merge_candles(&mut buf.m1, m1, self.warmup_1m_minutes as usize + 1500);
-        merge_candles(&mut buf.h1, h1, self.warmup_1h_hours as usize + 50);
+        if let Some(since) = m1_since {
+            let m1 = self
+                .client
+                .fetch_ohlcv(symbol, "1m", Some(since), 1000)
+                .await?;
+            let buf = self.candles.get_mut(symbol).expect("buffer");
+            merge_candles(&mut buf.m1, m1, self.warmup_1m_minutes as usize + 1500);
+        }
+        if let Some(since) = h1_since {
+            let h1 = self
+                .client
+                .fetch_ohlcv(symbol, "1h", Some(since), 1000)
+                .await?;
+            let buf = self.candles.get_mut(symbol).expect("buffer");
+            merge_candles(&mut buf.h1, h1, self.warmup_1h_hours as usize + 50);
+        }
         Ok(())
     }
 
@@ -644,6 +654,13 @@ pub fn risk_active_pairs(
     pairs
 }
 
+/// `Some(since)` when a new `period_ms` bucket has started after the last
+/// stored candle `last_ts` (which may be the still-open one, refetched so it
+/// gets its final values); `None` while nothing can have been finalized.
+pub fn candle_refresh_since(last_ts: u64, now_ms: u64, period_ms: u64) -> Option<u64> {
+    (now_ms / period_ms * period_ms > last_ts).then_some(last_ts)
+}
+
 /// Engine order -> exchange action (side from the qty sign; closes are
 /// reduce-only; market execution as decided by the engine).
 fn to_planned(o: &ExecutableOrder, symbols: &[String]) -> Result<PlannedOrder> {
@@ -779,6 +796,26 @@ pub fn hourly_from_minutes(m1: &[Candle]) -> Vec<Candle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candle_refresh_only_after_a_new_bucket() {
+        let t = 1_700_000_000_000 / ONE_MIN_MS * ONE_MIN_MS; // open 1m bucket
+        assert_eq!(candle_refresh_since(t, t + 30_000, ONE_MIN_MS), None);
+        assert_eq!(candle_refresh_since(t, t + ONE_MIN_MS, ONE_MIN_MS), Some(t));
+        assert_eq!(
+            candle_refresh_since(t, t + 5 * ONE_MIN_MS, ONE_MIN_MS),
+            Some(t)
+        );
+        let h = t / ONE_HOUR_MS * ONE_HOUR_MS;
+        assert_eq!(
+            candle_refresh_since(h, h + ONE_HOUR_MS - 1, ONE_HOUR_MS),
+            None
+        );
+        assert_eq!(
+            candle_refresh_since(h, h + ONE_HOUR_MS, ONE_HOUR_MS),
+            Some(h)
+        );
+    }
 
     fn fill(id: &str, order: &str, ts: u64, side: Side, fee: f64) -> Fill {
         Fill {

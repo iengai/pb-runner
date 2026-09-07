@@ -177,7 +177,16 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
                     }
                 }
             }
-            Err(e) => tracing::error!(error = %e, "planning cycle failed"),
+            Err(e) => {
+                tracing::error!(error = %e, "planning cycle failed");
+                // Honour the exchange's back-off before the regular cycle delay.
+                if let Some(pb_exchange_bybit::ExchangeError::RateLimited { retry_after_ms }) = e
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<pb_exchange_bybit::ExchangeError>())
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(*retry_after_ms)).await;
+                }
+            }
         }
         if args.once {
             return Ok(());
