@@ -33,6 +33,9 @@ use pb_runner::bot_params::ConfigView;
 use pb_runner::churn::{ChurnGate, ChurnParams};
 use pb_runner::jsonexact::parse_exact;
 use pb_runner::live::PlannedOrder;
+use pb_runner::market_filter::{
+    self, MarketFilter, MarketSnapshot, LIVE_MARKET_SNAPSHOT_MAX_AGE_MS,
+};
 use pb_runner::reconcile::{self, OrderRec, PbMode, ReconcileParams};
 use pb_runner::snapshot::{MarketParams, SideState, SnapshotBuilder, SymbolState};
 use serde_json::Value;
@@ -125,6 +128,8 @@ fn main() -> Result<()> {
     };
     let stop = PbMode::parse(builder.stop_mode());
     let mut gate = ChurnGate::new(ChurnParams::from_config(&cfg));
+    let mut market_filter = MarketFilter::from_config(&cfg)?;
+    let mut market_skips = 0usize;
     let wall_clock = match args.gate_clock.as_str() {
         "wall" => true,
         "cycle" => false,
@@ -364,16 +369,54 @@ fn main() -> Result<()> {
                 .copied()
                 .unwrap_or(PbMode::Normal)
         };
-        let plan = reconcile::reconcile(
-            &ideal,
-            &open,
-            &mode_fn,
-            &last,
-            &[],
+        let mut plan = reconcile::reconcile(&ideal, &open, &mode_fn, &last, &[], ts, &params);
+        // SPEC 3.1 step 8 with what the fake run provides: the fake ticker is
+        // bid = ask = last = the step price (recorded as `order_book.bid`),
+        // and `utc_ms` is pinned to scenario time, so the snapshot fetched
+        // for planning is 0 ms old at the pre-create check (no refetch, no
+        // stale skip); the distance filter runs on the recorded price.
+        let snaps: HashMap<String, MarketSnapshot> = last_price
+            .iter()
+            .map(|(s, p)| {
+                (
+                    s.clone(),
+                    MarketSnapshot {
+                        symbol: s.clone(),
+                        bid: *p,
+                        ask: *p,
+                        last: *p,
+                        fetched_ms: ts,
+                    },
+                )
+            })
+            .collect();
+        let mut create_symbols: Vec<String> =
+            plan.creates.iter().map(|o| o.symbol.clone()).collect();
+        create_symbols.sort();
+        create_symbols.dedup();
+        let max_age = LIVE_MARKET_SNAPSHOT_MAX_AGE_MS;
+        let mut invalid =
+            market_filter::planning_snapshot_invalid(&create_symbols, &snaps, ts, max_age);
+        invalid.extend(market_filter::snapshot_signature_invalid(
+            &create_symbols,
+            &snaps,
             ts,
-            &params,
-            Some((&mut gate, gate_now)),
-        );
+            max_age,
+        ));
+        if !create_symbols.is_empty() && !invalid.is_empty() {
+            plan.skipped_market_snapshot = plan.creates.len();
+            plan.creates.clear();
+        } else {
+            let (kept, skipped) = market_filter.filter_by_market_distance(
+                std::mem::take(&mut plan.creates),
+                &snaps,
+                ts,
+            );
+            plan.creates = kept;
+            plan.skipped_market_distance = skipped;
+        }
+        market_skips += plan.skipped_market_snapshot + plan.skipped_market_distance;
+        reconcile::admit_and_cap(&mut plan, &params, Some((&mut gate, gate_now)));
 
         // Expected from the request log at this step.
         let mut exp_creates: Vec<String> = creates_at
@@ -459,7 +502,7 @@ fn main() -> Result<()> {
             ok_steps += 1;
         }
     }
-    println!("{steps} steps, {ok_steps} identical plans, {create_mismatch} create mismatches, {cancel_mismatch} cancel mismatches");
+    println!("{steps} steps, {ok_steps} identical plans, {create_mismatch} create mismatches, {cancel_mismatch} cancel mismatches, {market_skips} market-filter skips");
     for e in examples {
         println!("  {e}");
     }

@@ -6,8 +6,10 @@
 //! cancel and to create exactly as `calc_orders_to_cancel_and_create` does:
 //! conversion with reduce-only trimming, open-order normalisation, exact
 //! 8-key matching, mode filters, tolerance matching (maximum-cardinality),
-//! market-distance sorting, batch limits, cancel-first barrier, the
-//! recent-execution guard and (optionally) the order churn gate admission.
+//! market-distance sorting, cancel batch limit, cancel-first barrier and the
+//! recent-execution guard. `admit_and_cap` applies the order churn gate
+//! admission and the create batch limit; the pre-create market snapshot
+//! filter (`market_filter.rs`) runs between the two, as in Python.
 
 use crate::churn::ChurnGate;
 use crate::live::PlannedOrder;
@@ -35,6 +37,10 @@ pub struct OrderRec {
     pub risk_critical: bool,
     /// `_churn_evidence` set by `ChurnGate::evaluate` (planned creates only).
     pub churn_evidenced: bool,
+    /// `_churn_gate_market_distance`: signed `order_market_diff` against the
+    /// pre-create market snapshot, set by the market-distance filter
+    /// (`market_filter.rs`) and read by the churn admission.
+    pub market_distance: Option<f64>,
     /// Exchange id (open orders only).
     pub id: Option<String>,
     pub custom_id: Option<String>,
@@ -139,6 +145,7 @@ pub fn to_executable(
             pb_order_type: o.order_type.clone(),
             risk_critical: o.risk_critical,
             churn_evidenced: false,
+            market_distance: None,
             id: None,
             custom_id: Some(format_custom_id(&o.order_type)),
         })
@@ -216,6 +223,7 @@ pub fn normalize_open_order(o: &OpenOrder, hedge_mode: bool) -> OrderRec {
         pb_order_type: pb_order_type_from_custom_id(o.client_id.as_deref()),
         risk_critical: false,
         churn_evidenced: false,
+        market_distance: None,
         id: Some(o.id.clone()),
         custom_id: o.client_id.clone(),
     }
@@ -265,6 +273,11 @@ pub struct Plan {
     /// Creates deferred by the churn gate admission (SPEC 2.9).
     pub deferred_churn: usize,
     pub deferred_capacity: usize,
+    /// Creates dropped because the pre-create market snapshot gate skipped
+    /// the whole cycle (SPEC 2.10 / 3.1 step 8).
+    pub skipped_market_snapshot: usize,
+    /// Limit creates dropped by the market-distance filter (SPEC 2.10).
+    pub skipped_market_distance: usize,
 }
 
 /// A create acknowledged less than 15 s ago (SPEC 2.8).
@@ -341,7 +354,6 @@ pub fn reconcile(
     recent: &[RecentExecution],
     now_ms: u64,
     params: &ReconcileParams,
-    mut churn: Option<(&mut ChurnGate, f64)>,
 ) -> Plan {
     let mut plan = Plan::default();
     let symbols: HashSet<&str> = ideal
@@ -480,13 +492,28 @@ pub fn reconcile(
         })
     });
     plan.deferred_recent += before - to_create.len();
+    plan.cancels = to_cancel;
+    plan.creates = to_create;
+    plan
+}
+
+/// The tail of `execute_order_plan` after the pre-create market snapshot
+/// filter (SPEC 3.1 steps 8-9): churn gate admission (2.9) reading each
+/// create's `market_distance` (`_churn_gate_market_distance`, unset ->
+/// `market_distance_unavailable` -> deferred), the create batch capacity
+/// (2.6, risk-critical first), and the attempt bookkeeping for every create
+/// that is submitted (exempt ones included, as Python records every
+/// submitted create). Call order in the live loop and in plancheck:
+/// `reconcile()` -> `MarketFilter::filter_fresh_creations` -> `admit_and_cap`.
+pub fn admit_and_cap(
+    plan: &mut Plan,
+    params: &ReconcileParams,
+    mut churn: Option<(&mut ChurnGate, f64)>,
+) {
+    let mut to_create = std::mem::take(&mut plan.creates);
     // 2.9 churn gate admission.
     if let Some((gate, now_s)) = churn.as_mut() {
-        let market_dist = |o: &OrderRec| {
-            let m = last_price(&o.symbol);
-            (m.is_finite() && m > 0.0).then(|| order_market_diff(o.side, o.price, m))
-        };
-        let (admitted, deferred) = gate.admit(to_create, &market_dist, *now_s);
+        let (admitted, deferred) = gate.admit(to_create, &|o| o.market_distance, *now_s);
         to_create = admitted;
         plan.deferred_churn += deferred;
     }
@@ -503,9 +530,7 @@ pub fn reconcile(
     if let Some((gate, now_s)) = churn.as_mut() {
         gate.record_attempts(to_create.len(), *now_s);
     }
-    plan.cancels = to_cancel;
     plan.creates = to_create;
-    plan
 }
 
 #[cfg(test)]
@@ -532,6 +557,7 @@ mod tests {
             pb_order_type: t.into(),
             risk_critical: false,
             churn_evidenced: false,
+            market_distance: None,
             id: id.map(str::to_string),
             custom_id: None,
         }
@@ -602,7 +628,6 @@ mod tests {
             &[],
             0,
             &params(),
-            None,
         );
         assert_eq!(plan.matched_exact, 1);
         assert!(plan.creates.is_empty());
@@ -660,7 +685,6 @@ mod tests {
             &[],
             0,
             &params(),
-            None,
         );
         assert_eq!(plan.matched_tolerance, 1);
         assert_eq!(plan.cancels.len(), 1); // the 1.3 close
@@ -679,7 +703,6 @@ mod tests {
             &[],
             0,
             &hedged,
-            None,
         );
         assert!(plan.creates.is_empty()); // same (symbol, pside) scope still deferred
     }
@@ -723,7 +746,6 @@ mod tests {
             &[],
             0,
             &params(),
-            None,
         );
         assert!(plan.cancels.is_empty()); // manual entry kept under tp_only (not reduce-only)
         assert_eq!(plan.creates.len(), 1);
@@ -736,7 +758,6 @@ mod tests {
             &[],
             0,
             &params(),
-            None,
         );
         assert!(plan.cancels.is_empty() && plan.creates.is_empty());
     }
@@ -756,7 +777,7 @@ mod tests {
             ));
         }
         ideal[4].risk_critical = true;
-        let plan = reconcile(
+        let mut plan = reconcile(
             &ideal,
             &[],
             &|_, _| PbMode::Normal,
@@ -764,8 +785,9 @@ mod tests {
             &[],
             0,
             &params(),
-            None,
         );
+        assert_eq!(plan.creates.len(), 6); // capacity is applied by admit_and_cap
+        admit_and_cap(&mut plan, &params(), None);
         assert_eq!(plan.creates.len(), 3);
         assert!(plan.creates[0].risk_critical);
         assert!(plan.creates[1].price > plan.creates[2].price); // closest to market first

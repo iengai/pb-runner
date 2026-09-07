@@ -10,6 +10,10 @@
 use crate::bot_params::{ConfigView, PSIDES};
 use crate::churn::{self, ChurnGate, ChurnParams};
 use crate::emas::{aggregate_1h, Candle, ONE_HOUR_MS, ONE_MIN_MS};
+use crate::market_filter::{
+    fetch_max_age_ms, MarketFilter, MarketSnapshot, SnapshotProvider,
+    LIVE_MARKET_SNAPSHOT_MAX_AGE_MS,
+};
 use crate::reconcile::{self, OrderRec, PbMode, Plan, RecentExecution, ReconcileParams};
 use crate::snapshot::{
     trailing_bundle, AccountState, MarketParams, SideState, SnapshotBuilder, SymbolState,
@@ -21,7 +25,7 @@ use passivbot_rust::orchestrator::{
 use passivbot_rust::types::TrailingPriceBundle;
 use passivbot_rust::utils::hysteresis;
 use pb_exchange_bybit::{
-    ClosedPnl, ExchangeClient, Fill, MarketSpec, OpenOrder, Position, PositionSide, Side, Ticker,
+    ClosedPnl, ExchangeClient, Fill, MarketSpec, OpenOrder, Position, PositionSide, Side,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -113,6 +117,11 @@ pub struct LiveRunner {
     pb_modes: HashMap<(String, PositionSide), PbMode>,
     /// Order churn gate history and create-attempt window (SPEC 2.9).
     churn: ChurnGate,
+    /// Ticker snapshot cache (`MarketSnapshotProvider`): planning reads it
+    /// with the 5 s fetch TTL, the pre-create gate with the 10 s hard TTL.
+    snapshots: SnapshotProvider,
+    /// Pre-create snapshot freshness gate + distance filter (SPEC 2.10).
+    market_filter: MarketFilter,
     pub cycles: u64,
 }
 
@@ -123,6 +132,7 @@ impl LiveRunner {
             .and_then(Value::as_f64)
             .unwrap_or(0.02);
         let churn = ChurnGate::new(ChurnParams::from_config(&cfg));
+        let market_filter = MarketFilter::from_config(&cfg)?;
         Ok(Self {
             cfg,
             client,
@@ -136,6 +146,8 @@ impl LiveRunner {
             warmup_1h_hours: 0,
             pb_modes: HashMap::new(),
             churn,
+            snapshots: SnapshotProvider::new(),
+            market_filter,
             cycles: 0,
         })
     }
@@ -314,13 +326,6 @@ impl LiveRunner {
         let balance = self.client.fetch_balance().await?;
         let positions = self.client.fetch_positions().await?;
         let orders = self.client.fetch_open_orders().await?;
-        let tickers: HashMap<String, Ticker> = self
-            .client
-            .fetch_tickers()
-            .await?
-            .into_iter()
-            .map(|t| (t.symbol.clone(), t))
-            .collect();
         if let Some(last) = self.fills.last().map(|f| f.timestamp_ms) {
             let new = self.client.fetch_fills(None, Some(last), None).await?;
             merge_fills(&mut self.fills, new);
@@ -346,6 +351,22 @@ impl LiveRunner {
         for s in &symbols {
             self.refresh_candles(s, now).await?;
         }
+        // Planning market snapshots (`get_orchestrator_market_snapshots`):
+        // cached tickers younger than the fetch TTL are reused, the rest
+        // come from one bulk `fetch_tickers`; `fetched_ms` is the local
+        // receive time and drives the pre-create freshness gate later.
+        let client = self.client.clone();
+        let fetch = || client.fetch_tickers();
+        let planning: HashMap<String, MarketSnapshot> = self
+            .snapshots
+            .get_snapshots(
+                &fetch,
+                &symbols,
+                fetch_max_age_ms(LIVE_MARKET_SNAPSHOT_MAX_AGE_MS),
+                &now_ms,
+            )
+            .await
+            .context("planning market snapshots")?;
         let builder = SnapshotBuilder::new(&self.cfg)?;
 
         // Balance hysteresis (SPEC 5.1).
@@ -391,7 +412,7 @@ impl LiveRunner {
                 .markets
                 .get(symbol)
                 .ok_or_else(|| anyhow!("no market for {symbol}"))?;
-            let t = tickers
+            let t = planning
                 .get(symbol)
                 .ok_or_else(|| anyhow!("no ticker for {symbol}"))?;
             let buf = self
@@ -537,7 +558,7 @@ impl LiveRunner {
                 .find(|p| p.symbol == symbol && p.pside == pside)
                 .map_or(0.0, |p| p.size)
         };
-        let last = |symbol: &str| -> f64 { tickers.get(symbol).map_or(0.0, |t| t.last) };
+        let last = |symbol: &str| -> f64 { planning.get(symbol).map_or(0.0, |t| t.last) };
         let mut ideal: Vec<OrderRec> = reconcile::to_executable(&planned, &pos_size, &last);
         // Churn evidence (SPEC 2.9) on the executable ideals, before reconciliation.
         let mono = churn::monotonic_seconds();
@@ -554,16 +575,23 @@ impl LiveRunner {
                 .copied()
                 .unwrap_or(PbMode::Normal)
         };
-        let plan = reconcile::reconcile(
-            &ideal,
-            &open,
-            &modes,
-            &last,
-            recent,
-            now,
-            &params,
-            Some((&mut self.churn, mono)),
-        );
+        let mut plan = reconcile::reconcile(&ideal, &open, &modes, &last, recent, now, &params);
+        // SPEC 3.1 step 8: pre-create market snapshot freshness gate and
+        // distance filter, then (step 9) churn admission + create capacity.
+        let outcome = self
+            .market_filter
+            .filter_fresh_creations(
+                &fetch,
+                &mut self.snapshots,
+                &planning,
+                std::mem::take(&mut plan.creates),
+                &now_ms,
+            )
+            .await;
+        plan.creates = outcome.kept;
+        plan.skipped_market_snapshot = outcome.skipped_snapshot;
+        plan.skipped_market_distance = outcome.skipped_distance;
+        reconcile::admit_and_cap(&mut plan, &params, Some((&mut self.churn, mono)));
         self.cycles += 1;
         Ok(CyclePlan {
             planned,

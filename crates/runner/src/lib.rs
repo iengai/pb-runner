@@ -17,6 +17,8 @@ pub mod jsonexact;
 #[cfg(feature = "engine-v8")]
 pub mod live;
 #[cfg(feature = "engine-v8")]
+pub mod market_filter;
+#[cfg(feature = "engine-v8")]
 pub mod reconcile;
 #[cfg(feature = "engine-v8")]
 pub mod snapshot;

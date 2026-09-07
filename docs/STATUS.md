@@ -2,6 +2,53 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 (worktree agent) — pre-create market snapshot gate + distance filter ported (RECONCILE_SPEC 2.10)
+
+**Changed:** new `crates/runner/src/market_filter.rs`: `MarketSnapshot`
+(bid/ask/last + local `fetched_ms`), `SnapshotProvider` (Python
+`MarketSnapshotProvider`, bulk strategy: cache within `max_age_ms`, one bulk
+`fetch_tickers`, one retry fetch, `Incomplete`/`Fetch` errors),
+`planning_snapshot_invalid`, `snapshot_signature_invalid`,
+`MarketFilter::{from_config, filter_by_market_distance, filter_fresh_creations}`
+with Python's log lines and the hourly INFO throttle; 13 unit tests
+mirroring `tests/test_passivbot_balance_split.py` and
+`tests/test_fresh_entry_eligibility_integration.py`. `OrderRec.market_distance`
+(`_churn_gate_market_distance`). `reconcile()` lost its churn argument and
+ends at the recent-execution guard; new `reconcile::admit_and_cap` = churn
+admission (reading `market_distance`) + create capacity + attempt
+bookkeeping. `LiveRunner` owns the snapshot cache: planning tickers come
+from `SnapshotProvider::get_snapshots` with the 5 s fetch TTL, the
+pre-create gate re-reads it with the 10 s hard TTL, then `admit_and_cap`.
+`pb-plancheck` applies the gate + distance filter per step on the recorded
+price and prints the skip count. `Plan.skipped_market_snapshot` /
+`skipped_market_distance`, logged by `pb-runner` as `skipped`.
+SPEC: new 2.10, 4.3 item moved to "ported", section 5 item 3 resolved;
+PLAN P4.3 note; D14.
+
+**Facts:** max age is the constant 10 000 ms (`md.py:656`), not config;
+freshness compares `utc_ms()` at the check against the *local receive time*
+of the fetch; the Bybit connector drops the ccxt ticker `timestamp`
+(`ccxt_bot.py:1219`), so no ticker timestamp is needed in the Rust client.
+Python's call order is barrier/guards -> market filter -> churn admission ->
+capacity (`exe.py:958-975`); the churn admission takes its market distance
+from the filter. Whole-cycle skips drop market orders too; the distance
+filter exempts them and symbols without a valid snapshot; `t == 0` disables
+the skip but still annotates.
+
+**Verified:** `pb-plancheck` grid_v7 600/600 (both artifact dirs), tm
+600/600, seeded2 grid_v7 400/400, tm 400/400, tm8 400/400, iter7 400/400,
+all with 0 market-filter skips (the fake ticker is `bid=ask=last=price`
+and `utc_ms` is pinned, so snapshots are never stale; no
+`far-from-market` / `skipping order creation` line in any `fake_live.log`,
+no `create_skipped` event in any `live_events.json`). `cargo fmt --check`,
+clippy `-D warnings`, `cargo test --workspace`. Not exercised: a real stale
+or failed ticker refresh on the live account (dry-run only).
+
+**Next action:** unchanged: (2) HSL / cooldown / runtime-forced modes with
+a seeded fake run; (3) long local dry-run of the container against the abot
+account; P5.2 shadow run, P6. Optional: a fake scenario with a price jump
+> 80 % between steps to exercise the distance skip end to end.
+
 ## 2026-09-07 (worktree agent) — order churn gate ported (RECONCILE_SPEC 2.9)
 
 **Changed:** `crates/runner/src/churn.rs` (`ChurnParams::from_config`,

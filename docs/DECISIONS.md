@@ -286,3 +286,39 @@ clock in the artifacts since `live_events.json` keeps 2000 events).
 Consequences: parity on fake runs depends on the recorder's stem; a harness
 that pins `time.monotonic` as well would need `--gate-clock cycle`. On a
 real exchange both bots see the same clock, so nothing changes there.
+
+## D14 (2026-09-08) Pre-create market gate sits between `reconcile()` and `admit_and_cap`; freshness = local receive time, constant 10 s
+
+Facts: `execute_order_plan` runs `_filter_fresh_market_snapshot_creations`
+after the cancel-first barrier and the recent-execution / state-change /
+exchange-config guards and *before* `_apply_order_churn_admission` and
+`_apply_creation_batch_capacity` (`exe.py:958-975`); the admission reads
+`_churn_gate_market_distance`, which only that filter sets (`md.py:294`,
+from the pre-create snapshot's `last`). `_live_market_snapshot_max_age_ms`
+is the constant 10 000 ms (`md.py:656`); staleness compares `utc_ms()` at
+the check with `MarketSnapshot.fetched_ms`, the `utc_ms()` taken after the
+ticker request returned (`market_snapshot.py:98`). The Bybit connector's
+`_normalize_tickers` (`ccxt_bot.py:1219`) discards the ccxt ticker
+`timestamp`, so `exchange_timestamp_ms` is `None` on Bybit and no freshness
+check uses it anywhere. Python's `fetch_tickers(symbols)` retry for symbols
+missing from the bulk response is, on Bybit, the same
+`/v5/market/tickers?category=linear` request.
+
+Decision: `reconcile()` ends at the recent-execution guard; the async market
+gate (`market_filter.rs`) runs on `plan.creates`; `reconcile::admit_and_cap`
+then applies churn admission (market distance from `OrderRec.market_distance`,
+unset -> deferred as `market_distance_unavailable`), the create capacity and
+the attempt bookkeeping. Freshness uses the runner's wall clock against the
+local receive time of the bulk `fetch_tickers`; the Rust `Ticker` gets no
+timestamp field. The planning tickers go through the same cache with the
+5 s fetch TTL, so the engine's `last` and the pre-create `last` coincide
+unless the cycle took more than 10 s (then a refetch, exactly as Python).
+The retry is one more bulk fetch. Surface epochs of the freshness ledger
+are not modelled (every surface is refreshed at the top of each cycle).
+
+Consequences: any caller of `reconcile()` that wants the churn gate must
+call `admit_and_cap` (live loop and plancheck do); a cycle whose ticker
+refresh fails or returns a stale/missing snapshot places no orders at all,
+market orders included, and logs Python's `[market] skipping order creation`
+line; a fake-harness scenario cannot exercise the stale path because its
+clock is pinned (plancheck reports the skip count instead).

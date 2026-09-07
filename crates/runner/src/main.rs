@@ -151,6 +151,7 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
                         + p.deferred_recent
                         + p.deferred_churn
                         + p.deferred_capacity,
+                    skipped = p.skipped_market_snapshot + p.skipped_market_distance,
                     warnings = cycle.output.diagnostics.warnings.len(),
                     "planned"
                 );

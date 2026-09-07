@@ -514,6 +514,95 @@ creates once more than 10 creates were sent in 10 minutes; it never
 prevents a cancel and never keeps a stale order alive
 (`tests/test_order_reconciliation_contract.py:1171`).
 
+### 2.10 Pre-create market snapshot gate and limit distance filter
+
+`_filter_fresh_market_snapshot_creations` (`md.py:152-250`), called from
+`execute_order_plan` on the creates that survived the barrier and the
+guards (3.1 step 8), **before** churn admission and the create batch
+capacity (`exe.py:958-975`). Ported 2026-09-08 as
+`crates/runner/src/market_filter.rs` (`MarketFilter::filter_fresh_creations`,
+`SnapshotProvider`); `reconcile::admit_and_cap` is the step-9 tail.
+
+- **Snapshot model** (`live/market_snapshot.py`): `MarketSnapshot(bid, ask,
+  last, fetched_ms, source, exchange_timestamp_ms)`; valid iff all three
+  prices are finite and > 0. `fetched_ms = utc_ms()` taken **after** the
+  ticker request returned (local receive time). `exchange_timestamp_ms` is
+  never used for freshness, and on Bybit it is always `None`: the
+  connector's `_normalize_tickers` (`exchanges/ccxt_bot.py:1219`) keeps
+  only `bid/ask/last` (`last = last or bid`, which `parse_tickers` in the
+  Rust client also does). Hence the Rust `Ticker` needs no timestamp.
+- **Max age**: `_live_market_snapshot_max_age_ms()` is the constant
+  **10 000 ms** (`md.py:656`), not a config value. Planning
+  (`get_orchestrator_market_snapshots`, `md.py:574`) uses the stricter
+  fetch TTL `max(1000, min(max_age, max_age // 2))` = 5 000 ms.
+- **Provider** (`MarketSnapshotProvider.get_snapshots`, Bybit strategy
+  `bulk`): cached snapshots with `now - fetched_ms <= max_age` are reused;
+  otherwise one bulk `fetch_tickers`, every returned symbol is cached; symbols
+  still missing get one `fetch_tickers(symbols)` retry (same
+  `/v5/market/tickers?category=linear` request on Bybit); any requested
+  symbol still without a valid snapshot -> `RuntimeError`. Fetch failure ->
+  `RuntimeError`.
+- **Sequence** for a non-empty create list (symbols = sorted unique):
+  1. `_current_planning_snapshot_invalid_for_creations`
+     (`planning_gates.py:482`): surface epochs too old, planning rows
+     missing, planning rows older than 10 s (`snapshot_too_old`), create
+     symbols not in the planning universe. Only `snapshot_too_old` is
+     refreshable; any other reason -> **all creates skipped** (WARNING
+     `[market] skipping order creation; planning snapshot invalid before
+     create`). Refreshable only -> INFO `[market] refreshing stale planning
+     market snapshot before create`. The port models `snapshot_too_old` and
+     `creation_symbols_not_in_snapshot`; surface epochs are always current
+     because the runner refreshes every surface each cycle.
+  2. `_get_live_market_snapshots(symbols, max_age_ms=10_000)`; exception ->
+     **all creates skipped** (WARNING `... failed pre-create market snapshot
+     refresh | ... action=skip_create`).
+  3. `_market_snapshot_signature_invalid(symbols)` on the just-recorded
+     snapshots with a fresh `utc_ms()`: `missing` (no valid snapshot) or
+     `stale` (`now - fetched_ms > 10_000`, possible when a cached snapshot
+     was reused at the edge of the TTL) -> **all creates skipped** (WARNING
+     `... stale pre-create market snapshots`).
+  4. `_filter_limit_order_creations_by_market_distance` (`md.py:271-320`):
+     threshold `live.limit_order_create_max_market_dist_pct` (default 0.8;
+     must be numeric, finite, `0 <= t < 1`, else `ValueError`). Per order in
+     list order: `type == market` -> keep; no valid snapshot for the symbol
+     -> keep; else `dist = order_market_diff(side, price, snapshot.last)` is
+     stored as `_churn_gate_market_distance` (also on kept orders, also when
+     `t == 0`), and the order is skipped iff `t > 0 and dist > t` (buys
+     below `(1-t) x last`, sells above `(1+t) x last`; reduce-only limit
+     orders included).
+- **Whole-cycle skips drop market orders too** (steps 1-3 return `[]`);
+  only the distance filter exempts them.
+- **Logging** of distance skips (`_log_limit_order_distance_skips`):
+  `[order] skipped far-from-market limit order creates | skipped=N
+  symbols=... threshold=%.4f min_multiplier=%.4f max_multiplier=%.4f
+  groups=<coin side pside type=count, ...> samples=<coin:side:price/market=last>
+  reason=limit_order_create_market_distance`, INFO at most once per hour per
+  (symbol, pside, side, pb_order_type) group, DEBUG otherwise; plus the
+  `execution.create_skipped` event. Skips add to the wave's
+  `skipped_create` counter (`Plan.skipped_market_snapshot` /
+  `skipped_market_distance` in the port).
+- **Interaction with 2.9**: churn admission reads
+  `_churn_gate_market_distance` from this filter (the pre-create snapshot's
+  `last`, which can differ from the planning ticker when a refetch
+  happened); an order without it is deferred `market_distance_unavailable`.
+  The Rust `OrderRec.market_distance` carries it.
+- **Fake harness / plancheck**: the fake ticker is `bid = ask = last =
+  step price` (`exchanges/fake.py:649`) and `utc_ms` is pinned to scenario
+  time, so the planning snapshot is 0 ms old at the pre-create check (cache
+  hit, no refetch, never stale); `pb-plancheck` runs the same gate and the
+  distance filter on the recorded `order_book.bid` and reports the skip
+  count (0 on all six local runs).
+
+Tests: `tests/test_passivbot_balance_split.py` (`_make_pre_create_distance_guard_bot`,
+`test_pre_create_snapshot_filter_skips_far_limit_order_creations`,
+`..._disables_limit_order_distance_guard`,
+`..._blocks_non_market_planning_invalidation`),
+`tests/test_fresh_entry_eligibility_integration.py`
+(`test_pre_create_market_filter_records_exact_existing_gate_reasons`,
+`test_disabled_generic_distance_guard_still_annotates_churn_distance`),
+`tests/test_config_utils_helpers.py:186` (threshold validation); mirrored in
+`market_filter.rs` unit tests.
+
 ---
 
 ## 3. Execution
@@ -547,6 +636,7 @@ prevents a cancel and never keeps a stale order alive
    limit orders with `order_market_diff > limit_order_create_max_market_dist_pct`
    (default 0.8, i.e. buys below 0.2x market or sells above 1.8x) are
    skipped; market orders and symbols without a valid snapshot pass.
+   Details, max-age derivation and the port in 2.10.
 9. Churn admission (2.9), then batch capacity (2.6).
 10. **Creates**: `execute_orders_parent(to_create_mod)` (3.3). A non-restart
     exception here is swallowed after `restart_bot_on_too_many_errors()`.
@@ -759,10 +849,18 @@ bot given the same engine output and the same open-orders snapshot.
   `reconcile()`; clock per DECISIONS D13) after it turned out to be the
   only source of plan differences on the seeded iter7 fake run.
 - **Pre-create market snapshot freshness** and the
-  `limit_order_create_max_market_dist_pct` filter (3.1 step 8). Needed
-  before real money (protects against stale tickers producing absurd limit
-  prices) but not for steady-state parity, since a fresh engine input
-  already used the same ticker.
+  `limit_order_create_max_market_dist_pct` filter (3.1 step 8, detailed in
+  2.10). Needed before real money (protects against stale tickers producing
+  absurd limit prices) but not for steady-state parity, since a fresh engine
+  input already used the same ticker. Ported 2026-09-08:
+  `crates/runner/src/market_filter.rs` (`SnapshotProvider`,
+  `MarketFilter::filter_fresh_creations`, `filter_by_market_distance`),
+  wired in `LiveRunner::plan` between `reconcile()` and
+  `reconcile::admit_and_cap` (churn admission + create capacity), the same
+  point as `exe.py:958-975`; `pb-plancheck` applies it too (0 skips on the
+  six local fake runs). Not modelled: freshness-ledger surface epochs (the
+  runner refreshes every surface each cycle), the `execution.create_skipped`
+  event stream (logs only).
 - **Low-balance filter**, **HSL replay filter**, **exchange-config
   gate** (steps 2, 3, 7): the port sets leverage/margin once at startup
   (P5) and does not implement HSL yet.
@@ -795,9 +893,10 @@ Python would also delay; that delay is at most one cycle in practice.
    the exact conditions under which `open_orders` is considered fresh after a
    partial refresh (`_finalize_authoritative_refresh_consistency`,
    `pb.py:11590`) are not documented here.
-3. `_filter_fresh_market_snapshot_creations` max-age value
-   (`_live_market_snapshot_max_age_ms`, `md.py:656`) and the ticker strategy
-   per exchange were not read.
+3. Resolved 2026-09-08 (2.10): `_live_market_snapshot_max_age_ms` is the
+   constant 10 000 ms; the ticker strategy is `bulk` on Bybit
+   (`market_snapshot_ticker_strategy`, `md.py:127`; `symbols` only on
+   bitget/hyperliquid/kucoin).
 4. Bybit's `did_create_order`/`did_cancel_order` are the base-class
    versions (no override found in `exchanges/bybit.py` or `ccxt_bot.py`);
    whether ccxt's Bybit `cancel_order` returns an `id` on every success path

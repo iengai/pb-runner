@@ -602,6 +602,7 @@ mod tests {
             pb_order_type: "entry_grid_normal_long".into(),
             risk_critical: false,
             churn_evidenced: false,
+            market_distance: None,
             id: None,
             custom_id: None,
         }
