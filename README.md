@@ -32,15 +32,15 @@ crates/diffcheck/          bin pb-diffcheck: replay recordings through the pinne
 crates/exchange-bybit/     ExchangeClient trait + hand-written Bybit v5 client (D11)
 crates/runner/             lib + bins: pb-runner (live loop), pb-snapcheck (P4.2), pb-plancheck, pb-mockrun (P5.1)
   src/bot_params.rs        config -> engine BotParams / strategy params (D9)
-  src/emas.rs, snapshot.rs OrchestratorInput builder (SNAPSHOT_SPEC)
-  src/reconcile.rs         cancel/create plan (RECONCILE_SPEC)
+  src/emas.rs, snapshot.rs OrchestratorInput builder (SNAPSHOT_SPEC); cooldown.rs, hsl.rs = cross-cycle state
+  src/reconcile.rs         cancel/create plan (RECONCILE_SPEC); churn.rs, market_filter.rs = create gates
   src/execute.rs, live.rs  order waves, state, the loop; startup.rs = S3 contract
   src/mock_exchange.rs     ExchangeClient mirroring passivbot's fake exchange (MOCK_EXCHANGE)
 docker/, deploy/           arm64 image + CodeBuild spec, same container contract as the Python image
 tools/                     recorder / fixture tooling (Python), read-only Bybit probes
 tests/fixtures/configs/    public configs the committed recordings were made with
 tests/fixtures/recordings/ synthetic_v8 (engine tests) and fake_v8 (fake-exchange replays)
-docs/                      PLAN, CONTRACT, DECISIONS, PORT_INVENTORY, RECORDER, *_SPEC, STATUS
+docs/                      PLAN, CONTRACT, DECISIONS, PORT_INVENTORY, RECORDER, *_SPEC, MOCK_EXCHANGE, REVIEW_*, STATUS
 ```
 
 ## Engine lines
