@@ -34,9 +34,9 @@ gives the old 367/400 on iter7.
 **Next action:** unchanged (P5.2 shadow run, P6); the market-distance
 filter (SPEC 4.3) is still open.
 
-## 2026-09-07 (session 3, IN PROGRESS) — P2 recordings, P3.1 started
+## 2026-09-07 (session 3) — P2 recordings, Bybit client, snapshot builder, reconcile, dry-run loop, image
 
-Working notes so a fresh context can resume; finalize at session end.
+Long entry; the "Next action" block at its end is the resume point.
 
 **Mandate (user, this session):** advance until a pure-Rust bot can be
 deployed on pbtb-rust; open decisions go to a same-tier subagent for review;
@@ -121,13 +121,36 @@ seeded-with-fills private sets: 400/400 diffcheck.
 actual create/cancel requests on 2400/2400 cycles of five full runs; the
 sixth (seeded iter7) differs on 33/400 cycles where Python's order churn
 gate deferred far grid entries. `jsonexact` module = exact float parser for
-recordings. P6: Dockerfile + buildspec written (unbuilt, Docker not running
-locally); pbtb-rust runtime-selection branch (D7 option 1) being written by a
-subagent in `E:\projects\pbtb-rust-pbrunner`.
-**Not done:** churn gate (RECONCILE_SPEC 2.9, ported later the same day, see the entry above); live execution never exercised with a trading key (P5.3);
-market-distance filter (SPEC 4.3); HSL modes; P5/P6. Detached recording jobs relaunched after a
-process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
-seeded grid_v7, tm, iter7, tm8).
+recordings. Churn gate ported by a subagent and merged (entry above, D13):
+all six local runs 2800/2800 identical plans.
+P6: `docker/Dockerfile` + `deploy/buildspec.yml`; the same Dockerfile built
+locally for linux/amd64 (63.2 MB image, 1m49s cold build); dry-run loop in
+the container against the abot account, grid_v7 config, 10 symbols, 22
+cycles: 19-20 MiB RSS (Python bot ~430 MB). Release binary 16.9 MB on
+Windows. pbtb-rust: D7 resolved by D12 (subagent-written branch
+`feat/pb-runner-runtime`, PR https://github.com/iengai/pbtb-rust/pull/35,
+reviewed here: engine keys `<major>[rs]`, bot attribute `runtime`,
+`/runtime` command, ECR repo `pb-runner`, `8rs` entry commented out until
+the image exists; not merged, nothing applied).
+
+**Not done / gaps:** market-distance filter (RECONCILE_SPEC 4.3); HSL,
+cooldown and runtime-forced modes, close-EMA carry-forward, open-tail
+projection (SNAPSHOT_SPEC 8); live execution never exercised with a trading
+key; arm64 image never built (CodeBuild); P5.2 shadow run in ECS; P6.4
+write-back check; P7 (v7 line). The passivbot worktree
+`E:\projects\passivbot-rlib-v8.1.0` still carries the uncommitted recorder
+patch and the Windows fcntl patch (keep them out of the fork branch).
+
+**Next action (autonomous):** P5.2-prep and remaining SNAPSHOT_SPEC gaps
+in this order: (1) market-distance filter + pre-create snapshot freshness
+(SPEC 3.1 step 8) so the runner is safe with real money; (2) HSL /
+cooldown / runtime-forced modes with a seeded fake run that exercises
+them; (3) a long local dry-run of the container against the abot account
+(hours) to catch drift, error-budget and reconnect behaviour.
+**Needs the user:** merge PR #35 and apply Terraform (ECR repo, later the
+`8rs` task definition); create the pb-runner CodeBuild project and run the
+first arm64 build (P6.2); approve the ECS shadow task (P2.4/P5.2) and the
+small-capital live run on a separate sub-account (P5.3).
 
 ## 2026-09-07 (session 2) — P1 done except the P2-gated box
 
