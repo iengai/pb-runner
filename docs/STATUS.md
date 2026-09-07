@@ -2,6 +2,62 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 (worktree agent) — P5.1 closed: mock exchange + `pb-mockrun`, six runs identical in requests and account state
+
+**Changed:** new `crates/runner/src/mock_exchange.rs`: `Scenario` (scripted
+`timeline` rows or candle `replay` from `.npy` day files / inline candles,
+boot positions / fills / orders, ISO or epoch timestamps) and
+`MockExchange: ExchangeClient` mirroring `src/exchanges/fake.py` operation
+for operation (fill on the next candle's range or at creation when the
+step price crosses, fees, balance, position netting per pside, order and
+trade ids seeded by the boot fills, `fetch_open_orders` `(timestamp, id)`
+string order, tickers = step price, `manual_fill` / `cancel_open_orders`
+actions, request log); `fetch_ohlcv` follows the Bybit client's paging
+contract instead of the fake's newest-`limit` quirk. 13 unit tests on the
+fill model and the API. New `pb-mockrun` (`bin/mockrun.rs`): `LiveRunner`
++ `Executor` (the `--live` path) drive the mock through a
+`tools/record_fake_v8.py` run directory with the harness pacing (one wave
+per step, then `advance`; wall clock = scenario time, churn clock = the
+recording stem per D13), comparing per step the create/cancel requests
+(content, order/id sequence), the open-order set (content and ids),
+positions, balance and fill count against `remote_calls.json`,
+`step_summaries.json`, `fills.json`, and the final
+`fake_exchange_state.json`; `--diff-inputs` diffs the engine input against
+the recording. `live.rs` (minimal, separated): `LiveRunner::with_clocks`
+(injected wall/monotonic clocks, `new` unchanged in behaviour),
+`set_harness_secondary_never_fetched` (harness-only flag feeding
+`candles_available`), and the first-minute trailing rule (side
+unavailable until a full minute closed after the last fill, Python's
+`missing_exact_trailing_candles`). Docs: MOCK_EXCHANGE.md (line-by-line
+map to `fake.py`, deviations, results), D17, PLAN P5.1 ticked, README.
+
+**Verified:** `pb-mockrun --diff-inputs`: public grid_v7 600/600 (both
+artifact dirs), tm 600/600, seeded2 grid_v7 400/400, tm 400/400, tm8
+400/400 (no order in either bot), iter7 400/400 — identical create and
+cancel request sets, identical create order/id sequences and cancel id
+sets, identical open-order sets and ids, positions, balances and fill
+counts at every step, final state identical, 0 planning errors, 0 write
+failures. Engine inputs identical 600/600 on both public runs; on the
+four seeded runs the only differing field is
+`global.realized_pnl_cumsum_last` (`0.0` vs `-0.0530015256`: Python's
+`fee_pct_fallback` on the fee-less seeded boot fills, D17.4, no order
+affected). Control runs fail as they should: `--no-harness-compat` on
+public grid_v7 267/600 requests, open-order set 43/600 (the runner rotates
+forager entries the harnessed Python bot could not, D17); `--gate-clock
+cycle` on iter7 398/400 requests, open-order set 367/400 (D13).
+Extra run with fills (`.local/fake_v8_fills/grid_v7`, grid_v7, 150 steps, `--seed-positions 3 --seed-entry-offset -0.03`, positions 3 % in profit): the close-grid orders cross at creation at step 1 (3 maker fills: ADA 233 @ 0.6425 pnl 4.423272, BTC 0.001 @ 110050 pnl 3.31217, DOGE 769 @ 0.19482 pnl 4.434823, fees 0.0150/0.0110/0.0150), positions go flat, fresh initial entries follow; `pb-mockrun --diff-inputs` 150/150 identical requests, open-order sets and ids, positions, fill counts and balances (final 1012.129308092 bit-identical), final state identical; engine inputs differ only in `realized_pnl_cumsum_{last,max}`: Python's series stays at the boot-fill fee fallback (-0.079479763 / 0.0) because the harness primes the fill cache once and the bot never calls `fetch_my_trades` (zero such calls in every run's `remote_calls.json`), while the runner refetches fills and its series reaches 12.129308092; no order affected (flat positions, no unstuck).
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -D
+warnings`, `cargo test --workspace` (98 tests; new: 13 mock_exchange).
+
+**Limits:** none of the six recorded runs produced a live fill, so their
+balance/position parity is trivial; the fill model rests on the unit tests
+and the extra fills run above. The mock cannot exercise market orders,
+partial fills or exchange errors (the fake exchange does not model them
+either). Not ported: `fee_pct_fallback` on fee-less fills.
+
+**Next action:** HSL equity state machine (in flight in a parallel
+worktree, `snapshot.rs`); P5.2 shadow run against the abot account; P6.
+
 ## 2026-09-08 (worktree agent) — SNAPSHOT_SPEC 8 gaps closed except HSL
 
 **Changed:** `crates/runner/src/snapshot.rs`: `CycleState` (previous

@@ -30,11 +30,12 @@ Cargo.toml                 workspace; passivbot_rust pinned to the fork's rlib b
 crates/snapshot/           on-disk format of recorded orchestrator calls
 crates/diffcheck/          bin pb-diffcheck: replay recordings through the pinned engine
 crates/exchange-bybit/     ExchangeClient trait + hand-written Bybit v5 client (D11)
-crates/runner/             lib + bins: pb-runner (live loop), pb-snapcheck (P4.2 acceptance)
+crates/runner/             lib + bins: pb-runner (live loop), pb-snapcheck (P4.2), pb-plancheck, pb-mockrun (P5.1)
   src/bot_params.rs        config -> engine BotParams / strategy params (D9)
   src/emas.rs, snapshot.rs OrchestratorInput builder (SNAPSHOT_SPEC)
   src/reconcile.rs         cancel/create plan (RECONCILE_SPEC)
   src/execute.rs, live.rs  order waves, state, the loop; startup.rs = S3 contract
+  src/mock_exchange.rs     ExchangeClient mirroring passivbot's fake exchange (MOCK_EXCHANGE)
 docker/, deploy/           arm64 image + CodeBuild spec, same container contract as the Python image
 tools/                     recorder / fixture tooling (Python), read-only Bybit probes
 tests/fixtures/configs/    public configs the committed recordings were made with
@@ -64,6 +65,11 @@ cargo run -p pb-diffcheck --features engine -- --dir tests/fixtures/recordings/f
 cargo run -p pb-runner --bin pb-snapcheck -- --config tests/fixtures/configs/fake_v8/grid_v7.json \
   --recordings tests/fixtures/recordings/fake_v8/grid_v7 \
   --candles E:/projects/passivbot/historical_data/ohlcvs_bybit --dates 2025-08-01:2025-10-28
+
+# closed-loop parity: the real runner drives the mock exchange through a recorded
+# fake-exchange run and must match the Python bot's requests and account state
+# step for step (needs a `tools/record_fake_v8.py` run directory, docs/MOCK_EXCHANGE.md)
+cargo run -p pb-runner --bin pb-mockrun -- --run .local/fake_v8_public/grid_v7 --diff-inputs
 
 # plan against a live account with a read-only key, never sends anything
 cargo run -p pb-runner -- config.json --once --api-keys api-keys.json

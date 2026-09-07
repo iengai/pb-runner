@@ -379,3 +379,76 @@ Decision:
    the runner and are not modelled; config forced modes (global and
    `coin_overrides.<coin>.live.forced_mode_*`) are, verified by the
    `grid_v7_forced` fixture set. HSL modes remain a separate task.
+
+## D17 (2026-09-08) Mock exchange = `fake.py` semantics behind the Bybit client's contract; two harness facts the runner reproduces only under `pb-mockrun`
+
+Facts (P5.1 closed loop, docs/MOCK_EXCHANGE.md):
+
+- The Python fake exchange (`src/exchanges/fake.py`) fills a resting limit
+  order when the *next* step candle's low/high reaches its price and a new
+  limit order immediately when the step's last price already crosses it,
+  both at the order price as maker; positions net per pside with an
+  average entry price and never flip; `balance += pnl - fee` per fill;
+  order and trade ids are consecutive integers seeded by the boot fills'
+  ids (`fake.py:517-525`). Its `fetch_ohlcv` returns the *newest* `limit`
+  rows, which `tools/fake_live_clock.py` overrides to ccxt semantics for
+  the Python harness (RECORDER.md A.3).
+- Under `run_fake_live.py` no background candle refresh runs and
+  `_prime_fake_candles` bypasses the candle manager's fetch bookkeeping, so
+  from the second cycle every forager cache-only symbol is
+  `cache_only_never_fetched` (pb:18244-18247) and non-tradable: the Python
+  bot could never rotate to a coin without a position or order. The
+  recordings show it (`tradable: false`, empty EMAs for those symbols;
+  `pb-snapcheck` models it as `candles_available = fi == 0 || has_pos ||
+  has_order`). The live runner refreshes every universe symbol each cycle,
+  which is what the Python bot does on a real exchange through
+  `update_ohlcvs`.
+- Python's trailing candle window starts at the first full minute after
+  the last fill and ends at the latest finalized minute (cm:7540-7545); an
+  empty window is `missing_exact_trailing_candles` (pb:9651) and the side is
+  unavailable for that cycle. The seeded scenarios' boot fills are one
+  minute before boot, so step 0 has `trailing_available = false` and the
+  engine emits no orders; the runner returned the default bundle as
+  available there.
+- The churn gate ran on wall-clock time in the harness (D13); the
+  recording stems are the only per-step wall clock.
+- `NewOrder` carries no order type: the Bybit client hard-codes
+  `orderType: Limit`.
+
+Decision:
+
+1. `mock_exchange.rs` mirrors `fake.py` operation for operation (line
+   references in the code and in MOCK_EXCHANGE.md section 1), except that
+   `fetch_ohlcv` implements the Bybit client's paging contract (oldest rows
+   from `since`, 5 pages), every created order is a limit order, closed pnl
+   is derived per position-reducing fill, and errors are
+   `ExchangeError::Rejected { code: "fake_*" }`.
+2. `LiveRunner` takes injected clocks (`with_clocks`: wall = scenario time,
+   monotonic = recording stem) and a harness-only flag
+   `set_harness_secondary_never_fetched` that reports every symbol as never
+   fetched by a background refresh (`candles_available = false`, read by
+   the snapshot builder for cache-only symbols only). `pb-mockrun` sets it;
+   `pb-runner` never does. Without it the public forager runs diverge from
+   step 17 (267/600), which is the runner behaving like the Python bot on a
+   real exchange, not a bug.
+3. The first-minute trailing rule is ported into `live.rs` for the live
+   path too (it is Python's real behaviour after any fill), guarded by
+   `latest_finalized >= first_full_minute_after(anchor)`.
+4. Not ported: `live.fee_pct_fallback` on fills without a fee (Python's
+   fill-event manager charges 0.02 % on the seeded boot fills, hence
+   `realized_pnl_cumsum_last = -0.053` in the seeded recordings vs `0.0`
+   in the runner). Bybit fills always carry a fee; revisit if a real
+   recording shows a fee-less fill. Related harness limit: the fill cache
+   is primed once at boot and the harnessed bot never calls
+   `fetch_my_trades` (zero calls in every `remote_calls.json`), so live
+   fills never enter Python's realized-pnl series in a fake run; the
+   runner refetches fills every cycle, as the Python bot does on Bybit.
+   The `fake_v8_fills` run shows the resulting `realized_pnl_cumsum_*`
+   difference without any order changing.
+
+Consequences: `pb-mockrun` is the P5.1 acceptance tool (six runs identical
+in requests and account state, MOCK_EXCHANGE.md section 4); the mock cannot
+exercise market orders, partial fills, or exchange errors, none of which
+the fake exchange models either. Fills are covered by unit tests and the
+extra `fake_v8_fills` run, not by the six original runs (no price ever
+reached a resting order there).

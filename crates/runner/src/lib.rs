@@ -20,6 +20,7 @@ pub mod jsonexact;
 pub mod live;
 #[cfg(feature = "engine-v8")]
 pub mod market_filter;
+pub mod mock_exchange;
 #[cfg(feature = "engine-v8")]
 pub mod reconcile;
 #[cfg(feature = "engine-v8")]

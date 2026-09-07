@@ -23,6 +23,11 @@ name = "pb-plancheck"
 path = "src/bin/plancheck.rs"
 required-features = ["engine-v8"]
 
+[[bin]]
+name = "pb-mockrun"
+path = "src/bin/mockrun.rs"
+required-features = ["engine-v8"]
+
 [features]
 # Exactly one engine line is compiled into a given binary/image (docs/DECISIONS.md D6).
 # `engine-v8` pulls the pinned v8.1.0 rlib branch (workspace dependency).
@@ -37,6 +42,7 @@ passivbot_rust = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

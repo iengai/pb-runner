@@ -130,11 +130,35 @@ pub struct LiveRunner {
     snapshots: SnapshotProvider,
     /// Pre-create snapshot freshness gate + distance filter (SPEC 2.10).
     market_filter: MarketFilter,
+    /// Wall clock (`utc_ms`) and monotonic clock (`time.monotonic()`), injected
+    /// so a harness can pin them to scenario time (`pb-mockrun`, D13/D17).
+    wall: Arc<dyn Fn() -> u64 + Send + Sync>,
+    mono: Arc<dyn Fn() -> f64 + Send + Sync>,
+    /// `pb-mockrun` only (D17): reproduce the fake harness, where no
+    /// background candle refresh runs, so forager cache-only symbols are
+    /// never fetched (`cache_only_never_fetched`, pb:18244-18247).
+    harness_secondary_never_fetched: bool,
     pub cycles: u64,
 }
 
 impl LiveRunner {
     pub fn new(cfg: ConfigView, client: Arc<dyn ExchangeClient>) -> Result<Self> {
+        Self::with_clocks(
+            cfg,
+            client,
+            Arc::new(now_ms),
+            Arc::new(churn::monotonic_seconds),
+        )
+    }
+
+    /// `new` with explicit clocks: `wall` replaces `now_ms()` (scenario
+    /// time in the mock harness), `mono` the churn gate's monotonic seconds.
+    pub fn with_clocks(
+        cfg: ConfigView,
+        client: Arc<dyn ExchangeClient>,
+        wall: Arc<dyn Fn() -> u64 + Send + Sync>,
+        mono: Arc<dyn Fn() -> f64 + Send + Sync>,
+    ) -> Result<Self> {
         let pct = cfg
             .live("balance_hysteresis_snap_pct")
             .and_then(Value::as_f64)
@@ -158,8 +182,19 @@ impl LiveRunner {
             churn,
             snapshots: SnapshotProvider::new(),
             market_filter,
+            wall,
+            mono,
+            harness_secondary_never_fetched: false,
             cycles: 0,
         })
+    }
+
+    /// Fake-harness compatibility (D17): mark every symbol's candles as never
+    /// fetched by a background refresh, so the snapshot builder treats
+    /// forager cache-only symbols as unavailable exactly like the Python bot
+    /// under `run_fake_live.py`. Never set on a real exchange.
+    pub fn set_harness_secondary_never_fetched(&mut self, on: bool) {
+        self.harness_secondary_never_fetched = on;
     }
 
     pub fn config(&self) -> &ConfigView {
@@ -292,7 +327,7 @@ impl LiveRunner {
             warmup_1h = h,
             "warmup"
         );
-        let now = now_ms();
+        let now = (self.wall)();
         for s in &symbols {
             self.refresh_candles(s, now).await?;
         }
@@ -352,7 +387,8 @@ impl LiveRunner {
     /// One planning cycle: refresh state, build the snapshot, run the engine,
     /// reconcile against the open orders.
     pub async fn plan(&mut self, recent: &[RecentExecution]) -> Result<CyclePlan> {
-        let now = now_ms();
+        let now = (self.wall)();
+        let wall = self.wall.clone();
         let balance = self.client.fetch_balance().await?;
         let positions = self.client.fetch_positions().await?;
         let orders = self.client.fetch_open_orders().await?;
@@ -393,7 +429,7 @@ impl LiveRunner {
                 &fetch,
                 &symbols,
                 fetch_max_age_ms(LIVE_MARKET_SNAPSHOT_MAX_AGE_MS),
-                &now_ms,
+                &*wall,
             )
             .await
             .context("planning market snapshots")?;
@@ -474,7 +510,20 @@ impl LiveRunner {
                 };
                 let required =
                     size != 0.0 && builder.is_trailing(symbol, pside_name).unwrap_or(false);
+                // SPEC 4.1 step 3: Python fetches candles from the first
+                // full minute after the fill up to the latest finalized
+                // minute; until one has closed the fetch is empty and the
+                // side is `missing_exact_trailing_candles` (pb:9651), i.e.
+                // unavailable for the cycle right after a fill (D17).
+                let minute_closed_after = |a: u64| {
+                    let first = (a / ONE_MIN_MS + 1) * ONE_MIN_MS;
+                    let latest = (now / ONE_MIN_MS * ONE_MIN_MS).saturating_sub(ONE_MIN_MS);
+                    latest >= first
+                };
                 let (trailing, avail) = match (required, anchor) {
+                    (true, Some(a)) if !minute_closed_after(a) => {
+                        (TrailingPriceBundle::default(), false)
+                    }
                     (true, Some(a)) => match trailing_bundle(&buf.m1, a, now) {
                         Some(b) => (b, true),
                         None => (TrailingPriceBundle::default(), false),
@@ -500,6 +549,10 @@ impl LiveRunner {
             };
             let long = side_state(PositionSide::Long);
             let short = side_state(PositionSide::Short);
+            // `candles_available` = the candle manager has fetched this
+            // symbol (SNAPSHOT_SPEC 3.7); the runner refreshes every
+            // universe symbol each cycle, except under the harness flag.
+            let candles_available = !buf.m1.is_empty() && !self.harness_secondary_never_fetched;
             states.push(SymbolState {
                 symbol: symbol.clone(),
                 market: MarketParams {
@@ -517,7 +570,7 @@ impl LiveRunner {
                 min_cost_price: t.last,
                 candles_1m: buf.m1.clone(),
                 candles_1h: Some(buf.h1.clone()),
-                candles_available: !buf.m1.is_empty(),
+                candles_available,
                 long,
                 short,
             });
@@ -594,7 +647,7 @@ impl LiveRunner {
         let last = |symbol: &str| -> f64 { planning.get(symbol).map_or(0.0, |t| t.last) };
         let mut ideal: Vec<OrderRec> = reconcile::to_executable(&planned, &pos_size, &last);
         // Churn evidence (SPEC 2.9) on the executable ideals, before reconciliation.
-        let mono = churn::monotonic_seconds();
+        let mono = (self.mono)();
         let risk_pairs = risk_active_pairs(&out, &snap.symbols);
         self.churn.evaluate(&symbols, &mut ideal, &risk_pairs, mono);
         let open: Vec<OrderRec> = orders
@@ -618,7 +671,7 @@ impl LiveRunner {
                 &mut self.snapshots,
                 &planning,
                 std::mem::take(&mut plan.creates),
-                &now_ms,
+                &*wall,
             )
             .await;
         plan.creates = outcome.kept;
