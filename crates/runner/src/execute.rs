@@ -261,6 +261,15 @@ impl Executor {
             let results = self.client.create_orders(&orders).await;
             if results.len() != orders.len() {
                 tracing::warn!("create response length mismatch; treating the batch as ambiguous");
+                // `_remember_ambiguous_create` (executor.py:1143): every
+                // order of an ambiguous batch enters the recent-execution
+                // guard so it is not re-sent for 15 s.
+                for o in creates.iter() {
+                    self.recent.push(RecentExecution {
+                        order: (*o).clone(),
+                        timestamp_ms: now_ms,
+                    });
+                }
                 self.note_error(now_ms)?;
             } else {
                 let mut failed = false;
@@ -279,6 +288,16 @@ impl Executor {
                             failed = true;
                             report.failures += 1;
                             report.write_failures.push((o.symbol.clone(), e.clone()));
+                            // Python remembers every failed create as
+                            // ambiguous (`_remember_ambiguous_create`,
+                            // executor.py:1090-1100 -> `add_to_recent_order_executions`):
+                            // a timed-out create the venue executed late must
+                            // not be duplicated 2 s later, and a deterministic
+                            // rejection is retried at the guard's pace.
+                            self.recent.push(RecentExecution {
+                                order: (*o).clone(),
+                                timestamp_ms: now_ms,
+                            });
                             tracing::warn!(symbol = %o.symbol, error = %e, "[order] create not acknowledged");
                         }
                     }

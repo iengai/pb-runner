@@ -302,7 +302,13 @@ impl LiveRunner {
         for attempt in 1..=3u64 {
             match self.client.set_hedge_mode().await {
                 Ok(()) => return Ok(()),
-                Err(e @ ExchangeError::Network(_)) if attempt < 3 => {
+                // ccxt's RateLimitExceeded / DDoSProtection /
+                // ExchangeNotAvailable subclass NetworkError (errors.py:176-204),
+                // so Python's `except (RequestTimeout, NetworkError)` retries
+                // rate limits as well.
+                Err(e @ (ExchangeError::Network(_) | ExchangeError::RateLimited { .. }))
+                    if attempt < 3 =>
+                {
                     tracing::warn!(
                         attempt,
                         error = %e,
@@ -668,7 +674,16 @@ impl LiveRunner {
                 "[state] symbols left out of this cycle (no orders planned, open orders untouched)"
             );
             if !exposed.is_empty() {
-                self.pending_budget_errors += 1;
+                // Python raises the whole cycle when a planning ticker is
+                // missing (market_data.py:634-640): with a position hidden
+                // from the engine, N-1 positions and a lower exposure would
+                // free a slot for a new entry. Fail the cycle instead (the
+                // budget charge happens through the error path).
+                bail!(
+                    "symbols with exposure left out of the cycle: {:?} ({:?})",
+                    exposed,
+                    skipped
+                );
             }
         }
         let skipped_set: HashSet<String> = skipped.iter().map(|(s, _)| s.clone()).collect();

@@ -473,8 +473,13 @@ pub fn reconcile(
                     None
                 },
             );
-            let bypass = o.reduce_only && !o.limit && o.pb_order_type.starts_with("close_panic");
-            bypass || !scopes.contains(&scope)
+            // No bypass: Python's `_is_dedicated_protective_market_panic`
+            // (executor.py:120-128) needs `configure_creations=False`, which
+            // only the HSL protective-panic input path passes
+            // (passivbot_hsl.py:8191, 8335); the runner's panic closes go
+            // through the normal planning path (D16 item 3), where a market
+            // panic close waits for the scope's cancels like any create.
+            !scopes.contains(&scope)
         });
         plan.deferred_by_barrier += before - to_create.len();
     }
@@ -795,12 +800,12 @@ mod tests {
     }
 
     #[test]
-    fn market_ideal_never_matches_a_resting_limit_and_bypasses_the_barrier() {
+    fn market_ideal_never_matches_a_resting_limit_and_waits_for_the_barrier() {
         // SPEC 2.2: `type` is in the exact key, so a market ideal (which
         // never rests) is always created; a resting limit order of the same
-        // shape is cancelled. A market panic close bypasses the cancel-first
-        // barrier (2.7); once executed it is gone and the engine stops
-        // emitting it, so nothing is recreated the next cycle.
+        // shape is cancelled. On the normal planning path a market panic
+        // close waits for the scope's cancel like any create (2.7); once
+        // executed it is gone and the engine stops emitting it.
         let mut ideal = rec(
             "A",
             Side::Sell,
@@ -832,11 +837,22 @@ mod tests {
         );
         assert_eq!(plan.matched_exact + plan.matched_tolerance, 0);
         assert_eq!(plan.cancels.len(), 1);
+        assert!(plan.creates.is_empty());
+        assert_eq!(plan.deferred_by_barrier, 1);
+        // With nothing to cancel in the scope the market close goes out.
+        let plan = reconcile(
+            &[ideal.clone()],
+            &[],
+            &|_, _| PbMode::Panic,
+            &|_| 1.0,
+            &[],
+            0,
+            &params(),
+        );
         assert_eq!(plan.creates.len(), 1);
         assert!(!plan.creates[0].limit);
-        assert_eq!(plan.deferred_by_barrier, 0);
         // A market entry (market_orders_allowed) is deferred by the barrier
-        // like any other create; only panic closes bypass.
+        // like any other create.
         let mut entry = rec(
             "A",
             Side::Buy,
