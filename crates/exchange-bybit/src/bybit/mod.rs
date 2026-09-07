@@ -8,8 +8,8 @@ pub mod parse;
 pub mod sign;
 
 use crate::{
-    Balance, Candle, ExchangeClient, ExchangeError, Fill, MarginMode, MarketSpec, NewOrder,
-    OpenOrder, OrderResult, Position, PositionSide, Side, Ticker,
+    Balance, Candle, ClosedPnl, ExchangeClient, ExchangeError, Fill, MarginMode, MarketSpec,
+    NewOrder, OpenOrder, OrderResult, Position, PositionSide, Side, Ticker,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -530,6 +530,28 @@ impl ExchangeClient for BybitClient {
         let mut seen = std::collections::HashSet::new();
         out.retain(|f| seen.insert(f.id.clone()));
         out.sort_by_key(|f| (f.timestamp_ms, f.id.clone()));
+        Ok(out)
+    }
+
+    async fn fetch_closed_pnl(
+        &self,
+        start_ms: Option<u64>,
+        end_ms: Option<u64>,
+    ) -> Result<Vec<ClosedPnl>, ExchangeError> {
+        let mut base = vec![("category", "linear".to_string())];
+        if let Some(s) = start_ms {
+            base.push(("startTime", s.to_string()));
+        }
+        if let Some(e) = end_ms {
+            base.push(("endTime", e.to_string()));
+        }
+        let mut out = Vec::new();
+        for page in self.paginate("/v5/position/closed-pnl", &base, 100).await? {
+            out.extend(parse::parse_closed_pnl(&page, &|id| self.symbol_of(id))?);
+        }
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|p| seen.insert((p.order_id.clone(), p.timestamp_ms)));
+        out.sort_by_key(|p| (p.timestamp_ms, p.order_id.clone()));
         Ok(out)
     }
 

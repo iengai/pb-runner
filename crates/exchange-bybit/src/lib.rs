@@ -133,6 +133,18 @@ pub struct Fill {
     pub timestamp_ms: u64,
 }
 
+/// One closed-pnl record (`/v5/position/closed-pnl`): realized pnl of the
+/// order that reduced/closed a position (Python: `exchanges/bybit.py::fetch_pnl`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosedPnl {
+    pub order_id: String,
+    pub symbol: String,
+    /// `sell` closes a long, `buy` closes a short.
+    pub pside: PositionSide,
+    pub pnl: f64,
+    pub timestamp_ms: u64,
+}
+
 /// `[ts_ms, open, high, low, close, volume]`
 pub type Candle = [f64; 6];
 
@@ -186,6 +198,12 @@ pub trait ExchangeClient: Send + Sync {
         start_ms: Option<u64>,
         end_ms: Option<u64>,
     ) -> Result<Vec<Fill>, ExchangeError>;
+    /// Closed-pnl records between `start_ms` and `end_ms`, ascending by time.
+    async fn fetch_closed_pnl(
+        &self,
+        start_ms: Option<u64>,
+        end_ms: Option<u64>,
+    ) -> Result<Vec<ClosedPnl>, ExchangeError>;
     /// One request per order, sent concurrently (Python: `asyncio.gather`).
     async fn create_orders(&self, orders: &[NewOrder]) -> Vec<OrderResult<OpenOrder>>;
     /// Cancel by exchange id; an order that is already gone counts as

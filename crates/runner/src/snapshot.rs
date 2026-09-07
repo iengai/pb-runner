@@ -476,6 +476,15 @@ impl<'a> SnapshotBuilder<'a> {
         Ok(set)
     }
 
+    /// `_orchestrator_uses_realized_pnl`: `max_realized_loss_pct < 1` or unstuck uses it.
+    pub fn uses_realized_pnl(&self) -> Result<bool> {
+        let mrl = match self.cfg.live("max_realized_loss_pct") {
+            None | Some(Value::Null) => 1.0,
+            Some(v) => v.as_f64().unwrap_or(1.0),
+        };
+        Ok(mrl < 1.0 || self.auto_unstuck_allowed()?)
+    }
+
     /// `_unstuck_uses_realized_pnl`.
     fn auto_unstuck_allowed(&self) -> Result<bool> {
         for pside in PSIDES {

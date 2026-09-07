@@ -8,7 +8,7 @@
 use crate::{
     Balance, ExchangeError, Fill, MarketSpec, OpenOrder, Position, PositionSide, Side, Ticker,
 };
-use crate::{Candle, MarginMode};
+use crate::{Candle, ClosedPnl, MarginMode};
 use serde_json::Value;
 
 pub const QUOTE: &str = "USDT";
@@ -411,6 +411,35 @@ pub fn parse_fills(
     Ok(out)
 }
 
+/// `/v5/position/closed-pnl` rows (Python `fetch_pnl`: `pnl = closedPnl`,
+/// `timestamp = updatedTime`, `position_side = long if side == sell else short`).
+pub fn parse_closed_pnl(
+    result: &Value,
+    symbol_of: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<ClosedPnl>, ExchangeError> {
+    let mut out = Vec::new();
+    for r in list(result)? {
+        let id = str_field(r, "symbol")?;
+        let Some(symbol) = symbol_of(id) else {
+            continue;
+        };
+        let pside = match r.get("side").and_then(Value::as_str) {
+            Some("Sell") => PositionSide::Long,
+            _ => PositionSide::Short,
+        };
+        out.push(ClosedPnl {
+            order_id: str_field(r, "orderId")?.to_string(),
+            symbol,
+            pside,
+            pnl: num(r, "closedPnl")?,
+            timestamp_ms: opt_u64(r, "updatedTime")
+                .ok_or_else(|| malformed("updatedTime missing"))?,
+        });
+    }
+    out.sort_by_key(|p| (p.timestamp_ms, p.order_id.clone()));
+    Ok(out)
+}
+
 /// Number of decimals implied by a step such as `0.001` (ccxt
 /// `precisionFromString`); used to format qty/price strings.
 pub fn decimals_of_step(step: f64) -> usize {
@@ -584,6 +613,21 @@ mod tests {
         assert_eq!(
             (f[1].price, f[1].is_maker, f[1].pside),
             (1190.15, true, PositionSide::Long)
+        );
+    }
+
+    #[test]
+    fn closed_pnl_rows() {
+        let r = json!({"list":[
+            {"symbol":"BTCUSDT","orderId":"o2","side":"Sell","closedPnl":"1.5","updatedTime":"1672282722430"},
+            {"symbol":"BTCUSDT","orderId":"o1","side":"Buy","closedPnl":"-0.25","updatedTime":"1672282722429"}
+        ]});
+        let p = parse_closed_pnl(&r, &sym).unwrap();
+        assert_eq!(p[0].order_id, "o1");
+        assert_eq!((p[0].pside, p[0].pnl), (PositionSide::Short, -0.25));
+        assert_eq!(
+            (p[1].pside, p[1].pnl, p[1].timestamp_ms),
+            (PositionSide::Long, 1.5, 1672282722430)
         );
     }
 

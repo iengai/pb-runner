@@ -18,7 +18,7 @@ use passivbot_rust::orchestrator::{
 use passivbot_rust::types::TrailingPriceBundle;
 use passivbot_rust::utils::hysteresis;
 use pb_exchange_bybit::{
-    ExchangeClient, Fill, MarketSpec, OpenOrder, Position, PositionSide, Side, Ticker,
+    ClosedPnl, ExchangeClient, Fill, MarketSpec, OpenOrder, Position, PositionSide, Side, Ticker,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -93,6 +93,7 @@ pub struct LiveRunner {
     markets: BTreeMap<String, MarketSpec>,
     candles: HashMap<String, CandleBuffer>,
     fills: Vec<Fill>,
+    closed_pnl: Vec<ClosedPnl>,
     prev_hysteresis_balance: f64,
     balance_hysteresis_pct: f64,
     warmup_1m_minutes: u64,
@@ -112,6 +113,7 @@ impl LiveRunner {
             markets: BTreeMap::new(),
             candles: HashMap::new(),
             fills: Vec::new(),
+            closed_pnl: Vec::new(),
             prev_hysteresis_balance: 0.0,
             balance_hysteresis_pct: pct,
             warmup_1m_minutes: 0,
@@ -241,7 +243,12 @@ impl LiveRunner {
             .unwrap_or(30.0);
         let since = now.saturating_sub((lookback_days * 86_400_000.0) as u64);
         self.fills = self.client.fetch_fills(None, Some(since), None).await?;
-        tracing::info!(fills = self.fills.len(), "fill history loaded");
+        self.closed_pnl = self.client.fetch_closed_pnl(Some(since), None).await?;
+        tracing::info!(
+            fills = self.fills.len(),
+            closed_pnl = self.closed_pnl.len(),
+            "fill history loaded"
+        );
         Ok(symbols)
     }
 
@@ -261,6 +268,20 @@ impl LiveRunner {
         if let Some(last) = self.fills.last().map(|f| f.timestamp_ms) {
             let new = self.client.fetch_fills(None, Some(last), None).await?;
             merge_fills(&mut self.fills, new);
+        }
+        if let Some(last) = self.closed_pnl.last().map(|p| p.timestamp_ms) {
+            let new = self.client.fetch_closed_pnl(Some(last), None).await?;
+            for p in new {
+                if !self
+                    .closed_pnl
+                    .iter()
+                    .any(|x| x.order_id == p.order_id && x.timestamp_ms == p.timestamp_ms)
+                {
+                    self.closed_pnl.push(p);
+                }
+            }
+            self.closed_pnl
+                .sort_by_key(|p| (p.timestamp_ms, p.order_id.clone()));
         }
         let symbols = {
             let builder = SnapshotBuilder::new(&self.cfg)?;
@@ -286,13 +307,26 @@ impl LiveRunner {
             )
         };
         self.prev_hysteresis_balance = snapped;
+        let lookback_days = self
+            .cfg
+            .live("pnls_max_lookback_days")
+            .and_then(Value::as_f64)
+            .unwrap_or(30.0);
+        let (cum_max, cum_last) = if builder.uses_realized_pnl()? {
+            realized_pnl_cumsum(
+                &self.fills,
+                &self.closed_pnl,
+                now.saturating_sub((lookback_days * 86_400_000.0) as u64),
+            )
+        } else {
+            (0.0, 0.0)
+        };
         let account = AccountState {
             timestamp_ms: now,
             balance: snapped,
             balance_raw: raw,
-            // TODO(P4.1): realized-pnl cumsum from closed-pnl history (SPEC 5.2).
-            realized_pnl_cumsum_max: 0.0,
-            realized_pnl_cumsum_last: 0.0,
+            realized_pnl_cumsum_max: cum_max,
+            realized_pnl_cumsum_last: cum_last,
         };
 
         let mut states = Vec::with_capacity(symbols.len());
@@ -346,8 +380,13 @@ impl LiveRunner {
                     position_price: price,
                     trailing,
                     trailing_available: avail,
-                    // TODO(P4.1): entry-cooldown fill timestamps (SPEC 4.4).
-                    last_increase_fill_ts: None,
+                    last_increase_fill_ts: last_increase_fill_ts(
+                        &self.cfg,
+                        &self.fills,
+                        symbol,
+                        pside,
+                        now,
+                    ),
                     has_entry_order: has_entry,
                     has_open_order: !side_orders.is_empty(),
                 }
@@ -429,6 +468,81 @@ fn to_planned(o: &ExecutableOrder, symbols: &[String]) -> Result<PlannedOrder> {
             == Some("risk_critical"),
         order_type,
     })
+}
+
+/// SPEC 5.2: chronological net pnl (`closedPnl` of the order attached to its
+/// last fill, plus signed fees: paid fees are negative) over the lookback;
+/// returns `(max(0, running max), last)`.
+pub fn realized_pnl_cumsum(fills: &[Fill], closed: &[ClosedPnl], start_ms: u64) -> (f64, f64) {
+    let mut pnl_by_order: HashMap<&str, f64> = HashMap::new();
+    for p in closed {
+        *pnl_by_order.entry(p.order_id.as_str()).or_default() += p.pnl;
+    }
+    let mut last_fill_of_order: HashMap<&str, &str> = HashMap::new();
+    for f in fills {
+        last_fill_of_order.insert(f.order_id.as_str(), f.id.as_str());
+    }
+    let mut cum = 0.0;
+    let mut max = 0.0f64;
+    let mut any = false;
+    for f in fills.iter().filter(|f| f.timestamp_ms >= start_ms) {
+        let pnl = if last_fill_of_order.get(f.order_id.as_str()) == Some(&f.id.as_str()) {
+            pnl_by_order
+                .get(f.order_id.as_str())
+                .copied()
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let fee_paid = if f.fee < 0.0 {
+            f.fee.abs()
+        } else {
+            -f.fee.abs()
+        };
+        cum += pnl + fee_paid;
+        max = max.max(cum);
+        any = true;
+    }
+    if any {
+        (max.max(0.0), cum)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// SPEC 4.4 `fill_ts` part: newest fill that increased the position on
+/// `pside` within the cooldown lookback, when the side's cooldown is > 0.
+fn last_increase_fill_ts(
+    cfg: &ConfigView,
+    fills: &[Fill],
+    symbol: &str,
+    pside: PositionSide,
+    now: u64,
+) -> Option<u64> {
+    let pside_name = if pside == PositionSide::Long {
+        "long"
+    } else {
+        "short"
+    };
+    let cd = cfg
+        .bp(pside_name, "risk_entry_cooldown_minutes", Some(symbol))
+        .ok()?
+        .as_f64()
+        .unwrap_or(0.0);
+    if cd <= 0.0 {
+        return None;
+    }
+    let lookback_min = if cd < 1.0 { 1.0 } else { cd.ceil() + 1.0 };
+    let start = now.saturating_sub((lookback_min * 60_000.0) as u64);
+    let increases = |f: &Fill| match pside {
+        PositionSide::Long => f.side == Side::Buy,
+        PositionSide::Short => f.side == Side::Sell,
+    };
+    fills
+        .iter()
+        .rev()
+        .find(|f| f.symbol == symbol && f.pside == pside && f.timestamp_ms >= start && increases(f))
+        .map(|f| f.timestamp_ms)
 }
 
 fn merge_candles(buf: &mut Vec<Candle>, new: Vec<Candle>, keep: usize) {
