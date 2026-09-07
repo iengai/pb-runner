@@ -10,4 +10,6 @@ pub mod config;
 #[cfg(feature = "engine-v8")]
 pub mod emas;
 #[cfg(feature = "engine-v8")]
+pub mod live;
+#[cfg(feature = "engine-v8")]
 pub mod snapshot;

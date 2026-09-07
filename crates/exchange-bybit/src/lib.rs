@@ -168,11 +168,14 @@ pub trait ExchangeClient: Send + Sync {
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;
     async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError>;
     async fn fetch_tickers(&self) -> Result<Vec<Ticker>, ExchangeError>;
-    /// 1m candles from `since_ms` (rounded down to the minute), ascending,
-    /// at most 5 pages of `limit` (Python: `fetch_ohlcvs_1m`).
-    async fn fetch_ohlcv_1m(
+    /// Candles of `timeframe` (`"1m"` or `"1h"`) from `since_ms` (rounded down
+    /// to the bucket), ascending, at most 5 pages of `limit`
+    /// (Python: `fetch_ohlcvs_1m`; the candle manager uses the same call with
+    /// `timeframe="1h"` for hourly windows).
+    async fn fetch_ohlcv(
         &self,
         symbol: &str,
+        timeframe: &str,
         since_ms: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Candle>, ExchangeError>;

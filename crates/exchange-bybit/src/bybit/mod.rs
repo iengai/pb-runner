@@ -452,19 +452,25 @@ impl ExchangeClient for BybitClient {
         parse::parse_tickers(&result, &|id| self.symbol_of(id))
     }
 
-    async fn fetch_ohlcv_1m(
+    async fn fetch_ohlcv(
         &self,
         symbol: &str,
+        timeframe: &str,
         since_ms: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Candle>, ExchangeError> {
         let id = self.id_of(symbol)?;
+        let (interval, period_ms) = match timeframe {
+            "1m" => ("1", 60_000u64),
+            "1h" => ("60", 3_600_000u64),
+            other => return Err(ExchangeError::NotSupported(format!("timeframe {other}"))),
+        };
         let limit = if limit == 0 { 1000 } else { limit.min(1000) };
         let base = |start: Option<u64>| {
             let mut p = vec![
                 ("category", "linear".to_string()),
                 ("symbol", id.clone()),
-                ("interval", "1".to_string()),
+                ("interval", interval.to_string()),
                 ("limit", limit.to_string()),
             ];
             if let Some(s) = start {
@@ -476,7 +482,7 @@ impl ExchangeClient for BybitClient {
             let result = self.public_get("/v5/market/kline", &base(None)).await?;
             return parse::parse_klines(&result);
         };
-        let mut since = since / 60_000 * 60_000;
+        let mut since = since / period_ms * period_ms;
         let mut all: std::collections::BTreeMap<u64, Candle> = std::collections::BTreeMap::new();
         for _ in 0..5 {
             let result = self

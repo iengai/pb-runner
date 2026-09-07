@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "XRP/USDT:USDT".to_string());
     let since = now_ms() - 2 * 60 * 60 * 1000;
     let candles = client
-        .fetch_ohlcv_1m(&probe_symbol, Some(since), 1000)
+        .fetch_ohlcv(&probe_symbol, "1m", Some(since), 1000)
         .await?;
     let fills = client
         .fetch_fills(None, Some(now_ms() - 24 * 60 * 60 * 1000), None)

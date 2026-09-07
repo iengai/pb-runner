@@ -71,7 +71,13 @@ replays the fake exchange's timeline gap fill): grid_v7 30/30, tm 30/30,
 grid_v7_seeded 30/30 identical. Gaps to close before P5 (SPEC section 8):
 HSL/cooldown/runtime-forced modes, `PB_modes` carry-over for tradability,
 close-EMA 10-min carry-forward, open-tail projection, trailing from real
-fills, entry-cooldown fill timestamps, realized-pnl cumsum from fills. Detached recording jobs relaunched after a
+fills, entry-cooldown fill timestamps, realized-pnl cumsum from fills.
+Fixture sets now: grid_v7, tm (unseeded), grid_v7_seeded, tm_seeded (boot
+positions + boot fills: closes, grid entries, cropped entries); snapcheck
+identical on all 120 recordings (trailing bundles from fill anchors with
+float32 candles, `is_trailing` rule). Live loop skeleton `live.rs` +
+`pb-runner --dry-run --once` verified on the abot account (read-only key):
+one cycle 4.3 s. RECONCILE_SPEC.md (P4.3/P4.4) being written by a subagent. Detached recording jobs relaunched after a
 process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
 seeded grid_v7, tm, iter7, tm8).
 

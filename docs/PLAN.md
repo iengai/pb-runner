@@ -96,13 +96,13 @@ Effort guesses are for orientation only.
 
 ## P4 — Runner loop  ~1 week
 
-- [ ] **P4.1** State model: balance (with hysteresis), positions, open orders, per-symbol candle buffers, fills since start, forager metrics cache.
+- [ ] **P4.1** (partial 2026-09-07: `crates/runner/src/live.rs` keeps hysteresis balance, 1m/1h candle buffers, fills since `pnls_max_lookback_days`, trailing anchors. Missing: realized-pnl cumsum from closed-pnl, entry-cooldown fill timestamps, previous-cycle engine states.) State model: balance (with hysteresis), positions, open orders, per-symbol candle buffers, fills since start, forager metrics cache.
 - [x] **P4.2** (2026-09-07: `crates/runner/src/{bot_params,emas,snapshot}.rs`; `pb-snapcheck` rebuilds every committed fake_v8 recording identically: grid_v7 30/30, tm 30/30, grid_v7_seeded 30/30. Not modelled yet, see STATUS: HSL/cooldown/runtime modes, close-EMA carry-forward, open-tail projection, real fill-manager state.) Snapshot builder: port section 2 of PORT_INVENTORY.md into `crates/runner/src/snapshot.rs`, producing `OrchestratorInput`.
       - Acceptance (the key test): for each real recording, feed the runner the same market state (positions/balance/open orders/candles reconstructed from the recording's timestamp) and assert the built `OrchestratorInput` equals the recorded input field-by-field. Start with the fake-exchange set.
 - [ ] **P4.3** Post-processing + reconciliation: port `parse_and_validate_rust_orchestrator_output`, `calc_orders_to_cancel_and_create`, recently-cancelled guard, order churn gate.
 - [ ] **P4.4** Execution: cancels then creates, batch sizes, retry policy mirroring `tests/test_ccxt_retry_policy.py`.
-- [ ] **P4.5** Startup: S3 download of config/keys per CONTRACT.md, exit codes, structured logging, graceful shutdown on SIGTERM (ECS stop).
-- [ ] **P4.6** `--check-only` becomes opt-in; `--dry-run` flag (plan and log orders, never send) added.
+- [ ] **P4.5** (partial: api-keys.json loading, tracing logs, ctrl-c shutdown, warmup; S3 download and exit codes pending) Startup: S3 download of config/keys per CONTRACT.md, exit codes, structured logging, graceful shutdown on SIGTERM (ECS stop).
+- [x] **P4.6** (2026-09-07: `--check-only` opt-in, `--dry-run` default with `--once`; verified against the abot account: 10 symbols, warmup 2957 x 1m + 2482 x 1h candles, 43 fills, one planning cycle in 4.3 s producing 2 entry orders) `--check-only` becomes opt-in; `--dry-run` flag (plan and log orders, never send) added.
 
 ## P5 — Paper and shadow  ~1-2 weeks wall clock
 

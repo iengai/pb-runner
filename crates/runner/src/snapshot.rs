@@ -84,6 +84,9 @@ pub struct SymbolState {
     pub min_cost_price: f64,
     /// Ascending 1m candles `[ts, o, h, l, c, v]`; the current (open) minute may be included.
     pub candles_1m: Vec<Candle>,
+    /// Hourly candles from the exchange (the Python bot fetches `1h` klines
+    /// for hourly windows); `None` aggregates them from `candles_1m`.
+    pub candles_1h: Option<Vec<Candle>>,
     /// False when the candle manager never fetched this symbol (forager
     /// secondary symbol without a warm cache -> unavailable, SPEC 3.7).
     pub candles_available: bool,
@@ -429,6 +432,38 @@ impl<'a> SnapshotBuilder<'a> {
         Ok(out)
     }
 
+    /// `Passivbot.is_trailing(symbol, pside)`: whether the side's strategy
+    /// uses trailing prices at all (SPEC 4.1). Sides without it keep the
+    /// default bundle and stay `trailing_available = true`.
+    pub fn is_trailing(&self, symbol: &str, pside: &str) -> Result<bool> {
+        let sp = self.cfg.strategy_params(pside, Some(symbol))?;
+        let f = |path: &[&str]| path_get(&sp, path).and_then(Value::as_f64).unwrap_or(0.0);
+        Ok(match self.cfg.strategy_kind_name.as_str() {
+            "trailing_grid_v7" => {
+                f(&["entry", "trailing_grid_ratio"]) != 0.0
+                    || f(&["close", "trailing_grid_ratio"]) != 0.0
+            }
+            _ => {
+                f(&["entry", "retracement_base_pct"]) > 0.0
+                    || f(&["close", "retracement_base_pct"]) > 0.0
+            }
+        })
+    }
+
+    /// Largest 1m span (close / strategy log-range) and 1h span a symbol
+    /// needs; used to size the candle warmup.
+    pub fn max_spans(&self, symbol: &str) -> Result<(f64, f64)> {
+        let sp = self.spans_for(symbol)?;
+        let m1 = sp
+            .close
+            .iter()
+            .chain(sp.m1_lr_required.iter())
+            .map(|k| unkey(*k))
+            .fold(0.0, f64::max);
+        let h1 = sp.h1_lr.iter().map(|k| unkey(*k)).fold(0.0, f64::max);
+        Ok((m1, h1))
+    }
+
     fn forager_spans(&self, flat_key: &str) -> Result<BTreeSet<u64>> {
         let mut set = BTreeSet::new();
         for pside in PSIDES {
@@ -570,7 +605,10 @@ impl<'a> SnapshotBuilder<'a> {
             let mut allow_missing = false;
             if !unavailable {
                 let c = &s.candles_1m;
-                let h = emas::aggregate_1h(c);
+                let h = match &s.candles_1h {
+                    Some(h) => h.clone(),
+                    None => emas::aggregate_1h(c),
+                };
                 let mut missing_required = false;
                 for k in &spans.close {
                     match emas::latest_ema(

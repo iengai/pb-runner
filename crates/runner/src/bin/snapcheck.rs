@@ -496,7 +496,10 @@ fn main() -> Result<()> {
                 // `trailing_available == false` is fill-confirmation state the
                 // runner cannot derive from REST (SPEC 4.3): take it as input.
                 let recorded_avail = r["trailing_available"].as_bool().unwrap_or(true);
-                let (trailing, avail) = match (size != 0.0 && recorded_avail, anchor) {
+                let required = size != 0.0
+                    && recorded_avail
+                    && builder.is_trailing(symbol, pside).unwrap_or(false);
+                let (trailing, avail) = match (required, anchor) {
                     (true, Some(a)) => match trailing_bundle(&candles, a, ts) {
                         Some(b) => (b, true),
                         None => (TrailingPriceBundle::default(), false),
@@ -536,6 +539,7 @@ fn main() -> Result<()> {
                 ask: num(&rs["order_book"]["ask"]),
                 min_cost_price: num(&rs["order_book"]["bid"]),
                 candles_1m: candles,
+                candles_1h: None,
                 candles_available: fi == 0 || has_pos || has_order,
                 long,
                 short,
