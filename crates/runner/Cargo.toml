@@ -32,7 +32,12 @@ passivbot_rust = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+uuid.workspace = true
+strum.workspace = true

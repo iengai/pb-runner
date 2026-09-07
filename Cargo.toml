@@ -13,7 +13,7 @@ edition = "2021"
 license = "MIT"
 # Engine line this runner is pinned to. Bump ONLY via docs/PLAN.md "upgrade
 # procedure" (re-run diffcheck + shadow run), never casually.
-rust-version = "1.85"
+rust-version = "1.94"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -29,7 +29,12 @@ hex = "0.4"
 async-trait = "0.1"
 hmac = "0.12"
 futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+strum = "0.26"
 # rustls so the arm64 image needs no OpenSSL; gzip because Bybit compresses.
+# S3 download of config/keys at container start (docs/CONTRACT.md).
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "http2"] }
 
 # --- Pinned upstream engines (Phase 1 enables these; see docs/PLAN.md) -------

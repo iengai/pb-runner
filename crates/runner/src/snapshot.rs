@@ -372,9 +372,18 @@ impl<'a> SnapshotBuilder<'a> {
         )
     }
 
+    /// `PB_mode_stop`: what a side falls back to when the engine reports it inactive.
+    pub fn stop_mode(&self) -> &'static str {
+        if self.auto_gs {
+            "graceful_stop"
+        } else {
+            "manual"
+        }
+    }
+
     /// `_orchestrator_mode_override` steps 4-7 (HSL, runtime overrides and
     /// exchange cooldowns are not modelled).
-    fn mode_override(&self, pside: &str, s: &SymbolState) -> Result<Option<String>> {
+    pub fn mode_override(&self, pside: &str, s: &SymbolState) -> Result<Option<String>> {
         let coin = s.symbol.split('/').next().unwrap_or(&s.symbol);
         let per_symbol = self
             .cfg

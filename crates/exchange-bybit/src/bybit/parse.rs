@@ -301,7 +301,11 @@ pub fn parse_order(
         symbol,
         side: s,
         pside: order_pside(v, s, reduce_only)?,
-        qty: num(v, "qty")?,
+        // Remaining quantity (ccxt `remaining` = `leavesQty`), which is what
+        // the reconciler matches on; falls back to the order qty.
+        qty: opt_num(v, "leavesQty")?
+            .filter(|q| *q > 0.0)
+            .unwrap_or(num(v, "qty")?),
         price: num(v, "price")?,
         reduce_only,
         created_ms: opt_u64(v, "createdTime"),

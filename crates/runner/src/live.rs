@@ -8,6 +8,7 @@
 
 use crate::bot_params::{ConfigView, PSIDES};
 use crate::emas::{aggregate_1h, Candle, ONE_HOUR_MS, ONE_MIN_MS};
+use crate::reconcile::{self, OrderRec, PbMode, Plan, RecentExecution, ReconcileParams};
 use crate::snapshot::{
     trailing_bundle, AccountState, MarketParams, SideState, SnapshotBuilder, SymbolState,
 };
@@ -81,6 +82,14 @@ pub struct PlannedOrder {
     pub risk_critical: bool,
 }
 
+/// Result of one planning cycle.
+pub struct CyclePlan {
+    pub planned: Vec<PlannedOrder>,
+    pub output: OrchestratorOutput,
+    pub input: Value,
+    pub plan: Plan,
+}
+
 #[derive(Debug, Default)]
 struct CandleBuffer {
     m1: Vec<Candle>,
@@ -98,6 +107,8 @@ pub struct LiveRunner {
     balance_hysteresis_pct: f64,
     warmup_1m_minutes: u64,
     warmup_1h_hours: u64,
+    /// `PB_modes[(symbol, pside)]` from the previous engine output (SPEC 1.6).
+    pb_modes: HashMap<(String, PositionSide), PbMode>,
     pub cycles: u64,
 }
 
@@ -118,6 +129,7 @@ impl LiveRunner {
             balance_hysteresis_pct: pct,
             warmup_1m_minutes: 0,
             warmup_1h_hours: 0,
+            pb_modes: HashMap::new(),
             cycles: 0,
         })
     }
@@ -252,8 +264,46 @@ impl LiveRunner {
         Ok(symbols)
     }
 
-    /// One planning cycle: refresh state, build the snapshot, run the engine.
-    pub async fn plan(&mut self) -> Result<(Vec<PlannedOrder>, OrchestratorOutput, Value)> {
+    /// Startup exchange configuration (Python `update_exchange_config*`):
+    /// hedge mode for the account, then margin mode + leverage per symbol.
+    pub async fn configure_exchange(&self, symbols: &[String]) -> Result<()> {
+        let hedge = self
+            .cfg
+            .live("hedge_mode")
+            .map(|v| v.as_bool().unwrap_or(true))
+            .unwrap_or(true);
+        if hedge {
+            self.client.set_hedge_mode().await?;
+        }
+        let leverage = self
+            .cfg
+            .live("leverage")
+            .and_then(Value::as_f64)
+            .unwrap_or(10.0);
+        let margin = match self
+            .cfg
+            .live("margin_mode_preference")
+            .and_then(Value::as_str)
+        {
+            Some("isolated") => pb_exchange_bybit::MarginMode::Isolated,
+            _ => pb_exchange_bybit::MarginMode::Cross,
+        };
+        for s in symbols {
+            self.client.configure_symbol(s, leverage, margin).await?;
+        }
+        tracing::info!(
+            symbols = symbols.len(),
+            leverage,
+            ?margin,
+            hedge,
+            "exchange configured"
+        );
+        Ok(())
+    }
+
+    /// One planning cycle: refresh state, build the snapshot, run the engine,
+    /// reconcile against the open orders.
+    pub async fn plan(&mut self, recent: &[RecentExecution]) -> Result<CyclePlan> {
         let now = now_ms();
         let balance = self.client.fetch_balance().await?;
         let positions = self.client.fetch_positions().await?;
@@ -427,8 +477,80 @@ impl LiveRunner {
             .iter()
             .map(|o| to_planned(o, &snap.symbols))
             .collect::<Result<Vec<_>>>()?;
+
+        // PB_modes from this output's symbol_states (SPEC 1.6).
+        let stop = PbMode::parse(builder.stop_mode());
+        let mut pb_modes: HashMap<(String, PositionSide), PbMode> = HashMap::new();
+        for st in &out.diagnostics.symbol_states {
+            let Some(symbol) = snap.symbols.get(st.symbol_idx) else {
+                continue;
+            };
+            let state = states.iter().find(|s| s.symbol == *symbol);
+            for (pside, name, active) in [
+                (PositionSide::Long, "long", st.long.active),
+                (PositionSide::Short, "short", st.short.active),
+            ] {
+                let explicit = state.and_then(|s| builder.mode_override(name, s).ok().flatten());
+                let mode = match explicit {
+                    Some(m) => PbMode::parse(&m),
+                    None if active => PbMode::Normal,
+                    None => stop,
+                };
+                pb_modes.insert((symbol.clone(), pside), mode);
+            }
+        }
+        self.pb_modes = pb_modes;
+
+        // Reconcile (SPEC 2).
+        let hedge_mode = self
+            .cfg
+            .live("hedge_mode")
+            .map(|v| v.as_bool().unwrap_or(true))
+            .unwrap_or(true);
+        let params = ReconcileParams {
+            hedge_mode,
+            match_tolerance: self
+                .cfg
+                .live("order_match_tolerance_pct")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0002),
+            max_cancels_per_batch: self
+                .cfg
+                .live("max_n_cancellations_per_batch")
+                .and_then(Value::as_u64)
+                .unwrap_or(5) as usize,
+            max_creates_per_batch: self
+                .cfg
+                .live("max_n_creations_per_batch")
+                .and_then(Value::as_u64)
+                .unwrap_or(3) as usize,
+        };
+        let pos_size = |symbol: &str, pside: PositionSide| -> f64 {
+            positions
+                .iter()
+                .find(|p| p.symbol == symbol && p.pside == pside)
+                .map_or(0.0, |p| p.size)
+        };
+        let last = |symbol: &str| -> f64 { tickers.get(symbol).map_or(0.0, |t| t.last) };
+        let ideal: Vec<OrderRec> = reconcile::to_executable(&planned, &pos_size, &last);
+        let open: Vec<OrderRec> = orders
+            .iter()
+            .map(|o| reconcile::normalize_open_order(o, hedge_mode))
+            .collect();
+        let modes = |symbol: &str, pside: PositionSide| -> PbMode {
+            self.pb_modes
+                .get(&(symbol.to_string(), pside))
+                .copied()
+                .unwrap_or(PbMode::Normal)
+        };
+        let plan = reconcile::reconcile(&ideal, &open, &modes, &last, recent, now, &params);
         self.cycles += 1;
-        Ok((planned, out, snap.input))
+        Ok(CyclePlan {
+            planned,
+            output: out,
+            input: snap.input,
+            plan,
+        })
     }
 
     pub fn sleep_between_cycles(&self) -> Duration {

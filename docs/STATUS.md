@@ -77,7 +77,16 @@ positions + boot fills: closes, grid entries, cropped entries); snapcheck
 identical on all 120 recordings (trailing bundles from fill anchors with
 float32 candles, `is_trailing` rule). Live loop skeleton `live.rs` +
 `pb-runner --dry-run --once` verified on the abot account (read-only key):
-one cycle 4.3 s. RECONCILE_SPEC.md (P4.3/P4.4) being written by a subagent. Detached recording jobs relaunched after a
+one cycle 4.3 s. `docs/RECONCILE_SPEC.md` (819 lines, subagent) written;
+P4.3 `reconcile.rs` and P4.4 `execute.rs` implement its "minimal faithful
+subset"; `live.rs` keeps `PB_modes`, closed-pnl history, realized-pnl
+cumsum and entry-cooldown timestamps; `startup.rs` downloads config/keys
+from S3 with the contract's exit codes. `pb-runner --dry-run --once` on the
+abot account now prints the reconciled plan (cancels of the live v7 bot's
+XRP orders + 2 entries, expected with a different config). All four
+seeded-with-fills private sets: 400/400 diffcheck.
+**Not done:** live execution never exercised with a trading key (P5.3);
+churn gate / market-distance filter (SPEC 4.3); HSL modes; P5/P6. Detached recording jobs relaunched after a
 process restart: `.local/fake_v8/run_rest.sh|log` (public grid_v7, tm; then
 seeded grid_v7, tm, iter7, tm8).
 
