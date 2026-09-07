@@ -380,6 +380,74 @@ Decision:
    `coin_overrides.<coin>.live.forced_mode_*`) are, verified by the
    `grid_v7_forced` fixture set. HSL modes remain a separate task.
 
+## D16 (2026-09-08) HSL: account-level state machine ported in `hsl.rs`, reconstructed from the fill history at start; coin mode refused; verified by trace replay
+
+Facts (`src/passivbot_hsl.py` at e808cfd33, `passivbot-rust/src/equity_hard_stop_loss.rs`):
+
+- The per-side HSL state (`_equity_hard_stop_make_state`, hsl:2430) wraps
+  the engine's `HardStopState` (`EquityHardStopRuntime`) and
+  `RollingPeakTracker`; Python adds halted / cooldown / no-restart /
+  flat-confirmation bookkeeping, the per-minute sample cache and the stop
+  event. `get_forced_PB_mode(pside)` returns `panic` (red, not halted) or
+  `graceful_stop` (halted); `_orchestrator_mode_override` step 1 turns that
+  into per-symbol modes (`_equity_hard_stop_halted_mode`). `is_forager_mode`
+  ignores HSL; `_pside_blocks_new_entries` does not.
+- Python persists latch payloads
+  (`caches/equity_hard_stop/<exchange>/<user>_<pside>.json`) and a
+  replay-matrix cache, both write-only or accelerators: on start it always
+  replays `get_balance_equity_history` (fills + 1m closes over
+  `pnls_max_lookback_days`) with `latch_red = False`, finalizes red-seen
+  episodes that an ordinary fill flattened, and samples the present.
+- `live.hsl_signal_mode` defaults to `coin` (per-symbol state, replay
+  matrices, panic markers from `pb_order_type`); `unified` / `pside` are the
+  account-level modes.
+- The fake harness runs red supervision through the normal planning path
+  with `panic` overrides (`_run_fake_red_supervisor_step`, two flat
+  confirmations, `_finalize_fake_terminal_red_if_sync_flat`); production
+  uses the protective-panic input path (hsl:8068) and anchors the stop
+  event at the fill that flattened the scope. The harness never refreshes
+  its fill ledger after boot (Python's `realized_pnl` stays at the boot
+  value), the production bot does (`update_pnls`).
+- Parity details found by replaying the Python trace: closes are f32 in the
+  candle manager, only finalized minutes are served (the current minute
+  carries the previous close), zero fees fall back to
+  `live.fee_pct_fallback` x notional (`_normalize_fee_paid_from_payload`),
+  `reset_after_restart` keeps `last_stop_event`, the 1h EMA map is
+  all-or-nothing (`fetch_required_map` raises, `h1 = {}`).
+
+Decision:
+
+1. `hsl.rs` ports the account-level machine (`unified`, `pside`) verbatim on
+   top of the engine crate: `HslState::{initialize_from_history, check,
+   supervise_red, sync_flat_finalize, modes}`; `LiveRunner` owns it,
+   initializes it at warmup from its own fill/closed-pnl history and 1m
+   buffers (`balance_equity_timeline`), feeds it every cycle before the
+   snapshot and passes `HslState::modes()` through `CycleState.hsl` to
+   `SnapshotBuilder::with_hsl`. No state file is read or written: a runner
+   restart reconstructs the same state a Python restart would.
+2. `hsl_signal_mode = "coin"` with HSL enabled is refused at config load
+   (`HslConfig::from_config`). Coin mode needs the per-symbol replay
+   matrices and panic-marker reconstruction and has no fixture; a config
+   that wants HSL on the runner sets `unified` or `pside`.
+3. Red supervision runs through the normal planning path with `panic`
+   overrides (the harness structure), not the protective-panic input;
+   `Supervision::Production` anchors the stop event at the latest flattening
+   fill as hsl:8068 does, `Supervision::FakeHarness` reproduces the harness
+   for the replay check. Operator runtime forced modes are not carried.
+4. Verification is a trace replay, not a state dump: `tools/fake_live_clock.py`
+   writes `hsl_trace.jsonl` (inputs and states around every check,
+   supervisor step, finalization and `compute`); `pb-snapcheck` drives
+   `HslState` with the traced inputs, recomputes the start-up replay from
+   `fills.json` + candles, cross-checks the derived pnl inputs (deviations
+   explained by the harness's stale ledger are counted, not failed) and
+   asserts every traced state (floats within 1e-9 relative; 10822/10835
+   bit-exact on `grid_v7_hsl`, the rest 2.7e-16 from summation order).
+5. Fees: `hsl::FeePolicy` reproduces the fill manager's normalisation for
+   the HSL ledger. `live::realized_pnl_cumsum` (SPEC 5.2) still negates the
+   reported fee only; zero-fee fills there should get the same fallback
+   (follow-up; no fixture distinguishes it because the recorded stats come
+   from the recording itself).
+
 ## D17 (2026-09-08) Mock exchange = `fake.py` semantics behind the Bybit client's contract; two harness facts the runner reproduces only under `pb-mockrun`
 
 Facts (P5.1 closed loop, docs/MOCK_EXCHANGE.md):

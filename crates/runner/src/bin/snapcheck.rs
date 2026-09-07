@@ -14,7 +14,16 @@
 //!   forager incumbents (the fake exchange keeps resting orders);
 //! - candle availability: warm for every symbol on the first cycle, then
 //!   only for symbols with a position or an open order (the harness never
-//!   marks secondary symbols as fetched, SPEC 3.7).
+//!   marks secondary symbols as fetched, SPEC 3.7);
+//! - HSL (SPEC 2.3 step 1, `hsl.rs`): when the config enables the equity
+//!   hard stop, the Python bot's HSL trace (`hsl_trace.jsonl`, written by
+//!   `tools/fake_live_clock.py`) drives the Rust state machine with the same
+//!   per-cycle inputs (balance, realized/unrealized pnl, positions, the
+//!   supervisor's position/order counts). The Rust state is asserted against
+//!   the traced Python state after every step, the start-up replay is
+//!   recomputed from `fills.json` + candles, and the derived pnl inputs are
+//!   cross-checked at every check. The mode overrides of each recording then
+//!   come from the Rust machine, not from the trace.
 //!
 //! Derived fields are compared exactly (Value equality: int vs float kept);
 //! `effective_min_cost` uses the 600 s-TTL cached price the bot had, which is
@@ -29,13 +38,17 @@ use clap::Parser;
 use passivbot_rust::types::TrailingPriceBundle;
 use pb_runner::bot_params::ConfigView;
 use pb_runner::emas::Candle;
+use pb_runner::hsl::{
+    balance_equity_timeline, hsl_pnl, pside_index, realized_pnl_now, CycleInputs, FeePolicy,
+    HslConfig, HslFill, HslPosition, HslState, RedObservation, SideState, Supervision, LONG, SHORT,
+};
 use pb_runner::jsonexact::parse_exact;
 use pb_runner::snapshot::{
-    trailing_bundle, AccountState, CycleState, MarketParams, SideState, SnapshotBuilder,
-    SymbolState,
+    trailing_bundle, AccountState, CycleState, MarketParams, SideState as SnapSide,
+    SnapshotBuilder, SymbolState,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -49,9 +62,17 @@ struct Args {
     /// `YYYY-MM-DD:YYYY-MM-DD` inclusive day files to load per coin.
     #[arg(long)]
     dates: String,
-    /// Scenario file of the run (for boot fills -> trailing anchors).
+    /// Scenario file of the run (boot fills -> trailing anchors; market steps
+    /// for the HSL start-up replay).
     #[arg(long)]
     scenario: Option<PathBuf>,
+    /// HSL trace of the run (default `<recordings>/hsl_trace.jsonl`; only
+    /// read when the config enables the equity hard stop).
+    #[arg(long)]
+    hsl_trace: Option<PathBuf>,
+    /// Fill ledger of the run (default `<recordings>/fills.json`).
+    #[arg(long)]
+    fills: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     limit: usize,
     /// Print every mismatch instead of the first three per path.
@@ -155,7 +176,7 @@ impl CandleStore {
     /// previous close (`_build_replay_timeline`).
     fn load_all(&mut self, coins: &[String]) -> Result<()> {
         let mut raw: BTreeMap<String, Vec<Candle>> = BTreeMap::new();
-        let mut union: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut union: BTreeSet<u64> = BTreeSet::new();
         for coin in coins {
             let mut all = Vec::new();
             for d in &self.dates {
@@ -208,10 +229,23 @@ impl CandleStore {
         }
         Ok(&self.cache[coin])
     }
+
+    /// Close of the candle at exactly `ts`: the fake exchange's step price
+    /// (ticker bid = ask = last) and the 1m close the HSL history replay
+    /// reads. `None` when there is no such row.
+    fn close_at(&self, coin: &str, ts: u64) -> Option<f64> {
+        let rows = self.cache.get(coin)?;
+        let i = rows.partition_point(|c| (c[0] as u64) < ts);
+        rows.get(i).filter(|c| c[0] as u64 == ts).map(|c| c[4])
+    }
 }
 
 fn num(v: &Value) -> f64 {
     v.as_f64().unwrap_or(0.0)
+}
+
+fn coin_of(symbol: &str) -> &str {
+    symbol.split('/').next().unwrap_or(symbol)
 }
 
 /// Deep diff with paths; array indices under `symbols` are replaced by `*` in
@@ -266,65 +300,544 @@ fn diff(path: &str, a: &Value, b: &Value, out: &mut Vec<(String, String)>) {
     }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let cfg_text = std::fs::read_to_string(&args.config)?;
-    let cfg = ConfigView::new(serde_json::from_str(&cfg_text)?)?;
-    let builder = SnapshotBuilder::new(&cfg)?;
-    let mut store = CandleStore {
-        dir: args.candles.clone(),
-        dates: date_range(&args.dates)?,
-        cache: BTreeMap::new(),
-    };
+/// `fills.json` (the fake exchange's fill ledger, ccxt-shaped) -> HSL fill
+/// events in the fill manager's order (timestamp, then id as a string).
+/// `fee_paid` follows the fill manager's fee normalisation (`FeePolicy`):
+/// the seeded boot fills carry a zero fee and get the fallback percentage.
+fn load_fills(path: &Path, fee: &FeePolicy) -> Result<Vec<HslFill>> {
+    let v: Value = parse_exact(&std::fs::read_to_string(path)?)?;
+    let mut rows: Vec<(u64, String, HslFill)> = Vec::new();
+    for f in v.as_array().into_iter().flatten() {
+        let pside = pside_index(f["position_side"].as_str().unwrap_or("long"));
+        let side = f["side"].as_str().unwrap_or("").to_ascii_lowercase();
+        let qty = num(&f["amount"]).abs();
+        let price = num(&f["price"]);
+        if qty <= 0.0 || price <= 0.0 {
+            continue;
+        }
+        let c_mult = f["info"]["contractMultiplier"].as_f64().unwrap_or(1.0);
+        let fee_paid = fee.signed_fee_paid(num(&f["fee"]["cost"]), qty * price * c_mult);
+        let ts = f["timestamp"].as_u64().unwrap_or(0);
+        let id = f["id"].as_str().unwrap_or("").to_string();
+        rows.push((
+            ts,
+            id,
+            HslFill {
+                timestamp_ms: ts,
+                symbol: f["symbol"].as_str().unwrap_or("").to_string(),
+                pside,
+                qty,
+                price,
+                increase: (pside == LONG) == (side == "buy"),
+                pnl: num(&f["pnl"]),
+                fee_paid,
+            },
+        ));
+    }
+    rows.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    Ok(rows.into_iter().map(|r| r.2).collect())
+}
 
-    // Boot fills (seeded scenarios) -> trailing anchors per (symbol, pside).
-    let mut anchors: BTreeMap<(String, String), u64> = BTreeMap::new();
-    if let Some(p) = &args.scenario {
-        let sc: Value = serde_json::from_str(&std::fs::read_to_string(p)?)?;
-        for f in sc
-            .pointer("/account/fills")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let sym = f["symbol"].as_str().unwrap_or_default().to_string();
-            let pside = f["position_side"].as_str().unwrap_or("long").to_string();
-            let ts = f["timestamp"].as_u64().unwrap_or(0);
-            let e = anchors.entry((sym, pside)).or_insert(0);
-            *e = (*e).max(ts);
+fn trace_positions(v: &Value) -> Vec<HslPosition> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| HslPosition {
+            symbol: p["symbol"].as_str().unwrap_or("").to_string(),
+            pside: pside_index(p["pside"].as_str().unwrap_or("long")),
+            size: num(&p["size"]),
+            price: num(&p["price"]),
+        })
+        .collect()
+}
+
+/// Parity bookkeeping for the HSL trace assertions: booleans/ints/strings
+/// must match exactly, floats bit-exact or within 1e-9 relative (the
+/// Python timeline sums unrealized pnl in set-iteration order, so the
+/// start-up replay is only reproducible up to summation order).
+#[derive(Default)]
+struct Parity {
+    floats: usize,
+    exact: usize,
+    max_rel: f64,
+    max_rel_at: String,
+    mismatches: Vec<String>,
+    /// Realized-pnl cross-checks where Python only knew the fills of its
+    /// start-up ledger: the fake harness never refreshes the fill history
+    /// after boot, the runner reads every fill (see RECORDER.md A).
+    stale_ledger: usize,
+}
+
+impl Parity {
+    fn float(&mut self, label: &str, py: Option<f64>, rs: f64) {
+        let Some(py) = py else {
+            self.mismatches
+                .push(format!("{label}: python None vs rust {rs}"));
+            return;
+        };
+        self.floats += 1;
+        if py.to_bits() == rs.to_bits() {
+            self.exact += 1;
+            return;
+        }
+        let rel = (py - rs).abs() / py.abs().max(rs.abs()).max(1e-300);
+        if rel > self.max_rel {
+            self.max_rel = rel;
+            self.max_rel_at = label.to_string();
+        }
+        if rel > 1e-9 {
+            self.mismatches
+                .push(format!("{label}: python {py} vs rust {rs}"));
         }
     }
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&args.recordings)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.to_string_lossy().ends_with(".in.json"))
-        .collect();
-    files.sort();
-    if args.limit > 0 {
-        files.truncate(args.limit);
+    /// `float`, but a Python value that matches the boot-ledger figure
+    /// instead of the full-ledger one counts as a stale-ledger deviation.
+    fn float_or_stale(&mut self, label: &str, py: Option<f64>, rs: f64, rs_boot: f64) {
+        if let Some(p) = py {
+            if p.to_bits() != rs.to_bits() && p.to_bits() == rs_boot.to_bits() {
+                self.stale_ledger += 1;
+                return;
+            }
+        }
+        self.float(label, py, rs);
     }
 
-    let coins: Vec<String> = builder
-        .universe(&[])
+    fn eq<T: PartialEq + std::fmt::Debug>(&mut self, label: &str, py: T, rs: T) {
+        if py != rs {
+            self.mismatches
+                .push(format!("{label}: python {py:?} vs rust {rs:?}"));
+        }
+    }
+}
+
+/// Assert one traced Python side state (`_hsl_state_summary`) against the
+/// Rust side state.
+fn compare_side(par: &mut Parity, label: &str, py: &Value, rs: &SideState) {
+    let f = |k: &str| py.get(k).and_then(Value::as_f64);
+    let b = |k: &str| py.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let u = |k: &str| py.get(k).and_then(Value::as_u64);
+    let s = |k: &str| py.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    par.eq(
+        &format!("{label}.initialized"),
+        b("initialized"),
+        rs.runtime.initialized(),
+    );
+    par.eq(
+        &format!("{label}.red_latched"),
+        b("red_latched"),
+        rs.runtime.red_latched(),
+    );
+    par.eq(
+        &format!("{label}.red_seen_in_episode"),
+        b("red_seen_in_episode"),
+        rs.runtime.state.red_seen_in_episode,
+    );
+    par.eq(
+        &format!("{label}.tier"),
+        s("tier"),
+        rs.runtime.tier().as_str().to_string(),
+    );
+    par.float(
+        &format!("{label}.peak_strategy_equity"),
+        f("peak_strategy_equity"),
+        rs.runtime.state.peak_strategy_equity,
+    );
+    par.float(
+        &format!("{label}.drawdown_ema"),
+        f("drawdown_ema"),
+        rs.runtime.state.drawdown_ema,
+    );
+    par.float(
+        &format!("{label}.rolling_peak_strategy_equity"),
+        f("rolling_peak_strategy_equity"),
+        rs.runtime.last_rolling_peak,
+    );
+    par.eq(&format!("{label}.halted"), b("halted"), rs.halted);
+    par.eq(
+        &format!("{label}.no_restart_latched"),
+        b("no_restart_latched"),
+        rs.no_restart_latched,
+    );
+    par.float(
+        &format!("{label}.no_restart_peak_strategy_equity"),
+        f("no_restart_peak_strategy_equity"),
+        rs.no_restart_peak_strategy_equity,
+    );
+    par.eq(
+        &format!("{label}.cooldown_until_ms"),
+        u("cooldown_until_ms"),
+        rs.cooldown_until_ms,
+    );
+    par.eq(
+        &format!("{label}.pending_red_since_ms"),
+        u("pending_red_since_ms"),
+        rs.pending_red_since_ms,
+    );
+    par.eq(
+        &format!("{label}.red_flat_confirmations"),
+        u("red_flat_confirmations").unwrap_or(0) as u32,
+        rs.red_flat_confirmations,
+    );
+    par.eq(
+        &format!("{label}.cooldown_intervention_active"),
+        b("cooldown_intervention_active"),
+        rs.cooldown_intervention_active,
+    );
+    par.eq(
+        &format!("{label}.cooldown_repanic_reset_pending"),
+        b("cooldown_repanic_reset_pending"),
+        rs.cooldown_repanic_reset_pending,
+    );
+    par.eq(
+        &format!("{label}.cooldown_repanic_since_ms"),
+        u("cooldown_repanic_since_ms"),
+        rs.cooldown_repanic_since_ms,
+    );
+    par.eq(
+        &format!("{label}.cooldown_unresolved_residue"),
+        b("cooldown_unresolved_residue"),
+        rs.cooldown_unresolved_residue,
+    );
+    let pm = &py["last_metrics"];
+    par.eq(
+        &format!("{label}.last_metrics.some"),
+        !pm.is_null(),
+        rs.last_metrics.is_some(),
+    );
+    if let (false, Some(m)) = (pm.is_null(), &rs.last_metrics) {
+        let l = format!("{label}.last_metrics");
+        let g = |k: &str| pm.get(k).and_then(Value::as_f64);
+        par.eq(
+            &format!("{l}.timestamp_ms"),
+            pm["timestamp_ms"].as_u64(),
+            Some(m.timestamp_ms),
+        );
+        par.float(&format!("{l}.balance"), g("balance"), m.balance);
+        par.float(
+            &format!("{l}.realized_pnl_total"),
+            g("realized_pnl_total"),
+            m.realized_pnl_total,
+        );
+        par.float(
+            &format!("{l}.realized_pnl"),
+            g("realized_pnl"),
+            m.realized_pnl,
+        );
+        par.float(
+            &format!("{l}.unrealized_pnl"),
+            g("unrealized_pnl"),
+            m.unrealized_pnl,
+        );
+        par.float(
+            &format!("{l}.strategy_pnl"),
+            g("strategy_pnl"),
+            m.strategy_pnl,
+        );
+        par.float(
+            &format!("{l}.peak_strategy_pnl"),
+            g("peak_strategy_pnl"),
+            m.peak_strategy_pnl,
+        );
+        par.float(
+            &format!("{l}.baseline_balance"),
+            g("baseline_balance"),
+            m.baseline_balance,
+        );
+        par.float(
+            &format!("{l}.strategy_equity"),
+            g("strategy_equity"),
+            m.strategy_equity,
+        );
+        par.float(
+            &format!("{l}.peak_strategy_equity"),
+            g("peak_strategy_equity"),
+            m.peak_strategy_equity,
+        );
+        par.float(
+            &format!("{l}.rolling_peak_strategy_equity"),
+            g("rolling_peak_strategy_equity"),
+            m.rolling_peak_strategy_equity,
+        );
+        par.float(
+            &format!("{l}.drawdown_raw"),
+            g("drawdown_raw"),
+            m.drawdown_raw,
+        );
+        par.float(
+            &format!("{l}.drawdown_ema"),
+            g("drawdown_ema"),
+            m.drawdown_ema,
+        );
+        par.float(
+            &format!("{l}.drawdown_score"),
+            g("drawdown_score"),
+            m.drawdown_score,
+        );
+        par.eq(
+            &format!("{l}.tier"),
+            pm["tier"].as_str().unwrap_or("").to_string(),
+            m.tier.as_str().to_string(),
+        );
+        par.eq(
+            &format!("{l}.red_active_now"),
+            pm["red_active_now"].as_bool(),
+            Some(m.red_active_now),
+        );
+        par.eq(
+            &format!("{l}.red_seen_in_episode"),
+            pm["red_seen_in_episode"].as_bool(),
+            Some(m.red_seen_in_episode),
+        );
+        par.eq(
+            &format!("{l}.changed"),
+            pm["changed"].as_bool(),
+            Some(m.changed),
+        );
+        par.eq(
+            &format!("{l}.elapsed_minutes"),
+            pm["elapsed_minutes"].as_u64(),
+            Some(m.elapsed_minutes),
+        );
+    }
+    let ps = &py["last_stop_event"];
+    par.eq(
+        &format!("{label}.last_stop_event.some"),
+        !ps.is_null(),
+        rs.last_stop_event.is_some(),
+    );
+    if let (false, Some(e)) = (ps.is_null(), &rs.last_stop_event) {
+        let l = format!("{label}.last_stop_event");
+        let g = |k: &str| ps.get(k).and_then(Value::as_f64);
+        par.eq(
+            &format!("{l}.stop_event_timestamp_ms"),
+            ps["stop_event_timestamp_ms"].as_u64(),
+            Some(e.stop_event_timestamp_ms),
+        );
+        par.eq(
+            &format!("{l}.cooldown_until_ms"),
+            ps["cooldown_until_ms"].as_u64(),
+            e.cooldown_until_ms,
+        );
+        par.eq(
+            &format!("{l}.no_restart_latched"),
+            ps["no_restart_latched"].as_bool(),
+            Some(e.no_restart_latched),
+        );
+        par.float(
+            &format!("{l}.strategy_equity"),
+            g("strategy_equity"),
+            e.strategy_equity,
+        );
+        par.float(
+            &format!("{l}.peak_strategy_equity"),
+            g("peak_strategy_equity"),
+            e.peak_strategy_equity,
+        );
+        par.float(
+            &format!("{l}.trigger_peak_strategy_equity"),
+            g("trigger_peak_strategy_equity"),
+            e.trigger_peak_strategy_equity,
+        );
+        par.float(
+            &format!("{l}.drawdown_raw"),
+            g("drawdown_raw"),
+            e.drawdown_raw,
+        );
+        par.float(
+            &format!("{l}.drawdown_ema"),
+            g("drawdown_ema"),
+            e.drawdown_ema,
+        );
+        par.float(
+            &format!("{l}.drawdown_score"),
+            g("drawdown_score"),
+            e.drawdown_score,
+        );
+        par.float(
+            &format!("{l}.no_restart_peak_strategy_equity"),
+            g("no_restart_peak_strategy_equity"),
+            e.no_restart_peak_strategy_equity,
+        );
+        par.float(
+            &format!("{l}.no_restart_drawdown_raw"),
+            g("no_restart_drawdown_raw"),
+            e.no_restart_drawdown_raw,
+        );
+    }
+    let pp = &py["pending_stop_event"];
+    par.eq(
+        &format!("{label}.pending_stop_event.some"),
+        !pp.is_null(),
+        rs.pending_stop_event.is_some(),
+    );
+    if let (false, Some(e)) = (pp.is_null(), &rs.pending_stop_event) {
+        let l = format!("{label}.pending_stop_event");
+        par.eq(
+            &format!("{l}.stop_event_timestamp_ms"),
+            pp["stop_event_timestamp_ms"].as_u64(),
+            Some(e.stop_event_timestamp_ms),
+        );
+        par.float(
+            &format!("{l}.drawdown_raw"),
+            pp["drawdown_raw"].as_f64(),
+            e.drawdown_raw,
+        );
+        par.float(
+            &format!("{l}.peak_strategy_equity"),
+            pp["peak_strategy_equity"].as_f64(),
+            e.peak_strategy_equity,
+        );
+    }
+}
+
+fn compare_states(par: &mut Parity, label: &str, py: &Value, hsl: &HslState) {
+    for (pside, idx) in [("long", LONG), ("short", SHORT)] {
+        if !hsl.enabled(idx) {
+            continue;
+        }
+        compare_side(
+            par,
+            &format!("{label}.{pside}"),
+            &py[pside],
+            &hsl.sides[idx],
+        );
+    }
+}
+
+/// The trace record's HSL inputs (`_hsl_inputs` in `fake_live_clock.py`).
+fn trace_inputs<'a>(
+    ev: &Value,
+    positions: &'a [HslPosition],
+    fills: &'a [HslFill],
+) -> CycleInputs<'a> {
+    CycleInputs {
+        now_ms: ev["ts"].as_u64().unwrap_or(0),
+        balance: num(&ev["balance"]),
+        realized_pnl_total: num(&ev["realized_pnl_total"]),
+        realized_pnl: [
+            num(&ev["realized_pnl_long"]),
+            num(&ev["realized_pnl_short"]),
+        ],
+        unrealized_pnl: [
+            num(&ev["unrealized_pnl_long"]),
+            num(&ev["unrealized_pnl_short"]),
+        ],
+        positions,
+        fills,
+    }
+}
+
+fn observation(v: &Value) -> RedObservation {
+    RedObservation {
+        n_positions: v["n_positions"].as_u64().unwrap_or(0) as usize,
+        entry_orders: v["entry_orders"].as_u64().unwrap_or(0) as usize,
+        nonpanic_close_orders: v["nonpanic_close_orders"].as_u64().unwrap_or(0) as usize,
+    }
+}
+
+fn fills_until(fills: &[HslFill], ts: u64) -> Vec<HslFill> {
+    fills
         .iter()
-        .map(|s| s.split('/').next().unwrap().to_string())
-        .collect();
-    store.load_all(&coins)?;
-    let mut totals: BTreeMap<String, usize> = BTreeMap::new();
-    let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut prev_out_symbols: HashSet<usize> = HashSet::new();
-    // Cross-cycle state (SPEC 8): `PB_modes` from the previous recording's
-    // output (the previous *cycle* when the set is not subsampled), the
-    // dynamic forager eligibility and the close-EMA carry-forward cache.
-    let mut cycle = CycleState::default();
-    let mut n = 0usize;
-    let mut clean = 0usize;
-    for (fi, file) in files.iter().enumerate() {
+        .filter(|f| f.timestamp_ms <= ts)
+        .cloned()
+        .collect()
+}
+
+/// Everything the per-recording rebuild carries across recordings.
+struct Checker<'a> {
+    cfg: &'a ConfigView,
+    store: &'a mut CandleStore,
+    anchors: BTreeMap<(String, String), u64>,
+    all_symbols: Vec<String>,
+    markets: BTreeMap<String, MarketParams>,
+    totals: BTreeMap<String, usize>,
+    examples: BTreeMap<String, Vec<String>>,
+    prev_out_symbols: HashSet<String>,
+    cycle: CycleState,
+    n: usize,
+    clean: usize,
+    verbose: bool,
+}
+
+impl Checker<'_> {
+    /// Cross-check the derived HSL pnl inputs of one trace record against
+    /// what the runner computes from the fill ledger and the step prices.
+    #[allow(clippy::too_many_arguments)]
+    fn check_hsl_inputs(
+        &self,
+        par: &mut Parity,
+        label: &str,
+        ev: &Value,
+        positions: &[HslPosition],
+        fills_now: &[HslFill],
+        boot_fills: &[HslFill],
+        start: Option<u64>,
+        c_mults: &BTreeMap<String, f64>,
+    ) -> Result<()> {
+        let ts = ev["ts"].as_u64().unwrap_or(0);
+        par.float_or_stale(
+            &format!("{label}.realized_pnl_total"),
+            ev["realized_pnl_total"].as_f64(),
+            realized_pnl_now(fills_now, start, None),
+            realized_pnl_now(boot_fills, start, None),
+        );
+        for (pside, idx) in [("long", LONG), ("short", SHORT)] {
+            par.float_or_stale(
+                &format!("{label}.realized_pnl_{pside}"),
+                ev[format!("realized_pnl_{pside}")].as_f64(),
+                realized_pnl_now(fills_now, start, Some(idx)),
+                realized_pnl_now(boot_fills, start, Some(idx)),
+            );
+            let mut upnl = 0.0;
+            for p in positions.iter().filter(|p| p.pside == idx) {
+                let price = self
+                    .store
+                    .close_at(coin_of(&p.symbol), ts)
+                    .ok_or_else(|| anyhow!("no step price for {} at {ts}", p.symbol))?;
+                upnl += hsl_pnl(
+                    idx,
+                    p.price,
+                    price,
+                    p.size,
+                    c_mults.get(&p.symbol).copied().unwrap_or(1.0),
+                );
+            }
+            par.float(
+                &format!("{label}.unrealized_pnl_{pside}"),
+                ev[format!("unrealized_pnl_{pside}")].as_f64(),
+                upnl,
+            );
+        }
+        Ok(())
+    }
+
+    /// Rebuild one recording. `names` is the recorded `symbol_idx` order when
+    /// the trace named it (the harness drops symbols without candles from the
+    /// planning universe); otherwise the recording must cover the full
+    /// candidate list.
+    fn run(&mut self, fi: usize, file: &Path, names: Option<Vec<String>>) -> Result<()> {
         let rec: Value = parse_exact(&std::fs::read_to_string(file)?)?;
         let out_path = PathBuf::from(file.to_string_lossy().replace(".in.json", ".out.json"));
         let rec_out: Value = parse_exact(&std::fs::read_to_string(&out_path)?)?;
         let ts = rec["timestamp_ms"].as_u64().unwrap();
-        let symbols: Vec<String> = builder.universe(&[]);
+        let n_rec = rec["symbols"].as_array().map_or(0, Vec::len);
+        let names = match names {
+            Some(n) if n.len() == n_rec => n,
+            None if n_rec == self.all_symbols.len() => self.all_symbols.clone(),
+            other => bail!(
+                "{}: {} recorded symbols but {} candidates{}",
+                file.display(),
+                n_rec,
+                self.all_symbols.len(),
+                other.map_or(String::new(), |n| format!(" (trace names {})", n.len()))
+            ),
+        };
+        let rec_idx: BTreeMap<&str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
         let incumbents: HashSet<(usize, &str)> = ["long", "short"]
             .iter()
             .flat_map(|p| {
@@ -336,28 +849,51 @@ fn main() -> Result<()> {
                     .collect::<Vec<_>>()
             })
             .collect();
+        for symbol in &names {
+            let ex = &rec["symbols"][rec_idx[symbol.as_str()]]["exchange"];
+            self.markets.insert(
+                symbol.clone(),
+                MarketParams {
+                    qty_step: num(&ex["qty_step"]),
+                    price_step: num(&ex["price_step"]),
+                    min_qty: num(&ex["min_qty"]),
+                    min_cost: num(&ex["min_cost"]),
+                    c_mult: num(&ex["c_mult"]),
+                    maker_fee: num(&ex["maker_fee"]),
+                    taker_fee: num(&ex["taker_fee"]),
+                },
+            );
+        }
+        let builder = SnapshotBuilder::new(self.cfg)?.with_hsl(&self.cycle.hsl);
+        let mut universe: BTreeSet<String> = self.all_symbols.iter().cloned().collect();
+        universe.extend(names.iter().cloned());
         let mut states = Vec::new();
-        for (idx, symbol) in symbols.iter().enumerate() {
-            let rs = &rec["symbols"][idx];
-            let coin = symbol.split('/').next().unwrap();
-            let all = store.coin(coin)?;
+        for symbol in &universe {
+            let coin = coin_of(symbol);
+            let all = self.store.coin(coin)?;
             let cut = all.partition_point(|c| c[0] as u64 <= ts);
             let candles = all[..cut].to_vec();
-            let ex = &rs["exchange"];
-            let market = MarketParams {
-                qty_step: num(&ex["qty_step"]),
-                price_step: num(&ex["price_step"]),
-                min_qty: num(&ex["min_qty"]),
-                min_cost: num(&ex["min_cost"]),
-                c_mult: num(&ex["c_mult"]),
-                maker_fee: num(&ex["maker_fee"]),
-                taker_fee: num(&ex["taker_fee"]),
-            };
-            let side = |pside: &str| -> SideState {
+            let market = self
+                .markets
+                .get(symbol)
+                .cloned()
+                .ok_or_else(|| anyhow!("{symbol}: no market params recorded yet"))?;
+            let rs = rec_idx.get(symbol.as_str()).map(|i| &rec["symbols"][*i]);
+            let side = |pside: &str| -> SnapSide {
+                let Some(rs) = rs else {
+                    return SnapSide {
+                        has_open_order: self.prev_out_symbols.contains(symbol),
+                        ..SnapSide::default()
+                    };
+                };
+                let idx = rec_idx[symbol.as_str()];
                 let r = &rs[pside];
                 let size = num(&r["position"]["size"]);
                 let has_entry = incumbents.contains(&(idx, pside));
-                let anchor = anchors.get(&(symbol.clone(), pside.to_string())).copied();
+                let anchor = self
+                    .anchors
+                    .get(&(symbol.clone(), pside.to_string()))
+                    .copied();
                 // `trailing_available == false` is fill-confirmation state the
                 // runner cannot derive from REST (SPEC 4.3): take it as input.
                 let recorded_avail = r["trailing_available"].as_bool().unwrap_or(true);
@@ -382,27 +918,34 @@ fn main() -> Result<()> {
                         )
                     }
                 };
-                SideState {
+                SnapSide {
                     position_size: size,
                     position_price: num(&r["position"]["price"]),
                     trailing,
                     trailing_available: avail,
                     last_increase_fill_ts: r["last_increase_fill_timestamp_ms"].as_u64(),
                     has_entry_order: has_entry,
-                    has_open_order: has_entry || prev_out_symbols.contains(&idx),
+                    has_open_order: has_entry || self.prev_out_symbols.contains(symbol),
                 }
             };
             let long = side("long");
             let short = side("short");
             let has_pos = long.position_size != 0.0 || short.position_size != 0.0;
             let has_order = long.has_open_order || short.has_open_order;
+            let (bid, ask) = match rs {
+                Some(rs) => (num(&rs["order_book"]["bid"]), num(&rs["order_book"]["ask"])),
+                None => {
+                    let p = self.store.close_at(coin, ts).unwrap_or(0.0);
+                    (p, p)
+                }
+            };
             states.push(SymbolState {
                 symbol: symbol.clone(),
                 market,
                 active: true,
-                bid: num(&rs["order_book"]["bid"]),
-                ask: num(&rs["order_book"]["ask"]),
-                min_cost_price: num(&rs["order_book"]["bid"]),
+                bid,
+                ask,
+                min_cost_price: bid,
                 candles_1m: candles,
                 candles_1h: None,
                 candles_available: fi == 0 || has_pos || has_order,
@@ -417,7 +960,7 @@ fn main() -> Result<()> {
             realized_pnl_cumsum_max: num(&rec["global"]["realized_pnl_cumsum_max"]),
             realized_pnl_cumsum_last: num(&rec["global"]["realized_pnl_cumsum_last"]),
         };
-        let snap = builder.build(&account, &states, &mut cycle)?;
+        let snap = builder.build(&account, &states, &mut self.cycle)?;
         let active: Vec<(usize, bool, bool)> = rec_out["diagnostics"]["symbol_states"]
             .as_array()
             .into_iter()
@@ -430,16 +973,16 @@ fn main() -> Result<()> {
                 )
             })
             .collect();
-        cycle.pb_modes = builder.pb_modes_after_cycle(&snap, &active);
+        self.cycle.pb_modes = builder.pb_modes_after_cycle(&snap, &active);
         let mut d = Vec::new();
         diff("", &snap.input, &rec, &mut d);
         if d.is_empty() {
-            clean += 1;
+            self.clean += 1;
         }
         for (p, msg) in d {
-            *totals.entry(p.clone()).or_default() += 1;
-            let ex = examples.entry(p).or_default();
-            if args.verbose || ex.len() < 3 {
+            *self.totals.entry(p.clone()).or_default() += 1;
+            let ex = self.examples.entry(p).or_default();
+            if self.verbose || ex.len() < 3 {
                 ex.push(format!(
                     "{}: {}",
                     file.file_name().unwrap().to_string_lossy(),
@@ -447,14 +990,339 @@ fn main() -> Result<()> {
                 ));
             }
         }
-        prev_out_symbols = rec_out["orders"]
+        self.prev_out_symbols = rec_out["orders"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|o| o["symbol_idx"].as_u64().map(|x| x as usize))
+            .filter_map(|i| snap.symbols.get(i).cloned())
             .collect();
-        n += 1;
+        self.n += 1;
+        Ok(())
     }
+}
+
+/// Recording stem `<timestamp>_<hash>.in.json` -> the input hash.
+fn stem_hash(file: &Path) -> String {
+    let stem = file.file_name().unwrap().to_string_lossy().to_string();
+    stem.split('_')
+        .nth(1)
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Replay the HSL trace through the Rust state machine, rebuilding each
+/// recording at its `compute` event with the machine's mode overrides.
+fn replay_with_trace(
+    checker: &mut Checker<'_>,
+    files: &[PathBuf],
+    trace: &[Value],
+    hsl: &mut HslState,
+    fills: &[HslFill],
+    qty_steps: &BTreeMap<String, f64>,
+    c_mults: &BTreeMap<String, f64>,
+) -> Result<(Parity, BTreeMap<String, String>)> {
+    let mut par = Parity::default();
+    let mut modes_by_hash: BTreeMap<String, String> = BTreeMap::new();
+    let mut rec_i = 0usize;
+    // (supervisor_begin record, its positions, first `counts` consumed)
+    let mut supervisor: Option<(Value, Vec<HslPosition>, bool)> = None;
+    let (mut checks, mut inits, mut supervisions, mut finalizes, mut resets) = (0, 0, 0, 0, 0);
+    let lookback = hsl.cfg.lookback;
+    let mut boot_fills: Vec<HslFill> = Vec::new();
+    for ev in trace {
+        let kind = ev["kind"].as_str().unwrap_or("");
+        let ts = ev["ts"].as_u64().unwrap_or(0);
+        match kind {
+            "init" => {
+                inits += 1;
+                let positions = trace_positions(&ev["positions"]);
+                let fills_now = fills_until(fills, ts);
+                boot_fills = fills_now.clone();
+                let start = lookback.event_history_start_ms(ts);
+                checker.check_hsl_inputs(
+                    &mut par,
+                    &format!("init@{ts}"),
+                    ev,
+                    &positions,
+                    &fills_now,
+                    &boot_fills,
+                    start,
+                    c_mults,
+                )?;
+                let timeline = {
+                    let store = &*checker.store;
+                    let close_at =
+                        |symbol: &str, minute: u64| store.close_at(coin_of(symbol), minute);
+                    let c_mult = |s: &str| c_mults.get(s).copied().unwrap_or(1.0);
+                    let qty_step = |s: &str| qty_steps.get(s).copied().unwrap_or(0.0);
+                    let known = |s: &str| c_mults.contains_key(s);
+                    balance_equity_timeline(
+                        ts,
+                        num(&ev["balance"]),
+                        lookback,
+                        &fills_now,
+                        &positions,
+                        &close_at,
+                        &c_mult,
+                        &qty_step,
+                        &known,
+                    )
+                };
+                hsl.initialize_from_history(
+                    ts,
+                    num(&ev["balance"]),
+                    &fills_now,
+                    &timeline,
+                    num(&ev["realized_pnl_total"]),
+                    [
+                        num(&ev["realized_pnl_long"]),
+                        num(&ev["realized_pnl_short"]),
+                    ],
+                    [
+                        num(&ev["unrealized_pnl_long"]),
+                        num(&ev["unrealized_pnl_short"]),
+                    ],
+                )?;
+                compare_states(&mut par, &format!("init@{ts}"), &ev["after"], hsl);
+                checker.cycle.hsl = hsl.modes();
+            }
+            "check_begin" => {
+                checks += 1;
+                let positions = trace_positions(&ev["positions"]);
+                let fills_now = fills_until(fills, ts);
+                let start = lookback.event_history_start_ms(ts);
+                checker.check_hsl_inputs(
+                    &mut par,
+                    &format!("check@{ts}"),
+                    ev,
+                    &positions,
+                    &fills_now,
+                    &boot_fills,
+                    start,
+                    c_mults,
+                )?;
+                let inp = trace_inputs(ev, &positions, &fills_now);
+                hsl.check(&inp)?;
+                checker.cycle.hsl = hsl.modes();
+            }
+            "check_end" => {
+                compare_states(&mut par, &format!("check@{ts}"), &ev["after"], hsl);
+            }
+            "supervisor_begin" => {
+                supervisions += 1;
+                supervisor = Some((ev.clone(), trace_positions(&ev["positions"]), false));
+            }
+            "counts" => {
+                let Some((begin, positions, seen)) = supervisor.as_mut() else {
+                    continue;
+                };
+                if *seen {
+                    continue;
+                }
+                *seen = true;
+                let fills_now = fills_until(fills, ts);
+                let inp = trace_inputs(begin, positions, &fills_now);
+                for pside in begin["psides"].as_array().into_iter().flatten() {
+                    let name = pside.as_str().unwrap_or("long");
+                    hsl.supervise_red(
+                        pside_index(name),
+                        observation(&ev["counts"][name]),
+                        &inp,
+                        Supervision::FakeHarness,
+                    )?;
+                }
+                checker.cycle.hsl = hsl.modes();
+            }
+            "sync_flat" => {
+                let positions = trace_positions(&ev["positions"]);
+                let fills_now = fills_until(fills, ts);
+                let inp = trace_inputs(ev, &positions, &fills_now);
+                for pside in ev["psides"].as_array().into_iter().flatten() {
+                    let name = pside.as_str().unwrap_or("long");
+                    hsl.sync_flat_finalize(
+                        pside_index(name),
+                        observation(&ev["counts"][name]),
+                        &inp,
+                    )?;
+                }
+                compare_states(&mut par, &format!("sync_flat@{ts}"), &ev["after"], hsl);
+                checker.cycle.hsl = hsl.modes();
+            }
+            "supervisor_end" => {
+                compare_states(&mut par, &format!("supervisor@{ts}"), &ev["after"], hsl);
+                supervisor = None;
+            }
+            "finalize" => {
+                finalizes += 1;
+                let name = ev["pside"].as_str().unwrap_or("long");
+                compare_side(
+                    &mut par,
+                    &format!("finalize@{ts}.{name}"),
+                    &ev["after"],
+                    &hsl.sides[pside_index(name)],
+                );
+            }
+            "reset" => resets += 1,
+            "compute" => {
+                let Some(file) = files.get(rec_i) else {
+                    continue;
+                };
+                if ev["hash"].as_str() != Some(stem_hash(file).as_str()) {
+                    continue;
+                }
+                let names = ev["symbols"].as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                });
+                checker.run(rec_i, file, names)?;
+                modes_by_hash.insert(
+                    stem_hash(file),
+                    format!(
+                        "long={:?} short={:?}",
+                        checker.cycle.hsl.side("long"),
+                        checker.cycle.hsl.side("short")
+                    ),
+                );
+                rec_i += 1;
+            }
+            _ => {}
+        }
+    }
+    if rec_i != files.len() {
+        bail!(
+            "HSL trace matched {rec_i} of {} recordings (compute events by input hash)",
+            files.len()
+        );
+    }
+    println!(
+        "hsl trace: {inits} init, {checks} checks, {supervisions} supervisor steps, {finalizes} finalizations, {resets} resets; {} floats compared, {} bit-exact, max rel dev {:.3e} ({}); {} realized-pnl inputs explained by the harness's stale fill ledger",
+        par.floats, par.exact, par.max_rel, par.max_rel_at, par.stale_ledger
+    );
+    Ok((par, modes_by_hash))
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let cfg_text = std::fs::read_to_string(&args.config)?;
+    let cfg = ConfigView::new(serde_json::from_str(&cfg_text)?)?;
+    let hsl_cfg = HslConfig::from_config(&cfg)?;
+    let hsl_on = hsl_cfg.any_enabled();
+    let mut store = CandleStore {
+        dir: args.candles.clone(),
+        dates: date_range(&args.dates)?,
+        cache: BTreeMap::new(),
+    };
+
+    // Boot fills (seeded scenarios) -> trailing anchors per (symbol, pside);
+    // market steps for the HSL start-up replay.
+    let mut anchors: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut qty_steps: BTreeMap<String, f64> = BTreeMap::new();
+    let mut c_mults: BTreeMap<String, f64> = BTreeMap::new();
+    if let Some(p) = &args.scenario {
+        let sc: Value = serde_json::from_str(&std::fs::read_to_string(p)?)?;
+        for f in sc
+            .pointer("/account/fills")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let sym = f["symbol"].as_str().unwrap_or_default().to_string();
+            let pside = f["position_side"].as_str().unwrap_or("long").to_string();
+            let ts = f["timestamp"].as_u64().unwrap_or(0);
+            let e = anchors.entry((sym, pside)).or_insert(0);
+            *e = (*e).max(ts);
+        }
+        for (sym, m) in sc["symbols"].as_object().into_iter().flatten() {
+            qty_steps.insert(sym.clone(), num(&m["qty_step"]));
+            c_mults.insert(sym.clone(), m.get("contractSize").map_or(1.0, num));
+        }
+    }
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&args.recordings)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.to_string_lossy().ends_with(".in.json"))
+        .collect();
+    files.sort();
+    if args.limit > 0 {
+        files.truncate(args.limit);
+    }
+
+    let all_symbols: Vec<String> = SnapshotBuilder::new(&cfg)?.universe(&[], &Default::default());
+    let coins: Vec<String> = all_symbols.iter().map(|s| coin_of(s).to_string()).collect();
+    store.load_all(&coins)?;
+    let mut checker = Checker {
+        cfg: &cfg,
+        store: &mut store,
+        anchors,
+        all_symbols,
+        markets: BTreeMap::new(),
+        totals: BTreeMap::new(),
+        examples: BTreeMap::new(),
+        prev_out_symbols: HashSet::new(),
+        // Cross-cycle state (SPEC 8): `PB_modes` from the previous recording's
+        // output (the previous *cycle* when the set is not subsampled), the
+        // dynamic forager eligibility, the close-EMA carry-forward cache, the
+        // symbols ever seen and the HSL side modes.
+        cycle: CycleState::default(),
+        n: 0,
+        clean: 0,
+        verbose: args.verbose,
+    };
+
+    let mut parity: Option<(Parity, BTreeMap<String, String>)> = None;
+    if hsl_on {
+        let trace_path = args
+            .hsl_trace
+            .clone()
+            .unwrap_or_else(|| args.recordings.join("hsl_trace.jsonl"));
+        let fills_path = args
+            .fills
+            .clone()
+            .unwrap_or_else(|| args.recordings.join("fills.json"));
+        let fills = load_fills(&fills_path, &hsl_cfg.fee)
+            .with_context(|| fills_path.display().to_string())?;
+        let text = std::fs::read_to_string(&trace_path).with_context(|| {
+            format!(
+                "HSL enabled: need the run's trace at {}",
+                trace_path.display()
+            )
+        })?;
+        let mut trace: Vec<Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(parse_exact)
+            .collect::<Result<_>>()?;
+        trace.sort_by_key(|v| v["seq"].as_u64().unwrap_or(0));
+        if qty_steps.is_empty() {
+            bail!("HSL enabled: pass --scenario for the market steps of the start-up replay");
+        }
+        let mut hsl = HslState::new(hsl_cfg);
+        parity = Some(replay_with_trace(
+            &mut checker,
+            &files,
+            &trace,
+            &mut hsl,
+            &fills,
+            &qty_steps,
+            &c_mults,
+        )?);
+    } else {
+        for (fi, file) in files.iter().enumerate() {
+            checker.run(fi, file, None)?;
+        }
+    }
+    let Checker {
+        totals,
+        examples,
+        n,
+        clean,
+        ..
+    } = checker;
     println!(
         "{n} recordings, {clean} identical, {} mismatching field paths",
         totals.len()
@@ -465,7 +1333,25 @@ fn main() -> Result<()> {
             println!("          {}", e.chars().take(220).collect::<String>());
         }
     }
-    if totals.is_empty() {
+    let mut ok = totals.is_empty();
+    if let Some((par, modes)) = parity {
+        if args.verbose {
+            for (h, m) in &modes {
+                println!("  hsl modes {h}: {m}");
+            }
+        }
+        if par.mismatches.is_empty() {
+            println!("hsl trace: every traced state matches");
+        } else {
+            ok = false;
+            println!("hsl trace: {} state mismatches", par.mismatches.len());
+            let show = if args.verbose { usize::MAX } else { 30 };
+            for m in par.mismatches.iter().take(show) {
+                println!("          {m}");
+            }
+        }
+    }
+    if ok {
         Ok(())
     } else {
         std::process::exit(1)

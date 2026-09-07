@@ -15,6 +15,8 @@ pub mod cooldown;
 pub mod emas;
 #[cfg(feature = "engine-v8")]
 pub mod execute;
+#[cfg(feature = "engine-v8")]
+pub mod hsl;
 pub mod jsonexact;
 #[cfg(feature = "engine-v8")]
 pub mod live;

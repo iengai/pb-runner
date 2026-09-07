@@ -375,8 +375,8 @@ symbol; then `_apply_exchange_symbol_unavailable_planning_policy`
 `_mode_override_to_orchestrator_mode` normalises. Decision order in
 `_orchestrator_mode_override`:
 
-1. HSL (`_equity_hard_stop_enabled(pside)`): red latched and not halted -> `panic`; halted -> `_equity_hard_stop_halted_mode` (hsl:2924: `panic|manual|tp_only` when a position exists depending on `live.hsl_cooldown_position_policy`, else `graceful_stop`); orange tier -> `hsl_orange_tier_mode` (`graceful_stop` or `tp_only_with_active_entry_cancellation`).
-2. HSL coin mode with replay pending for `(pside, symbol)` -> configured forced mode if not normal, else `graceful_stop` (both through `_apply_entry_eligibility_mode`).
+1. HSL (`_equity_hard_stop_enabled(pside)`): red latched and not halted -> `panic`; halted -> `_equity_hard_stop_halted_mode` (hsl:2924: when the symbol holds a position, `panic` if the cooldown residue is unresolved, else `panic|manual|tp_only|graceful_stop` per `live.hsl_position_during_cooldown_policy` (default `panic`; `normal` and `graceful_stop` both give `graceful_stop`); flat symbols -> `graceful_stop`); orange tier -> `hsl_orange_tier_mode` (`graceful_stop` or `tp_only_with_active_entry_cancellation`). **Modelled** (2026-09-08, D16): `hsl.rs` owns the per-side state machine (`HslState`, engine `HardStopState` + `RollingPeakTracker`, `_equity_hard_stop_check`, the RED supervisor's flat confirmations and `finalize_red_stop`, cooldown handling, start-up replay from the fill history); `HslState::modes()` -> `CycleState.hsl` -> `SnapshotBuilder::with_hsl`, which applies this step in `mode_override` and, through `side_forced_mode` (= `get_forced_PB_mode(pside)`), in `_pside_blocks_new_entries` for the universe. Note `is_forager_mode` (pb:8243) only reads the *configured* forced mode, so a red/halted side keeps its forager flag and only loses its candidates from the universe; the symbols already in `self.positions` stay (`CycleState.known_symbols`). Verified by the `grid_v7_hsl` set (README in `tests/fixtures/recordings`).
+2. HSL coin mode with replay pending for `(pside, symbol)` -> configured forced mode if not normal, else `graceful_stop` (both through `_apply_entry_eligibility_mode`). Not modelled: `hsl::HslConfig::from_config` refuses `live.hsl_signal_mode = "coin"` while a side enables HSL (D16); the default is `coin`, so a config that enables HSL must set `unified` or `pside` explicitly for the runner.
 3. `self._runtime_forced_modes[pside][symbol]` (operator runtime overrides) -> `_apply_entry_eligibility_mode(pside, symbol, mode)`.
 4. `config_get(["live", f"forced_mode_{pside}"], symbol)` (per-symbol override or global `live.forced_mode_long/short`) -> `expand_PB_mode` (`config/overrides.py:798`: `gs|graceful_stop|graceful-stop`, `m|manual`, `n|normal`, `p|panic`, `t|tp|tp_only|tp-only`; anything else raises) -> `_apply_entry_eligibility_mode`.
 5. `not markets_dict[symbol]["active"]` -> `tp_only`.
@@ -921,7 +921,32 @@ validated; a per-symbol `forager_score_weights` is canonicalised at use.
      the runner and are not modelled.
    - HSL runtime state (`_equity_hard_stop[pside]`, engine-owned state machine
      fed by Python with equity samples and fills; `_hsl_state`, hsl:2426):
-     open (separate task).
+     **modelled** for the account-level signal modes (`unified`, `pside`)
+     in `hsl.rs` (D16). Persistence: Python writes latch files
+     (`caches/equity_hard_stop/<exchange>/<user>_<pside>.json`) and a
+     replay-matrix cache, but never reads a state file for a decision; at
+     start-up `_equity_hard_stop_initialize_from_history` replays
+     `get_balance_equity_history` (fills + 1m closes over
+     `pnls_max_lookback_days`, `latch_red = False`, red-seen episodes
+     flattened by an ordinary fill finalized with their cooldown) and then
+     samples the present. The runner does the same in
+     `LiveRunner::initialize_hsl` from its fill/closed-pnl history and 1m
+     buffers (`hsl::balance_equity_timeline`), so a restart lands in the
+     same state as a Python restart. Inputs per cycle: raw balance,
+     realized pnl from the fill ledger (`closedPnl` on the order's last fill
+     + signed fee per `live.fee_pct_fallback` / `fee_pct_sanity_abs_max`,
+     `hsl::FeePolicy`), unrealized pnl from positions x planning `last`.
+     Details that matter for parity (all found by the trace replay in
+     `pb-snapcheck`): the candle manager stores closes as f32 and serves
+     only finalized minutes, so the replay row of the current minute
+     carries the previous close forward; `reset_after_restart` keeps
+     `last_stop_event`; the history replay's stop-event anchor is the latest
+     scope fill inside the flatten window. Not modelled: coin mode (refused),
+     panic-marker reconstruction from `pb_order_type`, operator runtime
+     forced modes, the production protective-panic input path (the runner
+     runs red supervision through the normal planning path with `panic`
+     overrides like the fake harness; `Supervision::Production` anchors the
+     stop event at the flattening fill, hsl:8068).
    A cold-started runner reproduces the *first* cycle of a cold-started
    Python bot; both then diverge from each other only through the items
    still marked open.

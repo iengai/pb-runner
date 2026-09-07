@@ -275,6 +275,11 @@ impl ConfigView {
         Ok(twel > 0.0 && n > 0.0)
     }
 
+    /// `self.hsl[pside]` as the HSL state machine reads it (`hsl.rs`).
+    pub fn hsl_side(&self, pside: &str) -> Result<Map<String, Value>> {
+        self.hsl_global(pside)
+    }
+
     /// `_parse_hsl_config()[pside]`: global HSL values with the
     /// `no_restart_drawdown_threshold >= red_threshold` clamp.
     fn hsl_global(&self, pside: &str) -> Result<Map<String, Value>> {

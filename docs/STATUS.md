@@ -2,6 +2,66 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 (worktree agent) — HSL equity hard stop ported (SNAPSHOT_SPEC 2.3 step 1, D16)
+
+**Changed:** new `crates/runner/src/hsl.rs`: `HslConfig` (`_parse_hsl_config`
++ `live.hsl_signal_mode` / `hsl_position_during_cooldown_policy` /
+`pnls_max_lookback_days` / `fee_pct_fallback`; refuses coin mode with HSL
+enabled), `HslState` on top of the engine's `HardStopState` +
+`RollingPeakTracker` (`apply_sample` with the per-minute cache,
+`compute_stop_event`, `finalize_red_stop` via
+`evaluate_red_episode_finalization`, `handle_position_during_cooldown`,
+`check`, `supervise_red` (`Supervision::{Production, FakeHarness}`),
+`sync_flat_finalize`, `modes`, `initialize_from_history`),
+`balance_equity_timeline` (= `get_balance_equity_history` for the
+account-level modes: fill replay, f32 closes, finalized minutes only),
+`FeePolicy` (fill-manager fee normalisation), `HslModes` / `HslSideMode`;
+16 unit tests mirroring `tests/test_equity_hard_stop*.py` cases.
+`snapshot.rs`: `CycleState.hsl` + `known_symbols` (`set(self.positions)`),
+`SnapshotBuilder::with_hsl`, `side_forced_mode` (= `get_forced_PB_mode`)
+in `mode_override` step 1 and `_pside_blocks_new_entries`; `is_forager_mode`
+now reads only the configured forced mode (pb:8243, was wrongly also HSL);
+1h log-range EMA map is all-or-nothing (`fetch_required_map`); universe
+keeps known symbols; unit test `hsl_side_modes_override_step_one_and_keep_known_symbols`.
+`live.rs`: `LiveRunner.hsl`, `initialize_hsl` at warmup (fill history +
+1m buffers), per-cycle `check` + red supervision before the snapshot,
+`hsl_fills` / `hsl_positions` / `hsl_observation`. `bot_params.rs`:
+`hsl_side`. `bin/snapcheck.rs`: per-recording `Checker`, HSL trace replay
+(`--hsl-trace`, `--fills`, state assertions, derived-input cross-check with
+the stale-ledger classification, mode overrides from the Rust machine).
+Tools: `fake_live_clock.py` HSL trace wrapper (`PB_RUNNER_HSL_TRACE`),
+`record_fake_v8.py` sets it and copies `fills.json`, `select_fixtures.py`
+keeps trace/fills/scenario and HSL transitions. New fixtures
+`tests/fixtures/configs/fake_v8/grid_v7_hsl.json` and
+`tests/fixtures/recordings/fake_v8/grid_v7_hsl` (27 cycles + trace + fills +
+scenario). Docs: SNAPSHOT_SPEC 2.3 / 8, PLAN P4.1 / P4.2, RECORDER A,
+fixtures README, D16.
+
+**Verified:** full HSL run (`.local/fake_v8_hsl/grid_v7_hsl`, boot
+2025-10-10 20:00 into the Oct 10 crash, 398 cycles): `pb-snapcheck`
+398/398 identical with the mode overrides produced by `hsl.rs`
+(green 0-58, yellow 59-65, orange 66-72 = `tp_only`, red 73-74 = `panic`
+closes, halted 75-191 = `graceful_stop`, reset 192+), "every traced state
+matches" over 1 init / 397 checks / 4 supervisor steps / 1 finalization /
+1 reset, 10822/10835 floats bit-exact (rest 2.7e-16, summation order), 646
+realized-pnl inputs differ only because the harness never refreshes fills
+after boot. Committed subset 27/27. Regression: `pb-snapcheck` grid_v7,
+tm, grid_v7_seeded, tm_seeded, grid_v7_forced 30/30 each; `pb-plancheck`
+public grid_v7 600/600, tm 600/600, seeded grid_v7 / tm / tm8 / iter7
+400/400. `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace`
+(84 runner lib tests; new: 16 hsl, 1 snapshot).
+
+**Not modelled (D16):** HSL coin mode (config refused), panic-marker
+reconstruction, the production protective-panic input path (red
+supervision runs through normal planning with `panic` overrides), operator
+runtime forced modes; `live::realized_pnl_cumsum` does not apply the
+zero-fee fallback yet (SPEC 5.2 follow-up).
+
+**Next action:** P5.2 shadow run with an HSL-enabled `unified` config to
+see the runner's `initialize_hsl` against a live fill history; apply
+`FeePolicy` to `realized_pnl_cumsum`; then the entry-cooldown
+position-delta guard.
+
 ## 2026-09-08 (worktree agent) — P5.1 closed: mock exchange + `pb-mockrun`, six runs identical in requests and account state
 
 **Changed:** new `crates/runner/src/mock_exchange.rs`: `Scenario` (scripted

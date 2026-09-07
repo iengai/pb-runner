@@ -9,10 +9,11 @@
 //! Cross-cycle state the Python bot keeps privately and the builder needs is
 //! carried in [`CycleState`] (SPEC section 8): the previous engine output's
 //! `PB_modes`, the dynamic forager eligibility of the previous cycle, the
-//! close-EMA carry-forward cache and the exchange-unavailable cooldown set.
+//! close-EMA carry-forward cache, the exchange-unavailable cooldown set and
+//! the HSL side modes (`hsl.rs`, SPEC 2.3 step 1).
 //!
-//! Not reproduced (documented in SPEC section 8): HSL-driven modes, operator
-//! runtime forced modes, the EMA-entry-cancellation order keys, the cached
+//! Not reproduced (documented in SPEC section 8): operator runtime forced
+//! modes, HSL coin mode, the EMA-entry-cancellation order keys, the cached
 //! forager-metric fallback and the forager stale-tail projection.
 
 use crate::bot_params::{ConfigView, PSIDES};
@@ -20,6 +21,7 @@ use crate::emas::{
     self, open_tail_gap, open_tail_rows, projected_ema, Candle, GapPolicy, Metric, ONE_HOUR_MS,
     ONE_MIN_MS,
 };
+use crate::hsl::HslModes;
 use anyhow::{anyhow, bail, Result};
 use passivbot_rust::entries::calc_min_entry_qty;
 use passivbot_rust::types::{ExchangeParams, TrailingPriceBundle};
@@ -154,6 +156,15 @@ pub struct CycleState {
     /// `_orchestrator_prev_close_ema[symbol][span] = (value, read_ts_ms)`
     /// (SPEC 3.3 carry-forward); spans keyed by bit pattern.
     pub prev_close_ema: BTreeMap<String, BTreeMap<u64, (f64, u64)>>,
+    /// HSL side modes of this cycle (`hsl::HslState::modes`, SPEC 2.3 step
+    /// 1 and `get_forced_PB_mode(pside)`); set by the owner of the HSL state
+    /// after `_equity_hard_stop_check`, before `build`.
+    pub hsl: HslModes,
+    /// `set(self.positions)`: every symbol that ever entered the planning
+    /// universe (zero-size entries are never evicted, SPEC 2.1), so a side
+    /// blocked later by HSL keeps its candidates in the input. Extended by
+    /// `build`.
+    pub known_symbols: BTreeSet<String>,
 }
 
 type Modes = BTreeMap<&'static str, Option<String>>;
@@ -302,7 +313,10 @@ pub struct SnapshotBuilder<'a> {
     cfg: &'a ConfigView,
     approved: BTreeMap<&'static str, BTreeSet<String>>,
     auto_gs: bool,
+    /// Config `live.forced_mode_<pside>` (expanded).
     forced_mode: BTreeMap<&'static str, Option<String>>,
+    /// HSL side modes of the cycle (`with_hsl`).
+    hsl: HslModes,
     /// `_close_ema_fallback_max_age_ms()`.
     close_ema_fallback_max_age_ms: u64,
     /// `_active_candle_tail_gap_max_ms()`.
@@ -418,9 +432,28 @@ impl<'a> SnapshotBuilder<'a> {
             approved,
             auto_gs,
             forced_mode,
+            hsl: HslModes::default(),
             close_ema_fallback_max_age_ms: close_ema_fallback_max_age_ms(cfg),
             tail_gap_max_ms: active_candle_tail_gap_max_ms(cfg),
         })
+    }
+
+    /// Install the cycle's HSL side modes (`CycleState.hsl`): they decide
+    /// `_orchestrator_mode_override` step 1 and, through
+    /// `get_forced_PB_mode(pside)`, the universe (`_pside_blocks_new_entries`);
+    /// `is_forager_mode` only reads the configured forced mode.
+    pub fn with_hsl(mut self, hsl: &HslModes) -> Self {
+        self.hsl = hsl.clone();
+        self
+    }
+
+    /// `get_forced_PB_mode(pside)` with `symbol = None` (pb:10895): HSL red
+    /// (`panic`) or halted (`graceful_stop`) first, else the config mode.
+    fn side_forced_mode(&self, pside: &str) -> Option<&str> {
+        self.hsl
+            .side(pside)
+            .side_forced_mode()
+            .or(self.forced_mode[pside].as_deref())
     }
 
     /// `get_max_n_positions(pside)`: `max(0, round(min(n_positions, len(approved))))`.
@@ -554,13 +587,15 @@ impl<'a> SnapshotBuilder<'a> {
         self.approved[pside].contains(symbol)
     }
 
+    /// `_pside_blocks_new_entries` (pb:16931).
     fn pside_blocks_new_entries(&self, pside: &str) -> bool {
-        self.forced_mode[pside]
-            .as_deref()
+        self.side_forced_mode(pside)
             .is_some_and(|m| STOP_MODES.contains(&m))
     }
 
-    /// `is_forager_mode(pside)`.
+    /// `is_forager_mode(pside)` (pb:8243): only the *configured* forced mode
+    /// turns forager off; an HSL panic/halted side keeps its forager flag
+    /// (its candidates just drop out of the universe).
     pub fn is_forager_mode(&self, pside: &str) -> Result<bool> {
         if !self.cfg.is_pside_enabled(pside)? || self.forced_mode[pside].is_some() {
             return Ok(false);
@@ -570,11 +605,12 @@ impl<'a> SnapshotBuilder<'a> {
     }
 
     /// `_build_live_symbol_universe`: sorted union of positions, open orders,
+    /// symbols already known to `self.positions` (`known`, SPEC 2.1),
     /// override coins and the approved set of every non-blocked side.
-    pub fn universe(&self, states: &[SymbolState]) -> Vec<String> {
+    pub fn universe(&self, states: &[SymbolState], known: &BTreeSet<String>) -> Vec<String> {
         let mut set: BTreeSet<String> = BTreeSet::new();
         for s in states {
-            if s.has_position() || s.has_open_order() {
+            if s.has_position() || s.has_open_order() || known.contains(&s.symbol) {
                 set.insert(s.symbol.clone());
             }
         }
@@ -621,9 +657,17 @@ impl<'a> SnapshotBuilder<'a> {
         }
     }
 
-    /// `_orchestrator_mode_override` steps 4-7 (HSL, runtime overrides and
-    /// exchange cooldowns are not modelled).
+    /// `_orchestrator_mode_override` steps 1 and 4-7 (HSL account-level
+    /// modes and config forced modes; coin-mode replay, operator runtime
+    /// overrides and `ineligible_symbols` are not modelled; exchange
+    /// cooldowns are applied by `build`).
     pub fn mode_override(&self, pside: &str, s: &SymbolState) -> Result<Option<String>> {
+        // Step 1: HSL (`_equity_hard_stop_enabled(pside)`): red -> panic,
+        // halted -> `_equity_hard_stop_halted_mode`, orange -> its mode.
+        let side_size = s.side(pside).position_size;
+        if let Some(m) = self.hsl.side(pside).symbol_override(side_size != 0.0) {
+            return Ok(Some(m));
+        }
         let coin = s.symbol.split('/').next().unwrap_or(&s.symbol);
         let per_symbol = self
             .cfg
@@ -818,7 +862,7 @@ impl<'a> SnapshotBuilder<'a> {
         let now_ms = account.timestamp_ms;
         let mut next_dynamic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut mode_overrides: Vec<(Option<String>, Option<String>)> = Vec::new();
-        let symbols = self.universe(states);
+        let symbols = self.universe(states, &cycle.known_symbols);
         let by_symbol: BTreeMap<&str, &SymbolState> =
             states.iter().map(|s| (s.symbol.as_str(), s)).collect();
         let forager_long = self.is_forager_mode("long")?;
@@ -996,6 +1040,11 @@ impl<'a> SnapshotBuilder<'a> {
                         }
                     }
                 }
+                // `fetch_required_map(sym, need_h1_lr_spans, ..., "h1_log_range")`
+                // raises `MissingRequiredEma` when any span is short of
+                // history, and `load_symbol_bundle` then keeps `h1 = {}`: the
+                // 1h map is all-or-nothing.
+                let mut h1_missing = false;
                 for k in &spans.h1_lr {
                     match emas::latest_ema(
                         &h,
@@ -1008,8 +1057,12 @@ impl<'a> SnapshotBuilder<'a> {
                         Some(v) => {
                             h1_lr.insert(*k, v);
                         }
-                        None => missing_required = true,
+                        None => h1_missing = true,
                     }
+                }
+                if h1_missing {
+                    missing_required = true;
+                    h1_lr.clear();
                 }
                 if !vol_projected {
                     for k in &m1_volume_spans {
@@ -1195,6 +1248,7 @@ impl<'a> SnapshotBuilder<'a> {
             },
         });
         cycle.dynamic_forager_eligibility = next_dynamic;
+        cycle.known_symbols.extend(symbols.iter().cloned());
         Ok(Snapshot {
             input,
             symbols,
@@ -1346,7 +1400,7 @@ mod tests {
 
     fn states_all(builder: &SnapshotBuilder<'_>, c: &[Candle]) -> Vec<SymbolState> {
         builder
-            .universe(&[])
+            .universe(&[], &BTreeSet::new())
             .iter()
             .map(|s| state(s, c.to_vec(), 0.0, false))
             .collect()
@@ -1444,7 +1498,7 @@ mod tests {
             states[0] = state(ada, Vec::new(), pos, order);
             let mut cycle = CycleState::default();
             if let Some(m) = pb {
-                for s in builder.universe(&[]) {
+                for s in builder.universe(&[], &BTreeSet::new()) {
                     let mode = if s == ada { m } else { "graceful_stop" };
                     cycle.pb_modes.insert((s, "long".into()), mode.into());
                 }
@@ -1667,7 +1721,131 @@ mod tests {
         let cfg2 = public_config(|v| v["live"]["forced_mode_long"] = Value::from("graceful_stop"));
         let b2 = SnapshotBuilder::new(&cfg2).unwrap();
         // only the coin_overrides symbols remain (pb:16941-16953)
-        assert_eq!(b2.universe(&[]), ["DOGE/USDT:USDT", "XRP/USDT:USDT"]);
+        assert_eq!(
+            b2.universe(&[], &BTreeSet::new()),
+            ["DOGE/USDT:USDT", "XRP/USDT:USDT"]
+        );
         assert!(!b2.is_forager_mode("long").unwrap());
+    }
+
+    #[test]
+    fn hsl_side_modes_override_step_one_and_keep_known_symbols() {
+        use crate::hsl::{CooldownPositionPolicy, HslModes, HslSideMode};
+        let cfg = public_config(|v| {
+            v["coin_overrides"]["ADA"]["live"]["forced_mode_long"] = Value::from("gs");
+        });
+        let builder = SnapshotBuilder::new(&cfg).unwrap();
+        let c = warm(&builder, NOW);
+        let mut states = states_all(&builder, &c);
+        states[0].long.position_size = 100.0; // ADA holds a long
+        let with = |mode: HslSideMode| {
+            let modes = HslModes {
+                sides: [mode, HslSideMode::None],
+            };
+            SnapshotBuilder::new(&cfg).unwrap().with_hsl(&modes)
+        };
+
+        // Red latch: every long is `panic`, before the config forced mode;
+        // the side blocks new entries (universe drops its approved set,
+        // known symbols stay) while the forager flag follows the config.
+        let b = with(HslSideMode::Panic);
+        assert_eq!(
+            b.mode_override("long", &states[0]).unwrap().as_deref(),
+            Some("panic")
+        );
+        assert_eq!(
+            b.mode_override("long", &states[1]).unwrap().as_deref(),
+            Some("panic")
+        );
+        // the other side is untouched
+        assert_eq!(
+            b.mode_override("short", &states[1]).unwrap(),
+            builder.mode_override("short", &states[1]).unwrap()
+        );
+        assert_eq!(
+            b.is_forager_mode("long").unwrap(),
+            builder.is_forager_mode("long").unwrap()
+        );
+        // only the coin_overrides symbols remain ...
+        assert_eq!(
+            b.universe(&[], &BTreeSet::new()),
+            ["ADA/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
+        );
+        // ... plus the held ADA and whatever `self.positions` already knows
+        let known: BTreeSet<String> = ["ETH/USDT:USDT".to_string()].into_iter().collect();
+        assert_eq!(
+            b.universe(&states, &known),
+            [
+                "ADA/USDT:USDT",
+                "DOGE/USDT:USDT",
+                "ETH/USDT:USDT",
+                "XRP/USDT:USDT"
+            ]
+        );
+        // a fresh cycle state only knows the override coins + held symbols;
+        // once the symbols were seen (a previous cycle) they all stay
+        let mut cycle = CycleState::default();
+        let snap = b.build(&account(NOW), &states, &mut cycle).unwrap();
+        assert_eq!(snap.symbols.len(), 3);
+        assert_eq!(cycle.known_symbols.len(), 3);
+        cycle.known_symbols = states.iter().map(|s| s.symbol.clone()).collect();
+        let snap = b.build(&account(NOW), &states, &mut cycle).unwrap();
+        assert_eq!(snap.symbols.len(), states.len());
+        for i in 0..snap.symbols.len() {
+            assert_eq!(snap.input["symbols"][i]["long"]["mode"], "panic");
+        }
+
+        // Halted: `_equity_hard_stop_halted_mode` per symbol -- the cooldown
+        // policy for symbols with a position, `graceful_stop` for flat ones;
+        // an unresolved residue forces `panic` on held symbols.
+        let b = with(HslSideMode::Halted {
+            policy: CooldownPositionPolicy::TpOnly,
+            unresolved_residue: false,
+        });
+        assert_eq!(
+            b.mode_override("long", &states[0]).unwrap().as_deref(),
+            Some("tp_only")
+        );
+        assert_eq!(
+            b.mode_override("long", &states[1]).unwrap().as_deref(),
+            Some("graceful_stop")
+        );
+        assert_eq!(
+            b.universe(&[], &BTreeSet::new()),
+            ["ADA/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
+        );
+        let b = with(HslSideMode::Halted {
+            policy: CooldownPositionPolicy::TpOnly,
+            unresolved_residue: true,
+        });
+        assert_eq!(
+            b.mode_override("long", &states[0]).unwrap().as_deref(),
+            Some("panic")
+        );
+
+        // Orange: the configured tier mode on every symbol, but no forced
+        // side mode -> universe and forager untouched.
+        let b = with(HslSideMode::Orange(
+            "tp_only_with_active_entry_cancellation".to_string(),
+        ));
+        assert_eq!(
+            b.mode_override("long", &states[1]).unwrap().as_deref(),
+            Some("tp_only_with_active_entry_cancellation")
+        );
+        assert_eq!(
+            b.universe(&[], &BTreeSet::new()),
+            builder.universe(&[], &BTreeSet::new())
+        );
+        assert_eq!(
+            b.is_forager_mode("long").unwrap(),
+            builder.is_forager_mode("long").unwrap()
+        );
+
+        // No HSL mode: the config forced mode applies as before.
+        let b = with(HslSideMode::None);
+        assert_eq!(
+            b.mode_override("long", &states[0]).unwrap().as_deref(),
+            Some("graceful_stop")
+        );
     }
 }

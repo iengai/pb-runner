@@ -120,6 +120,30 @@ It exercises `_apply_entry_eligibility_mode` with per-symbol config modes on
 held positions: graceful_stop (closes + grid re-entries, no initials),
 tp_only (closes only), manual (no orders).
 
+HSL set (2026-09-08): `tests/fixtures/configs/fake_v8/grid_v7_hsl.json` is
+`grid_v7.json` with `bot.long.hsl.enabled = true`, `red_threshold 0.06`,
+`ema_span_minutes 15`, `cooldown_minutes_after_red 120`,
+`no_restart_drawdown_threshold 1`, `live.hsl_signal_mode = unified`,
+`live.hsl_position_during_cooldown_policy = panic`, recorded with
+`--boot-index 102000 --max-steps 400 --seed-positions 3 --seed-we 0.3` into
+`.local/fake_v8_hsl` (boot at 2025-10-10 20:00 UTC, right before the
+Oct 10 crash: ADA 0.767 -> 0.585, DOGE 0.232 -> 0.181 within two hours).
+`tools/fake_live_clock.py` writes `hsl_trace.jsonl` next to the recordings
+when `PB_RUNNER_HSL_TRACE` is set (`record_fake_v8.py` sets it): one JSON
+line per HSL event (`init`, `check_begin`/`check_end`, `sample`,
+`supervisor_begin`/`counts`/`sync_flat`/`supervisor_end`, `finalize`,
+`reset`, `cooldown_handle`, `compute` with the input hash and the symbol
+list) with the Python inputs and side states; `fills.json` is the fake
+exchange's fill ledger. `select_fixtures.py` keeps both (trace compacted:
+`sample` records and `before` states dropped) plus a `scenario.json`
+without the candle file list, treats HSL state changes as transitions, and
+`pb-snapcheck` replays the trace through `hsl.rs` (D16). Two harness
+properties to know: the fill ledger is never refreshed after boot (Python's
+`realized_pnl` stays at the boot value; the runner reads every fill, the
+check reports those deviations as "stale ledger"), and the boot index
+leaves only 1690 h of history, so the 1909 h log-range span is short and
+every 1h EMA map is empty (Python's all-or-nothing rule, now ported).
+
 ### B. Real market data (local, NOT committable)
 
 Running the real bot locally needs a trading key, which we do not have on the

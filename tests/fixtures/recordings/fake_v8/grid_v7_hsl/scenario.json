@@ -1,0 +1,152 @@
+{
+  "name": "grid_v7_hsl",
+  "tick_interval_seconds": 60,
+  "boot_index": 102000,
+  "account": {
+    "balance": 1000.0,
+    "positions": [
+      {
+        "symbol": "ADA/USDT:USDT",
+        "position_side": "long",
+        "qty": 391.0,
+        "price": 0.782136
+      },
+      {
+        "symbol": "BTC/USDT:USDT",
+        "position_side": "long",
+        "qty": 0.002,
+        "price": 119001.258
+      },
+      {
+        "symbol": "DOGE/USDT:USDT",
+        "position_side": "long",
+        "qty": 1295.0,
+        "price": 0.2362014
+      }
+    ],
+    "fills": [
+      {
+        "id": "1",
+        "order_id": "1000",
+        "symbol": "ADA/USDT:USDT",
+        "side": "buy",
+        "position_side": "long",
+        "amount": 391.0,
+        "price": 0.782136,
+        "timestamp": 1760126340000
+      },
+      {
+        "id": "2",
+        "order_id": "1001",
+        "symbol": "BTC/USDT:USDT",
+        "side": "buy",
+        "position_side": "long",
+        "amount": 0.002,
+        "price": 119001.258,
+        "timestamp": 1760126340000
+      },
+      {
+        "id": "3",
+        "order_id": "1002",
+        "symbol": "DOGE/USDT:USDT",
+        "side": "buy",
+        "position_side": "long",
+        "amount": 1295.0,
+        "price": 0.2362014,
+        "timestamp": 1760126340000
+      }
+    ]
+  },
+  "symbols": {
+    "ADA/USDT:USDT": {
+      "qty_step": 1.0,
+      "price_step": 0.0001,
+      "min_qty": 1.0,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "BTC/USDT:USDT": {
+      "qty_step": 0.001,
+      "price_step": 0.1,
+      "min_qty": 0.001,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "DOGE/USDT:USDT": {
+      "qty_step": 1.0,
+      "price_step": 1e-05,
+      "min_qty": 1.0,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "DOT/USDT:USDT": {
+      "qty_step": 0.1,
+      "price_step": 0.0001,
+      "min_qty": 0.1,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "ETH/USDT:USDT": {
+      "qty_step": 0.01,
+      "price_step": 0.01,
+      "min_qty": 0.01,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "HBAR/USDT:USDT": {
+      "qty_step": 1.0,
+      "price_step": 1e-05,
+      "min_qty": 1.0,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "SOL/USDT:USDT": {
+      "qty_step": 0.1,
+      "price_step": 0.01,
+      "min_qty": 0.1,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "TRX/USDT:USDT": {
+      "qty_step": 1.0,
+      "price_step": 0.0001,
+      "min_qty": 1.0,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "XLM/USDT:USDT": {
+      "qty_step": 1.0,
+      "price_step": 0.0001,
+      "min_qty": 1.0,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    },
+    "XRP/USDT:USDT": {
+      "qty_step": 0.1,
+      "price_step": 0.0001,
+      "min_qty": 0.1,
+      "min_cost": 5.0,
+      "contractSize": 1.0,
+      "maker_fee": 0.0001,
+      "taker_fee": 0.0006
+    }
+  }
+}

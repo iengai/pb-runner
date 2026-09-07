@@ -11,6 +11,10 @@ use crate::bot_params::{ConfigView, PSIDES};
 use crate::churn::{self, ChurnGate, ChurnParams};
 use crate::cooldown::ExchangeCooldowns;
 use crate::emas::{aggregate_1h, Candle, ONE_HOUR_MS, ONE_MIN_MS};
+use crate::hsl::{
+    balance_equity_timeline, hsl_pnl, realized_pnl_now, CycleInputs, FeePolicy, HslConfig, HslFill,
+    HslPosition, HslState, RedObservation, Supervision, LONG, SHORT,
+};
 use crate::market_filter::{
     fetch_max_age_ms, MarketFilter, MarketSnapshot, SnapshotProvider,
     LIVE_MARKET_SNAPSHOT_MAX_AGE_MS,
@@ -119,8 +123,12 @@ pub struct LiveRunner {
     /// `PB_modes[(symbol, pside)]` from the previous engine output (SPEC 1.6).
     pb_modes: HashMap<(String, PositionSide), PbMode>,
     /// Snapshot builder cross-cycle state (SNAPSHOT_SPEC 8): `PB_modes`,
-    /// dynamic forager eligibility, close-EMA carry-forward, cooled symbols.
+    /// dynamic forager eligibility, close-EMA carry-forward, cooled symbols,
+    /// HSL side modes.
     cycle: CycleState,
+    /// Equity hard-stop-loss state machine (SNAPSHOT_SPEC 2.3 step 1,
+    /// `hsl.rs`); `None` when no side enables it.
+    hsl: Option<HslState>,
     /// Exchange-unavailable symbol cooldowns fed by write failures.
     cooldowns: ExchangeCooldowns,
     /// Order churn gate history and create-attempt window (SPEC 2.9).
@@ -165,6 +173,8 @@ impl LiveRunner {
             .unwrap_or(0.02);
         let churn = ChurnGate::new(ChurnParams::from_config(&cfg));
         let market_filter = MarketFilter::from_config(&cfg)?;
+        let hsl_cfg = HslConfig::from_config(&cfg)?;
+        let hsl = hsl_cfg.any_enabled().then(|| HslState::new(hsl_cfg));
         Ok(Self {
             cfg,
             client,
@@ -178,6 +188,7 @@ impl LiveRunner {
             warmup_1h_hours: 0,
             pb_modes: HashMap::new(),
             cycle: CycleState::default(),
+            hsl,
             cooldowns: ExchangeCooldowns::new(),
             churn,
             snapshots: SnapshotProvider::new(),
@@ -344,7 +355,69 @@ impl LiveRunner {
             closed_pnl = self.closed_pnl.len(),
             "fill history loaded"
         );
+        if self.hsl.is_some() {
+            self.initialize_hsl(now).await?;
+        }
         Ok(symbols)
+    }
+
+    /// `_equity_hard_stop_initialize_from_history` at start-up (D16): the
+    /// Python bot never reads a persisted HSL state for decisions, it
+    /// replays the balance/equity timeline from the fill history and 1m
+    /// closes over `pnls_max_lookback_days`. The runner does the same from
+    /// its warmup buffers; a position whose symbol has no 1m candle at a
+    /// timeline minute keeps its previous close (carry-forward, like the
+    /// Python timeline), and the present sample uses the newest 1m close.
+    async fn initialize_hsl(&mut self, now: u64) -> Result<()> {
+        let balance = self.client.fetch_balance().await?.total_usdt;
+        let positions = hsl_positions(&self.client.fetch_positions().await?);
+        let Some(hsl) = self.hsl.as_mut() else {
+            return Ok(());
+        };
+        let lookback = hsl.cfg.lookback;
+        let start = lookback.event_history_start_ms(now);
+        let candles = &self.candles;
+        let markets = &self.markets;
+        let close_at = |symbol: &str, minute: u64| -> Option<f64> {
+            let m1 = &candles.get(symbol)?.m1;
+            let i = m1.partition_point(|c| (c[0] as u64) < minute);
+            m1.get(i).filter(|c| c[0] as u64 == minute).map(|c| c[4])
+        };
+        let c_mult = |symbol: &str| markets.get(symbol).map_or(1.0, |m| m.contract_size);
+        let fills = hsl_fills(&self.fills, &self.closed_pnl, &hsl.cfg.fee, &c_mult);
+        let qty_step = |symbol: &str| markets.get(symbol).map_or(0.0, |m| m.qty_step);
+        let known = |symbol: &str| markets.contains_key(symbol);
+        let timeline = balance_equity_timeline(
+            now, balance, lookback, &fills, &positions, &close_at, &c_mult, &qty_step, &known,
+        );
+        let latest = |symbol: &str| candles.get(symbol).and_then(|b| b.m1.last()).map(|c| c[4]);
+        let mut unrealized = [0.0; 2];
+        for p in &positions {
+            let Some(price) = latest(&p.symbol) else {
+                continue;
+            };
+            unrealized[p.pside] += hsl_pnl(p.pside, p.price, price, p.size, c_mult(&p.symbol));
+        }
+        hsl.initialize_from_history(
+            now,
+            balance,
+            &fills,
+            &timeline,
+            realized_pnl_now(&fills, start, None),
+            [
+                realized_pnl_now(&fills, start, Some(LONG)),
+                realized_pnl_now(&fills, start, Some(SHORT)),
+            ],
+            unrealized,
+        )?;
+        self.cycle.hsl = hsl.modes();
+        tracing::info!(
+            timeline_rows = timeline.len(),
+            long = ?self.cycle.hsl.sides[LONG],
+            short = ?self.cycle.hsl.sides[SHORT],
+            "hsl initialized from history"
+        );
+        Ok(())
     }
 
     /// Startup exchange configuration (Python `update_exchange_config*`):
@@ -433,13 +506,61 @@ impl LiveRunner {
             )
             .await
             .context("planning market snapshots")?;
-        let builder = SnapshotBuilder::new(&self.cfg)?;
 
         // Balance hysteresis (SPEC 5.1).
         let raw = balance.total_usdt;
         if !raw.is_finite() {
             bail!("exchange balance is not finite");
         }
+        // HSL (SNAPSHOT_SPEC 2.3 step 1): sample the raw balance and the
+        // realized/unrealized pnl, then run the red supervisor on the sides
+        // whose red latch is active; the side modes go into the snapshot.
+        if let Some(hsl) = self.hsl.as_mut() {
+            let markets = &self.markets;
+            let c_mult = |symbol: &str| markets.get(symbol).map_or(1.0, |m| m.contract_size);
+            let fills = hsl_fills(&self.fills, &self.closed_pnl, &hsl.cfg.fee, &c_mult);
+            let hsl_pos = hsl_positions(&positions);
+            let start = hsl.cfg.lookback.event_history_start_ms(now);
+            let mut unrealized = [0.0; 2];
+            for p in &hsl_pos {
+                let Some(t) = planning.get(&p.symbol) else {
+                    continue;
+                };
+                unrealized[p.pside] += hsl_pnl(p.pside, p.price, t.last, p.size, c_mult(&p.symbol));
+            }
+            let inp = CycleInputs {
+                now_ms: now,
+                balance: raw,
+                realized_pnl_total: realized_pnl_now(&fills, start, None),
+                realized_pnl: [
+                    realized_pnl_now(&fills, start, Some(LONG)),
+                    realized_pnl_now(&fills, start, Some(SHORT)),
+                ],
+                unrealized_pnl: unrealized,
+                positions: &hsl_pos,
+                fills: &fills,
+            };
+            hsl.check(&inp)?;
+            for pside in [LONG, SHORT] {
+                if !hsl.red_active(pside) {
+                    continue;
+                }
+                let obs = hsl_observation(&positions, &orders, pside);
+                let step = hsl.supervise_red(pside, obs, &inp, Supervision::Production)?;
+                tracing::warn!(
+                    pside = PSIDES[pside],
+                    finalized = step.finalized,
+                    panic = step.needs_panic_execution,
+                    "hsl red supervisor"
+                );
+            }
+            let modes = hsl.modes();
+            if modes != self.cycle.hsl {
+                tracing::warn!(long = ?modes.sides[LONG], short = ?modes.sides[SHORT], "hsl modes");
+            }
+            self.cycle.hsl = modes;
+        }
+        let builder = SnapshotBuilder::new(&self.cfg)?.with_hsl(&self.cycle.hsl);
         let snapped = if self.prev_hysteresis_balance == 0.0 {
             raw
         } else {
@@ -804,6 +925,105 @@ pub fn realized_pnl_cumsum(fills: &[Fill], closed: &[ClosedPnl], start_ms: u64) 
     } else {
         (0.0, 0.0)
     }
+}
+
+fn pside_idx(pside: PositionSide) -> usize {
+    match pside {
+        PositionSide::Long => LONG,
+        PositionSide::Short => SHORT,
+    }
+}
+
+/// HSL fill events (`_equity_hard_stop_fill_events`): the same ledger the
+/// realized-pnl cumsum reads (SPEC 5.2) with the `closedPnl` of an order
+/// attached to its last fill and the fill manager's signed `fee_paid`
+/// ([`FeePolicy`]), ordered by (timestamp, id) like the fill manager.
+pub fn hsl_fills(
+    fills: &[Fill],
+    closed: &[ClosedPnl],
+    fee: &FeePolicy,
+    c_mult: &dyn Fn(&str) -> f64,
+) -> Vec<HslFill> {
+    let mut pnl_by_order: HashMap<&str, f64> = HashMap::new();
+    for p in closed {
+        *pnl_by_order.entry(p.order_id.as_str()).or_default() += p.pnl;
+    }
+    let mut last_fill_of_order: HashMap<&str, &str> = HashMap::new();
+    for f in fills {
+        last_fill_of_order.insert(f.order_id.as_str(), f.id.as_str());
+    }
+    let mut out: Vec<(u64, &str, HslFill)> = fills
+        .iter()
+        .filter(|f| f.qty > 0.0 && f.price > 0.0)
+        .map(|f| {
+            let pnl = if last_fill_of_order.get(f.order_id.as_str()) == Some(&f.id.as_str()) {
+                pnl_by_order
+                    .get(f.order_id.as_str())
+                    .copied()
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let fee_paid = fee.signed_fee_paid(f.fee, f.qty.abs() * f.price * c_mult(&f.symbol));
+            let pside = pside_idx(f.pside);
+            (
+                f.timestamp_ms,
+                f.id.as_str(),
+                HslFill {
+                    timestamp_ms: f.timestamp_ms,
+                    symbol: f.symbol.clone(),
+                    pside,
+                    qty: f.qty.abs(),
+                    price: f.price,
+                    increase: (pside == LONG) == (f.side == Side::Buy),
+                    pnl,
+                    fee_paid,
+                },
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    out.into_iter().map(|r| r.2).collect()
+}
+
+pub fn hsl_positions(positions: &[Position]) -> Vec<HslPosition> {
+    positions
+        .iter()
+        .filter(|p| p.size != 0.0)
+        .map(|p| HslPosition {
+            symbol: p.symbol.clone(),
+            pside: pside_idx(p.pside),
+            size: p.size,
+            price: p.entry_price,
+        })
+        .collect()
+}
+
+/// `_equity_hard_stop_count_open_positions` +
+/// `_equity_hard_stop_count_blocking_open_orders` for one side: open
+/// positions, entry (non-reduce-only) orders and reduce-only orders whose
+/// custom id does not mark a panic close.
+pub fn hsl_observation(
+    positions: &[Position],
+    orders: &[OpenOrder],
+    pside: usize,
+) -> RedObservation {
+    let mut obs = RedObservation {
+        n_positions: positions
+            .iter()
+            .filter(|p| pside_idx(p.pside) == pside && p.size != 0.0)
+            .count(),
+        ..RedObservation::default()
+    };
+    for o in orders.iter().filter(|o| pside_idx(o.pside) == pside) {
+        if !o.reduce_only {
+            obs.entry_orders += 1;
+        } else if !reconcile::pb_order_type_from_custom_id(o.client_id.as_deref()).contains("panic")
+        {
+            obs.nonpanic_close_orders += 1;
+        }
+    }
+    obs
 }
 
 /// SPEC 4.4 `fill_ts` part: newest fill that increased the position on

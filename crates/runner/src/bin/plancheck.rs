@@ -106,7 +106,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = ConfigView::new(parse_exact(&std::fs::read_to_string(&args.config)?)?)?;
     let builder = SnapshotBuilder::new(&cfg)?;
-    let symbols = builder.universe(&[]);
+    let symbols = builder.universe(&[], &Default::default());
     let hedge_mode = cfg
         .live("hedge_mode")
         .map(|v| v.as_bool().unwrap_or(true))

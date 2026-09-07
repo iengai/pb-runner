@@ -178,6 +178,10 @@ def build_scenario(name: str, coins: list[str], candles_dir: Path, dates: list[s
 
 def clean_fake_user_state(checkout: Path, user: str) -> None:
     shutil.rmtree(checkout / "caches" / "fill_events" / "fake" / user, ignore_errors=True)
+    # HSL latch files and the replay-matrix cache (hsl:1361): a stale cache
+    # would let the start-up replay reuse a previous run's equity series.
+    shutil.rmtree(checkout / "caches" / "equity_hard_stop" / "fake" / "replay_matrix" / user,
+                  ignore_errors=True)
     for pside in ("long", "short"):
         latch = checkout / "caches" / "equity_hard_stop" / "fake" / f"{user}_{pside}.json"
         if latch.exists():
@@ -237,9 +241,15 @@ def run_one(args, name: str, config_path: Path) -> dict:
 
     clean_fake_user_state(checkout, user)
     artifacts = out_dir / "artifacts"
+    if artifacts.exists():
+        shutil.rmtree(artifacts)
+    rec_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["PYTHONPATH"] = str(checkout / "src")
     env["PB_RUNNER_RECORD_DIR"] = str(rec_dir)
+    # HSL state-machine trace (fake_live_clock.py) next to the recordings;
+    # empty when HSL is disabled, consumed by `pb-snapcheck --hsl-trace`.
+    env["PB_RUNNER_HSL_TRACE"] = str(rec_dir / "hsl_trace.jsonl")
     wrapper = Path(__file__).resolve().with_name("fake_live_clock.py")
     cmd = [args.python, str(wrapper), str(cfg_out), str(scn_out),
            "--max-steps", str(args.max_steps), "--output-dir", str(artifacts),
@@ -259,6 +269,15 @@ def run_one(args, name: str, config_path: Path) -> dict:
         raise SystemExit(f"[{name}] harness failed with exit code {proc.returncode}")
     recorded = len(list(rec_dir.glob("*.in.json"))) if rec_dir.exists() else 0
     kept, dropped = dedupe_recordings(rec_dir) if rec_dir.exists() else (0, 0)
+    # The fake exchange's fill ledger (harness artifact) is the fill history
+    # `pb-snapcheck` derives the HSL realized pnl from; keep it with the
+    # recordings so the committed fixture is self-contained.
+    hsl_trace = rec_dir / "hsl_trace.jsonl"
+    hsl_trace_lines = sum(1 for _ in hsl_trace.open(encoding="utf-8")) if hsl_trace.exists() else 0
+    if hsl_trace_lines == 0 and hsl_trace.exists():
+        hsl_trace.unlink()
+    for fills_path in artifacts.glob("*/fills.json"):
+        shutil.copyfile(fills_path, rec_dir / "fills.json")
 
     fingerprint = None
     for stamp in (checkout / "src").glob("passivbot_rust*.rust-src-sha256"):
@@ -284,6 +303,7 @@ def run_one(args, name: str, config_path: Path) -> dict:
         "calls_recorded": recorded,
         "unique_inputs_kept": kept,
         "duplicates_dropped": dropped,
+        "hsl_trace_lines": hsl_trace_lines,
         "harness_seconds": round(elapsed, 1),
         "recorded_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
