@@ -2,6 +2,47 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 -- a Bybit order field we send and the Python bot never has (D24)
+
+**What broke:** paper2 (`467146583`) closed its XRP long at 14:18:01 UTC and
+could not open another. Every cycle planned the same `entry_initial_normal_long`
+(`qty=1.6 price~1.408`, 2.25 USDT) and Bybit rejected every one with
+`110094 Order does not meet minimum order value 5USDT`. Ten per hour exhausts
+the error budget, so the bot restarted every ~3 minutes and was ~25 minutes
+from `max_n_restarts_per_day` and a code-30 exit the restart lambda would not
+have revived.
+
+**The first answer was wrong.** It reasoned -- correctly, at every step -- that
+ccxt leaves `limits.cost.min` unset for Bybit linear, so `min_cost` is 0.1, so
+`effective_min_cost` is 0.14 USDT, so `filter_by_min_effective_cost` cannot
+fire, so the Python bot would fail identically and the account was simply too
+small. It was overturned by one experiment: the Python 8.1.0 bot on the SAME
+account filled `1.6 @ 1.4084` -- the same 2.25 USDT -- twelve minutes later.
+
+**The actual difference,** from building ccxt's request offline and diffing:
+we send `reduceOnly`, the Python bot does not, and never has.
+`_build_order_params` returns exactly `{positionIdx, timeInForce, orderLinkId}`;
+closes are expressed by `positionIdx` alone, since in hedge mode a Sell on
+positionIdx 1 can only reduce the long. D11's inventory claimed `reduceOnly`
+was reproduced verbatim from the Python adapter; that line is now corrected.
+
+**Changed:** `order_body` drops the field. Reconciliation does not move --
+`normalize_open_order` already derives reduce-only from `(pside, side)` in
+hedge mode and ignores what the exchange reports, exactly as Python does.
+Workspace tests pass.
+
+**Not yet proven, and it matters:** that this field is what Bybit's validator
+branches on. The two attempts were twelve minutes apart, so an account-side
+change is not excluded by them alone. **Next action:** with paper2 flat, run
+the rs bot on the new build and watch whether a sub-5-USDT `entry_initial` is
+accepted. Until then that account cannot place an entry from the runner.
+
+**The gap this exposes:** all four harnesses replay recorded inputs and compare
+plans. A request body is not a plan, and nothing has ever compared the bytes we
+POST against the bytes ccxt would POST -- which is the parity check D11 wrote
+down for itself and never ran. Second finding in two days living in
+input/output acquisition rather than computation (D21 was the first).
+
 ## 2026-09-08 — deploys stop going through terraform (D23)
 
 **Why:** rolling out a runner fix meant editing `image_tag` in the pbtb-rust

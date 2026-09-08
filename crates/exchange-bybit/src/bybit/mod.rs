@@ -502,6 +502,16 @@ impl BybitClient {
     /// orderLinkId). ccxt sends `price` only for limit orders and refuses
     /// `postOnly` on market orders (`handle_post_only`), so a market order
     /// goes out as `orderType: Market`, `timeInForce: GTC`, no price.
+    ///
+    /// No `reduceOnly`, ever. `_build_order_params` returns exactly three
+    /// keys and that is not one of them, and ccxt only sets `reduceOnly`
+    /// itself on the trigger-order branch, so the Python bot's Bybit orders
+    /// -- closes included -- carry no such field. Closing is expressed by
+    /// `positionIdx` alone: in hedge mode a Sell on positionIdx 1 can only
+    /// reduce the long. We used to send `reduceOnly: <bool>`, believing it
+    /// matched (D11's inventory says so, wrongly); D24 has the account where
+    /// the two runtimes placed the same 2.25 USDT entry seconds apart and
+    /// only ours came back `110094 Order does not meet minimum order value`.
     fn order_body(&self, o: &NewOrder) -> Result<Value, ExchangeError> {
         let m = self.market(&o.symbol)?;
         let market = o.is_market();
@@ -513,7 +523,6 @@ impl BybitClient {
             "qty": parse::fmt_step(o.qty.abs(), m.qty_step),
             "timeInForce": if o.post_only && !market { "PostOnly" } else { "GTC" },
             "positionIdx": match o.pside { PositionSide::Long => 1, PositionSide::Short => 2 },
-            "reduceOnly": o.reduce_only,
             "orderLinkId": o.client_id,
         });
         if !market {
@@ -1032,7 +1041,7 @@ mod tests {
         let body = client.order_body(&o).unwrap();
         assert_eq!(
             body,
-            json!({"category":"linear","symbol":"ETHUSDT","side":"Buy","orderType":"Limit","qty":"0.05","price":"3814.26","timeInForce":"PostOnly","positionIdx":1,"reduceOnly":false,"orderLinkId":"x-pb-abc"})
+            json!({"category":"linear","symbol":"ETHUSDT","side":"Buy","orderType":"Limit","qty":"0.05","price":"3814.26","timeInForce":"PostOnly","positionIdx":1,"orderLinkId":"x-pb-abc"})
         );
         let sell = NewOrder {
             side: Side::Sell,
@@ -1043,8 +1052,10 @@ mod tests {
         };
         let body = client.order_body(&sell).unwrap();
         assert_eq!(body["timeInForce"], "GTC");
-        assert_eq!(body["reduceOnly"], true);
         assert_eq!(body["side"], "Sell");
+        // A close is a Sell on the long's positionIdx and nothing else; the
+        // Python bot never sends `reduceOnly` to Bybit, so neither do we.
+        assert!(body.get("reduceOnly").is_none());
         // Market order (engine `execution_type = market`): ccxt sends
         // `orderType: Market` without `price`, and never `PostOnly`.
         let market = NewOrder {
@@ -1057,7 +1068,7 @@ mod tests {
         let body = client.order_body(&market).unwrap();
         assert_eq!(
             body,
-            json!({"category":"linear","symbol":"ETHUSDT","side":"Sell","orderType":"Market","qty":"0.05","timeInForce":"GTC","positionIdx":1,"reduceOnly":true,"orderLinkId":"x-pb-abc"})
+            json!({"category":"linear","symbol":"ETHUSDT","side":"Sell","orderType":"Market","qty":"0.05","timeInForce":"GTC","positionIdx":1,"orderLinkId":"x-pb-abc"})
         );
         assert!(body.get("price").is_none());
     }

@@ -213,8 +213,9 @@ Consequences:
   contract size 1), UTA balance formula, `positionIdx` side mapping, ignored
   error codes 110025/110026/110043, "already gone" cancel codes (110001 and
   message patterns), order params (`positionIdx`, `timeInForce`
-  `PostOnly|GTC`, `orderLinkId`, `reduceOnly`, `orderType Limit`, qty/price
-  formatted with market precision), cursor pagination limits (200 / 50),
+  `PostOnly|GTC`, `orderLinkId`, `orderType Limit`, qty/price
+  formatted with market precision -- this line used to list `reduceOnly`
+  too, which was wrong: see D24), cursor pagination limits (200 / 50),
   kline `limit=1000` with at most 5 forward pages.
 - Numbers are parsed from Bybit's strings with `str::parse::<f64>`
   (correctly rounded, same as Python `float()`), never via serde_json floats.
@@ -920,3 +921,84 @@ fixes -- and the pin turned every fix into an infrastructure change.
      derived from that module -- so the smallest honest scope for this line
      is the three targets the RUNBOOK already lists, not the SSM parameter
      alone.
+
+## D24 (2026-09-08) Bybit orders carry no `reduceOnly`, because the Python bot's never have (corrects D11)
+
+1. **Symptom.** paper2 (`467146583`) closed its XRP long at 14:18:01 UTC and
+   never opened another. Every cycle from 14:18:07 on planned the same
+   `entry_initial_normal_long` -- `qty=1.6 price~1.408`, 2.25 USDT -- and
+   every one came back `110094 Order does not meet minimum order value
+   5USDT`. Ten in an hour exhausts the error budget, so the bot restarted
+   roughly every three minutes; `live.max_n_restarts_per_day = 10` would have
+   ended it with exit code 30 around 15:00, and the restart lambda only
+   revives memory kills.
+
+2. **The first diagnosis was wrong.** It ran: ccxt 4.5.66 leaves
+   `limits.cost.min` unset for Bybit linear markets (`bybit.py:2203`; only
+   the spot branch reads `minOrderAmt`), so passivbot's `min_costs[symbol]`
+   is `... or 0.1` (`ccxt_bot.py:1142`), so `effective_min_cost` for XRP is
+   0.1 x 1.408 = 0.14 USDT, so `filter_by_min_effective_cost` -- which is
+   `true` in this config and lives in the SHARED orchestrator we call --
+   compares 2.25 >= 0.14 and lets the order through. Conclusion: the Python
+   bot would spam the identical rejection, the account is simply too small
+   (initial entry = balance x TWEL x `initial_qty_pct` = balance x 5.51%, so
+   5 USDT needs a balance of ~91 against the ~42 it has), and the only fixes
+   were funding it or teaching the connector Bybit's `minNotionalValue`.
+   Every step of that is true. The conclusion was still wrong, and it is
+   recorded here so the reasoning is not repeated.
+
+3. **What killed it** was the one experiment worth more than all of the
+   source reading: the Python 8.1.0 bot was put on the same account twelve
+   minutes later, and at 14:34:29 UTC it logged
+   `[order] post XRP | buy long 1.6@1.4084 entry_initial_normal_long [new]`
+   followed at 14:34:32 by `[fill] ... +1.6 @ 1.4084`. Same account, same
+   key, same config object, same 2.25 USDT -- accepted and filled. Bybit does
+   not apply a flat 5 USDT floor to this account, so the difference is in the
+   request, not in the sizing.
+
+4. **The diff**, built from the pinned ccxt offline rather than guessed
+   (`create_order_request` on `XRP/USDT:USDT` with the params
+   `_build_order_params` actually returns):
+
+   ```
+   ccxt : {symbol, side:Buy, orderType:Limit, timeInForce:GTC,
+           price:"1.4077", category:linear, qty:"1.6", positionIdx:1,
+           orderLinkId}
+   ours : {category:linear, symbol, side:Buy, orderType:Limit, qty:"1.6",
+           timeInForce:GTC, positionIdx:1, reduceOnly:false, orderLinkId,
+           price:"1.4077"}
+   ```
+
+   One key differs. `exchanges/bybit.py::_build_order_params` returns exactly
+   `{positionIdx, timeInForce, orderLinkId}`, and ccxt sets `reduceOnly`
+   itself only on the trigger-order branch, so no passivbot Bybit order has
+   ever carried the field -- closes included. Closing is expressed by
+   `positionIdx` alone: in hedge mode a Sell on positionIdx 1 can only reduce
+   the long.
+
+5. **Changed:** `order_body` no longer emits `reduceOnly`. Nothing downstream
+   moves with it: `normalize_open_order` (reconcile.rs:207) already derives
+   reduce-only from `(pside, side)` in hedge mode and ignores what the
+   exchange reports, which is what Python does too, and `pside` still comes
+   from the `positionIdx` we keep sending.
+
+6. **What is proven and what is not.** Proven: the field is a divergence from
+   the Python bot's request, and the same order without it was accepted.
+   NOT proven: that this field is what Bybit's validator branches on. 110094's
+   exact trigger is undocumented, and the two attempts were twelve minutes
+   apart, so these two runs alone cannot exclude an account-side change in
+   between. The confirmation is cheap and specific -- put the rs runner back
+   on paper2 while it is flat and watch whether a sub-5-USDT
+   `entry_initial` is accepted -- and until it has run, this account is one
+   where the runner can place no entry at all.
+
+7. **Why four harnesses missed it.** diffcheck, snapcheck, plancheck and
+   mockrun all replay recorded inputs and compare PLANS. A request body is
+   not a plan. Nothing in the suite has ever compared the bytes we POST with
+   the bytes ccxt would POST -- which is precisely the check D11 wrote down
+   for itself ("record the Python bot's ccxt requests/responses for the
+   read-only abot account and compare against this client's requests") and
+   never ran. This is the second finding in two days whose hiding place was
+   input/output acquisition rather than computation (D21 was the first), and
+   the pattern is now explicit: the harnesses pin what the engine does with
+   an input, and nothing pins how the input or the order is carried.
