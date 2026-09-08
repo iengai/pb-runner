@@ -1,0 +1,151 @@
+name: image-build
+
+# Build the pb-runner container image (linux/arm64) and push it to ECR.
+# Does NOT deploy: the `8rs` task definition pins an image tag in the
+# pbtb-rust terraform, so rolling a build out stays a deliberate apply +
+# telebot-deploy + bot restart (pbtb-rust RUNBOOK "pb-runner runtime").
+#
+# Why this exists: the first images were built by hand on a dev box with
+# `docker buildx --platform linux/arm64`, i.e. rustc under QEMU -- 65 minutes,
+# and the trading image's supply chain ran through one laptop. A native arm64
+# runner builds the same thing in minutes.
+#
+# This repo is public. `workflow_dispatch` can only be triggered by someone
+# with write access, and the AWS role's trust policy pins `refs/heads/master`,
+# so a pull request -- including one from a fork -- can neither run this
+# workflow nor assume the role.
+
+# Manual only. Every push producing an image would pile up ECR tags nobody
+# rolls out; a build is worth doing when someone intends to deploy it. Run it
+# from the master branch -- the AWS role trusts no other ref.
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if an image for this source already exists'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write # OIDC -> assume the AWS build role
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPO: pb-runner
+  ENGINE: engine-v8
+
+jobs:
+  # Cheap gate on a standard runner: hash the build-relevant files and skip the
+  # arm build when ECR already has an image for exactly this source.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.hash.outputs.tag }}
+      needs_build: ${{ steps.decide.outputs.needs_build }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute source hash
+        id: hash
+        run: |
+          H='${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'docker/Dockerfile') }}'
+          [ -n "$H" ] || { echo "hashFiles matched nothing - refusing to build a bogus tag" >&2; exit 1; }
+          echo "tag=src-$H" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "Force rebuild requested."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if aws ecr describe-images --repository-name "$ECR_REPO" \
+               --image-ids imageTag=${{ steps.hash.outputs.tag }} >/dev/null 2>&1; then
+            echo "Image for this source already exists (${{ steps.hash.outputs.tag }}) -> skip build."
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No image for this source (${{ steps.hash.outputs.tag }}) -> build."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: ${{ needs.check.outputs.needs_build == 'true' }}
+    # Native arm64 runner: the target is Graviton (t4g) and QEMU is 5-10x
+    # slower. Free for public repositories.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Persist the cargo registry + target dir across runs so only changed
+      # crates recompile.
+      - name: Restore cargo build cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            cargo-registry-cache
+            cargo-target-cache
+          key: pb-runner-buildkit-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            pb-runner-buildkit-
+
+      - name: Inject cargo cache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          cache-map: |
+            {
+              "cargo-registry-cache": "/usr/local/cargo/registry",
+              "cargo-target-cache": "/src/target"
+            }
+          skip-extraction: ${{ steps.cache.outputs.cache-hit }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          build-args: |
+            ENGINE=${{ env.ENGINE }}
+          push: true
+          # source-hash tag (drives the skip check) + immutable :<sha>.
+          # No moving tag: the task definition pins one of these explicitly.
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ needs.check.outputs.tag }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Built & pushed"
+            echo "- \`$ECR_REPO:${{ needs.check.outputs.tag }}\` (source hash)"
+            echo "- \`$ECR_REPO:${{ github.sha }}\`"
+            echo ""
+            echo "To roll it out: set that tag as \`image_tag\` of the \`8rs\`"
+            echo "entry in the pbtb-rust dev tfvars, scoped-apply, telebot-deploy,"
+            echo "then restart the bot (RUNBOOK \"pb-runner runtime\")."
+          } >> "$GITHUB_STEP_SUMMARY"
