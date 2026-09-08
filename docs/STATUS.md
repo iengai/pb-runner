@@ -132,10 +132,21 @@ plancheck 400/400, mockrun engine inputs 400/400. Usable as the P5.3
 config. PR #35 review from the user received (1 must-fix: RUNBOOK deploy
 order lambda-before-`8rs`; 3 optional cleanups) — being applied.
 
-**Needs the user:** merge PR #35 and apply Terraform (ECR repo, later the
-`8rs` task definition); create the pb-runner CodeBuild project and run the
-first arm64 build (P6.2); approve the ECS shadow task (P5.2) and the
-small-capital live run on a separate sub-account (P5.3).
+**Rollout (user go-ahead 2026-09-08, RUNBOOK "pb-runner runtime"):** PR #35
+merged (5bd5afe). Step 1 ECR repo `pb-runner` created (terraform, module.ecr
+only). Step 2 image `pb-runner:8-v8.1.0-arm64` built locally (buildx/QEMU,
+65 min) and pushed. Step 3 lambda-deploy run 34179407866 succeeded (new
+task-state-change-handler, version 6; engine table still `7=,8=`). Blocked:
+telebot-build run 34178646212 failed on the EOL `bullseye-security` apt
+suite, so telebot `:latest` is still pre-#35; fix PR
+https://github.com/iengai/pbtb-rust/pull/36 (bookworm bases, glibc 2.34
+ceiling measured against al2023) awaits the user's merge, competing with a
+`Check-Valid-Until=false` workaround from another session. Steps 4-5
+(`8rs` scoped apply, telebot-deploy) wait for a successful telebot-build;
+step 6 (Telegram: choose cap300 config, `/runtime <bot_id> rs`, Stop, Run)
+is the user's.
+**Needs the user:** merge the Dockerfile fix; then say go for steps 4-5;
+approve the small-capital live run details (sub-account, keys via S3).
 
 ## 2026-09-08 (worktree agent) — pre-live review findings 1-8 fixed (fill windows, error budget + in-process restarts, market orders, lazy exchange config, dirty symbols)
 
