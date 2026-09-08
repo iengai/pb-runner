@@ -132,21 +132,36 @@ plancheck 400/400, mockrun engine inputs 400/400. Usable as the P5.3
 config. PR #35 review from the user received (1 must-fix: RUNBOOK deploy
 order lambda-before-`8rs`; 3 optional cleanups) — being applied.
 
-**Rollout (user go-ahead 2026-09-08, RUNBOOK "pb-runner runtime"):** PR #35
-merged (5bd5afe). Step 1 ECR repo `pb-runner` created (terraform, module.ecr
-only). Step 2 image `pb-runner:8-v8.1.0-arm64` built locally (buildx/QEMU,
-65 min) and pushed. Step 3 lambda-deploy run 34179407866 succeeded (new
-task-state-change-handler, version 6; engine table still `7=,8=`). Blocked:
-telebot-build run 34178646212 failed on the EOL `bullseye-security` apt
-suite, so telebot `:latest` is still pre-#35; fix PR
-https://github.com/iengai/pbtb-rust/pull/36 (bookworm bases, glibc 2.34
-ceiling measured against al2023) awaits the user's merge, competing with a
-`Check-Valid-Until=false` workaround from another session. Steps 4-5
-(`8rs` scoped apply, telebot-deploy) wait for a successful telebot-build;
-step 6 (Telegram: choose cap300 config, `/runtime <bot_id> rs`, Stop, Run)
-is the user's.
-**Needs the user:** merge the Dockerfile fix; then say go for steps 4-5;
-approve the small-capital live run details (sub-account, keys via S3).
+**Rollout (user go-ahead 2026-09-08, RUNBOOK "pb-runner runtime"): steps 1-5
+done.** PR #35 merged (5bd5afe). Step 1 ECR repo `pb-runner` created
+(terraform, module.ecr only). Step 2 image `pb-runner:8-v8.1.0-arm64` built
+locally (buildx/QEMU, 65 min) and pushed. Step 3 lambda-deploy run 34179407866
+succeeded (new task-state-change-handler, CodeSha256 `8OJsua5g...`), getting
+the `8rs`-aware binary live before the table gained the key. telebot-build
+first failed on the EOL `bullseye-security` apt suite; the user merged the
+bookworm fix (PR #36, d6a2139) and run 34184699943 pushed telebot `:latest` =
+`d6a2139`. Step 4: `8rs` uncommented in `terraform/envs/dev/terraform.tfvars`
+and applied scoped (`module.passivbot_task["8rs"]` + lambda + telebot
+base-env) -- 2 added, 2 changed, 0 destroyed; task def
+`scalable-cluster-dev-passivbot-v8-rs:1` (image `pb-runner:8-v8.1.0-arm64`,
+memory 96, cpu 128, `--live`, log group
+`/ecs/scalable-cluster-dev/passivbot-v8-rs`), lambda table now
+`7=...:3,8=...-v8:1,8rs=...-v8-rs:1` with the function code untouched
+(`source_code_hash` ignored by the module). The apply ran from worktree
+`E:\projects\pbtb-rust-8rs` (branch `chore/enable-8rs-engine`, PR
+https://github.com/iengai/pbtb-rust/pull/37) after copying the existing
+`target/lambda/task_state_change_handler/bootstrap` in -- the lambda module's
+`archive_file` needs it present, and the byte-identical copy keeps the S3
+artifact out of the diff. Step 5: telebot-deploy run 34185540023 succeeded
+(`tag=latest`, `passivbot_revisions=latest`), remote health `telebot-up`, the
+composed table carries `8rs=...-v8-rs:1`.
+**Needs the user:** merge PR #37 (live state now has `8rs` while `main` does
+not -- an apply from `main` before the merge would plan to destroy the new
+task def); then step 6 on Telegram (choose the cap300 config, `/runtime
+<bot_id> rs`, Stop, Run, watch `/ecs/scalable-cluster-dev/passivbot-v8-rs`);
+approve the small-capital live run details (sub-account, keys via S3). Memory
+96 MiB is a placeholder -- measure after the first `rs` bot start (soak RSS
+was 20-26 MiB) and lower it.
 
 ## 2026-09-08 (worktree agent) — pre-live review findings 1-8 fixed (fill windows, error budget + in-process restarts, market orders, lazy exchange config, dirty symbols)
 
