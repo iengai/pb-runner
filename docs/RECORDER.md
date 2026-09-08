@@ -111,6 +111,23 @@ changes tracked passivbot files):
    `MANIFEST.json` (the recordings themselves were intact). The tool now
    decodes with `encoding="utf-8", errors="replace"`.
 
+Old-anchor set (2026-09-08, D21): every other recording seeds its entry fill
+one minute before boot, so the trailing anchor always fell inside the warmup
+window and the runner could fold the bundle straight out of the warmup
+buffer -- which is exactly what it did, and what broke live when a real
+position turned out to be older than the window. `--seed-fill-age-minutes`
+sets that age (default 1, unchanged):
+
+```bash
+python tools/record_fake_v8.py --checkout E:/projects/passivbot-rlib-v8.1.0   --python E:/projects/passivbot/.venv/Scripts/python.exe   --candles E:/projects/passivbot/historical_data/ohlcvs_bybit   --config grid_v7_old_anchor=tests/fixtures/configs/fake_v8/grid_v7.json   --dates 2025-08-01:2025-10-28 --boot-index 120960 --max-steps 120   --seed-positions 1 --seed-we 0.3 --seed-fill-age-minutes 6000   --out .local/fake_v8_old_anchor
+```
+
+Python plans normally for that position (`entry_grid_cropped_long` +
+`close_grid_long` on ADA) because it fetches the trailing candles from the
+anchor; the runner has to backfill them (D21). `pb-mockrun` is the harness
+that sees this -- plancheck and snapcheck replay recorded inputs and so
+cannot tell how much history was fetched.
+
 Forced-mode set (2026-09-08): `tests/fixtures/configs/fake_v8/grid_v7_forced.json`
 is `grid_v7.json` plus `coin_overrides.{ADA,BTC,DOGE}.live.forced_mode_long`
 = `gs` / `tp_only` / `m`, recorded with `--seed-positions 3` (positions on

@@ -163,6 +163,14 @@ pub struct LiveRunner {
     /// background candle refresh runs, so forager cache-only symbols are
     /// never fetched (`cache_only_never_fetched`, pb:18244-18247).
     harness_secondary_never_fetched: bool,
+    /// Oldest 1m minute the trailing bundle of some side still needs
+    /// (SNAPSHOT_SPEC 4.1 step 3, D21): a position's anchor can be far older
+    /// than the warmup window, and the buffer must not be trimmed past it.
+    trailing_floor_ms: BTreeMap<String, u64>,
+    /// When the last backfill for a symbol ran. An anchor the exchange cannot
+    /// serve (a symbol listed after it, a persistent fetch failure) must not
+    /// re-walk hundreds of kline pages every 2.5 s cycle.
+    trailing_backfill_ms: BTreeMap<String, u64>,
     /// `init_markets_last_update_ms`: hourly market reload (SPEC: finding 2).
     markets_loaded_ms: u64,
     /// Wall time up to which fills / closed pnl were fetched; the next
@@ -227,6 +235,8 @@ impl LiveRunner {
             wall,
             mono,
             harness_secondary_never_fetched: false,
+            trailing_floor_ms: BTreeMap::new(),
+            trailing_backfill_ms: BTreeMap::new(),
             markets_loaded_ms: 0,
             fills_synced_ms: None,
             hedge_mode_on_reload: false,
@@ -440,8 +450,9 @@ impl LiveRunner {
                 .client
                 .fetch_ohlcv(symbol, "1m", Some(since), 1000)
                 .await?;
+            let keep = self.m1_keep(symbol, now);
             let buf = self.candles.get_mut(symbol).expect("buffer");
-            merge_candles(&mut buf.m1, m1, self.warmup_1m_minutes as usize + 1500);
+            merge_candles(&mut buf.m1, m1, keep);
         }
         if let Some(since) = h1_since {
             let h1 = self
@@ -452,6 +463,124 @@ impl LiveRunner {
             merge_candles(&mut buf.h1, h1, self.warmup_1h_hours as usize + 50);
         }
         Ok(())
+    }
+
+    /// How many 1m candles to keep for `symbol`: the warmup window, widened
+    /// to reach any trailing anchor that is older than it (D21), and capped by
+    /// `live.max_memory_candles_per_symbol`.
+    fn m1_keep(&self, symbol: &str, now: u64) -> usize {
+        let cap = self
+            .cfg
+            .live("max_memory_candles_per_symbol")
+            .and_then(Value::as_u64)
+            .unwrap_or(200_000) as usize;
+        let base = self.warmup_1m_minutes as usize + 1500;
+        let need = match self.trailing_floor_ms.get(symbol) {
+            Some(floor) => (now.saturating_sub(*floor) / ONE_MIN_MS) as usize + 1500,
+            None => 0,
+        };
+        base.max(need).min(cap.max(base))
+    }
+
+    /// SNAPSHOT_SPEC 4.1 step 3: Python fetches the trailing candles from the
+    /// position-change anchor itself
+    /// (`get_candles_with_resolution_ladder(start_ts=anchor + 1m)`), however
+    /// old that anchor is. Reading only the warmup buffer left every side
+    /// whose last fill predates the buffer without a trailing bundle, and the
+    /// engine answers `trailing_available = false` by planning NOTHING for
+    /// that side: the position keeps its exposure, its close orders are
+    /// cancelled, and nothing ever refetches the missing history (D21).
+    ///
+    /// Non-fatal: a failed or short backfill leaves the side unavailable, the
+    /// same state as before, with `trailing_bundle` logging why.
+    async fn ensure_trailing_candles(&mut self, positions: &[Position], now: u64) {
+        let Ok(builder) = SnapshotBuilder::new(&self.cfg) else {
+            return;
+        };
+        let mut need: BTreeMap<String, u64> = BTreeMap::new();
+        for p in positions.iter().filter(|p| p.size != 0.0) {
+            let pside_name = match p.pside {
+                PositionSide::Long => "long",
+                PositionSide::Short => "short",
+            };
+            if !builder.is_trailing(&p.symbol, pside_name).unwrap_or(false) {
+                continue;
+            }
+            let anchor = self
+                .fills
+                .iter()
+                .filter(|f| f.symbol == p.symbol && f.pside == p.pside)
+                .map(|f| f.timestamp_ms)
+                .max()
+                .or(p.updated_ms);
+            let Some(a) = anchor else { continue };
+            // The bundle is folded from the first full minute after the anchor.
+            let first = (a / ONE_MIN_MS + 1) * ONE_MIN_MS;
+            need.entry(p.symbol.clone())
+                .and_modify(|v| *v = (*v).min(first))
+                .or_insert(first);
+        }
+        self.trailing_floor_ms.retain(|s, _| need.contains_key(s));
+        for (symbol, first) in need {
+            self.trailing_floor_ms.insert(symbol.clone(), first);
+            let have_from = self
+                .candles
+                .get(&symbol)
+                .and_then(|b| b.m1.first())
+                .map(|c| c[0] as u64);
+            if have_from.is_some_and(|h| h <= first) {
+                continue;
+            }
+            // Retry a backfill that did not reach the anchor at most every
+            // 5 minutes; the side stays unavailable in between.
+            if self
+                .trailing_backfill_ms
+                .get(&symbol)
+                .is_some_and(|t| now.saturating_sub(*t) < 5 * 60_000)
+            {
+                continue;
+            }
+            self.trailing_backfill_ms.insert(symbol.clone(), now);
+            let until = have_from.unwrap_or(now);
+            let mut since = first;
+            let mut fetched: Vec<Candle> = Vec::new();
+            // `fetch_ohlcv` walks at most 5 pages of 1000 candles per call, so
+            // an anchor further back than that needs several calls.
+            for _ in 0..40 {
+                match self.client.fetch_ohlcv(&symbol, "1m", Some(since), 1000).await {
+                    Ok(page) if page.is_empty() => break,
+                    Ok(page) => {
+                        let last = page[page.len() - 1][0] as u64;
+                        fetched.extend(page);
+                        if last >= until.saturating_sub(ONE_MIN_MS) || last <= since {
+                            break;
+                        }
+                        since = last + ONE_MIN_MS;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            symbol = %symbol,
+                            error = %e,
+                            "[trailing] backfill of the anchor candles failed; the side stays unavailable"
+                        );
+                        break;
+                    }
+                }
+            }
+            if fetched.is_empty() {
+                continue;
+            }
+            let keep = self.m1_keep(&symbol, now);
+            let buf = self.candles.entry(symbol.clone()).or_default();
+            merge_candles(&mut buf.m1, fetched, keep);
+            tracing::info!(
+                symbol = %symbol,
+                anchor_ms = first,
+                m1 = buf.m1.len(),
+                m1_first_ms = buf.m1.first().map(|c| c[0]),
+                "[trailing] backfilled the candles the position anchor needs"
+            );
+        }
     }
 
     /// Startup: markets, warmup lengths, candle history, fill history.
@@ -711,6 +840,10 @@ impl LiveRunner {
                 }
             }
         }
+        // A position older than the warmup window still needs its trailing
+        // candles (D21); this is the only place that can reach back for them,
+        // and it runs before the snapshot is built from the buffer.
+        self.ensure_trailing_candles(&positions, now).await;
         // Planning market snapshots (`get_orchestrator_market_snapshots`):
         // cached tickers younger than the fetch TTL are reused, the rest
         // come from one bulk `fetch_tickers`; `fetched_ms` is the local
@@ -1640,6 +1773,158 @@ mod tests {
         let boot2 = fill("f2", "o2", 100, Side::Buy, 0.0);
         let (_, last) = realized_pnl_cumsum(&[boot2], &[], 0, &fee, &big);
         assert!((last + 10.0 * 0.0002).abs() < 1e-12);
+    }
+
+    /// Klines server: dense 1m candles from whatever `since` is asked for,
+    /// recording the starts so the test can see how far back it reached.
+    #[derive(Default)]
+    struct Klines {
+        starts: std::sync::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl pb_exchange_bybit::ExchangeClient for Klines {
+        async fn load_markets(&self) -> Result<Vec<pb_exchange_bybit::MarketSpec>, ExchangeError> {
+            Ok(vec![])
+        }
+        async fn fetch_balance(&self) -> Result<pb_exchange_bybit::Balance, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_tickers(&self) -> Result<Vec<pb_exchange_bybit::Ticker>, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_ohlcv(
+            &self,
+            _: &str,
+            _: &str,
+            since: Option<u64>,
+            limit: usize,
+        ) -> Result<Vec<Candle>, ExchangeError> {
+            let start = since.unwrap_or(0);
+            self.starts.lock().unwrap().push(start);
+            let n = limit.clamp(1, 1000) as u64;
+            Ok((0..n)
+                .map(|i| {
+                    let ts = (start + i * ONE_MIN_MS) as f64;
+                    [ts, 1.0, 1.5, 0.5, 1.0, 1.0]
+                })
+                .collect())
+        }
+        async fn fetch_fills(
+            &self,
+            _: Option<&str>,
+            _: Option<u64>,
+            _: Option<u64>,
+        ) -> Result<Vec<Fill>, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_closed_pnl(
+            &self,
+            _: Option<u64>,
+            _: Option<u64>,
+        ) -> Result<Vec<ClosedPnl>, ExchangeError> {
+            unreachable!()
+        }
+        async fn create_orders(
+            &self,
+            _: &[pb_exchange_bybit::NewOrder],
+        ) -> Vec<pb_exchange_bybit::OrderResult<OpenOrder>> {
+            unreachable!()
+        }
+        async fn cancel_orders(
+            &self,
+            _: &[(String, String)],
+        ) -> Vec<pb_exchange_bybit::OrderResult<pb_exchange_bybit::CancelAck>> {
+            unreachable!()
+        }
+        async fn set_hedge_mode(&self) -> Result<(), ExchangeError> {
+            Ok(())
+        }
+        async fn configure_symbol(
+            &self,
+            _: &str,
+            _: f64,
+            _: pb_exchange_bybit::MarginMode,
+        ) -> Result<(), ExchangeError> {
+            Ok(())
+        }
+    }
+
+    fn trailing_cfg() -> ConfigView {
+        let mut raw: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/configs/fake_v8/grid_v7.json"
+        ))
+        .unwrap();
+        // `is_trailing` = entry or close trailing_grid_ratio != 0 (pb:8612-8631).
+        raw["bot"]["long"]["strategy"]["trailing_grid_v7"]["close"]["trailing_grid_ratio"] =
+            serde_json::json!(0.5);
+        ConfigView::new(raw).unwrap()
+    }
+
+    /// D21: the position's anchor is older than the warmup buffer, so the
+    /// bundle cannot be folded from what warmup fetched. Python fetches from
+    /// the anchor (SNAPSHOT_SPEC 4.1 step 3); so must the runner, or the
+    /// engine plans nothing for the side and the position sits unmanaged.
+    #[tokio::test]
+    async fn trailing_candles_are_backfilled_to_an_anchor_older_than_the_buffer() {
+        let symbol = "XRP/USDT:USDT";
+        let now = 1_800_000_000_000 / ONE_MIN_MS * ONE_MIN_MS;
+        let anchor = now - 500 * ONE_MIN_MS;
+        let client = Arc::new(Klines::default());
+        let mut r = LiveRunner::new(trailing_cfg(), client.clone()).unwrap();
+        r.warmup_1m_minutes = 100;
+        // Warmup reached back 100 minutes; the anchor is 500 minutes old.
+        let buf = r.candles.entry(symbol.to_string()).or_default();
+        buf.m1 = (0..100)
+            .map(|i| {
+                let ts = (now - (100 - i) * ONE_MIN_MS) as f64;
+                [ts, 1.0, 1.5, 0.5, 1.0, 1.0]
+            })
+            .collect();
+        r.fills = vec![Fill {
+            id: "f1".into(),
+            order_id: "o1".into(),
+            symbol: symbol.into(),
+            side: Side::Buy,
+            pside: PositionSide::Long,
+            qty: 1.0,
+            price: 1.0,
+            fee: 0.0,
+            client_id: None,
+            is_maker: true,
+            timestamp_ms: anchor,
+        }];
+        let positions = vec![Position {
+            symbol: symbol.into(),
+            pside: PositionSide::Long,
+            size: 1.0,
+            entry_price: 1.0,
+            leverage: None,
+            margin_mode: None,
+            updated_ms: Some(anchor),
+        }];
+        let first_minute = (anchor / ONE_MIN_MS + 1) * ONE_MIN_MS;
+
+        assert!(
+            trailing_bundle(&r.candles[symbol].m1, anchor, now).is_none(),
+            "precondition: the warmup buffer cannot cover the anchor"
+        );
+        r.ensure_trailing_candles(&positions, now).await;
+
+        assert_eq!(client.starts.lock().unwrap()[0], first_minute);
+        assert!(r.candles[symbol].m1.first().unwrap()[0] as u64 <= first_minute);
+        assert!(
+            trailing_bundle(&r.candles[symbol].m1, anchor, now).is_some(),
+            "the bundle must fold from the backfilled candles"
+        );
+        // The widened buffer survives the next refresh trim.
+        assert!(r.m1_keep(symbol, now) >= 500);
     }
 
     #[test]

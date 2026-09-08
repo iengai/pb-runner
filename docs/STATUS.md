@@ -2,6 +2,59 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 — live incident: the `8rs` bots planned nothing for a position older than their warmup window (D21)
+
+**What happened:** the two bots moved to the Rust runtime (paper2
+`467146583`, `452425891`) cancelled all four resting orders on their XRP
+position in cycle 1 and then planned nothing at all -- `ideal=0 cancels=0
+creates=0 warnings=1` for 330 / 51 cycles. Bybit confirmed the state on
+paper2: long 2.7 XRP (3.74 USDT, entry 1.4309, mark 1.3854, -32.7% ROI),
+**zero open orders**, balance 42.02 USDT. An unmanaged position with no
+close order.
+
+**Cause (D21):** the trailing bundle was folded out of the warmup 1m buffer,
+but the anchor (newest fill of the side) was older than that buffer -- 3070
+min against a 2872-minute warmup, and 5621 against 2340 -- so
+`trailing_bundle` returned `None`, `trailing_available = false`, and the
+engine emitted no orders for the side (`StrategyInputUnavailable`). Nothing
+refetches that history, so the state never heals. Python fetches the
+trailing candles from the anchor itself (SNAPSHOT_SPEC 4.1 step 3).
+
+**Diagnosis path, and the two dead ends worth remembering:** the first local
+"reproduction" came from a stale binary (built before the day's commits) and
+was void; `live.balance_override` is not implemented, so the balance
+experiment built on it was void too. What settled it was the deployed image
+itself, pulled from ECR and run under QEMU against the read-only abot key
+with paper2's config: `ideal=3 warnings=0`, healthy -- image and config
+exonerated, leaving account state. paper2's own key is IP-bound to the NAT
+(`10010 Unmatched IP`), so the account state came from the Bybit UI plus the
+arithmetic above.
+
+**Changed:** `live.rs` `ensure_trailing_candles` backfills 1m candles from
+the anchor each cycle before the snapshot is built, widening the symbol's
+buffer (`trailing_floor_ms` / `m1_keep`, capped by
+`live.max_memory_candles_per_symbol`); `live.recv_window_ms` is finally
+passed to the Bybit client (every signed request had used the 5 s default);
+new logging -- engine warnings by name, an empty plan dumps balance /
+positions / `tradable` / `effective_min_cost` / `symbol_states` /
+`loss_gate_blocks`, warmup logs the candle counts it got, the
+missing-strategy-input fallback names the symbol.
+`tools/record_fake_v8.py --seed-fill-age-minutes` (default 1, unchanged)
+ages the seeded entry fill, which is the trailing anchor.
+
+**Harness gap:** every recording started flat and each seeded fill was
+stamped one minute before boot, so the anchor always fell inside the warmup
+window -- 3400 compared cycles never touched this branch. Fixture
+`grid_v7_old_anchor` (6000-minute fill age) records it.
+
+**Verified:** `cargo test --workspace` 138 (new:
+`trailing_candles_are_backfilled_to_an_anchor_older_than_the_buffer`).
+
+**Next:** finish the `grid_v7_old_anchor` recording + mockrun/diffcheck
+against it, rebuild the arm64 image, and roll the two bots onto it. Not yet
+implemented: Python's coarse-resolution prefix for very old anchors, and
+`live.balance_override`.
+
 ## 2026-09-08 (worktree agent) — HSL coin mode ported (`hsl_coin.rs`, D20); `realized_pnl_cumsum` fee fallback (D16.5)
 
 **Changed:** `crates/runner/src/hsl_coin.rs` (new): the per-pair HSL

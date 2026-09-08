@@ -116,10 +116,19 @@ Compared per step:
 | seeded2 tm | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 400/400 (*) |
 | seeded2 tm8 | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 400/400 (*) |
 | seeded2 iter7 | 400 | 400/400 | 400/400 / 400/400 | 400/400 | 400/400 | 400/400 | 400/400 (*) |
+| old_anchor grid_v7 (D21) | 120 | 120/120 | 120/120 / 120/120 | 120/120 | 120/120 | 120/120 | 120/120 |
 
 Create order/id sequence and cancel id set: 0 differing steps in every run.
 Final state identical in every run. tm8 places no order in 400 steps
 (Python neither).
+
+`old_anchor` (`--seed-fill-age-minutes 6000`, D21) is the run that fails
+without the trailing backfill: with `ensure_trailing_candles` disabled the
+ADA position loses both its orders from the first step on -- expected 4
+open orders, got 2 (`close_grid_long` and `entry_grid_cropped_long`
+missing) -- which is exactly what the two live bots did. This is the only
+harness that sees it; plancheck and snapcheck replay recorded inputs and
+cannot tell how much candle history was fetched.
 
 (*) Until 2026-09-08 the only differing field was
 `global.realized_pnl_cumsum_last` (`0.0` vs recorded `-0.0530015256`, every

@@ -745,3 +745,52 @@ Decision:
    `fee_pct_sanity_abs_max` replaced) so the realized-pnl series and the
    HSL ledger agree with Python's `fill_event_net_pnl` (closes D16 item 5
    and D17 item 4; `pb-mockrun` seeded2 engine inputs 0/400 -> 400/400).
+
+## D21 (2026-09-08) Trailing candles are fetched from the position anchor, not read out of the warmup buffer
+
+The two live `8rs` bots (paper2 `467146583`, `452425891`) cancelled every
+resting order on their XRP position and then planned nothing at all for 330 /
+51 cycles: `ideal=0 cancels=4 creates=0 warnings=1`, an unmanaged position with
+no close order.
+
+1. Cause. `live.rs` folded the trailing bundle out of the warmup 1m buffer.
+   `trailing_bundle` requires the window to start exactly at the first full
+   minute after the position-change anchor (the newest fill of that side, else
+   the exchange position timestamp), so an anchor older than the buffer yields
+   `None` -> `trailing_available = false`. The engine turns that into
+   `StrategyInputUnavailable` (`orchestrator.rs:2482-2497`) and emits NO orders
+   for the side; the reconciler then cancels everything, and nothing ever
+   refetches the missing history, so the state never heals. Both bots were past
+   the edge: last fill 3070 min old against a 2872-minute warmup, and 5621 min
+   against 2340.
+2. Python (`passivbot.py:9588-9610`, SNAPSHOT_SPEC 4.1 step 3) instead issues
+   one `get_candles_with_resolution_ladder(symbol, start_ts=anchor + 1m,
+   end_ts=None, strict=False)` per symbol that needs trailing, however old the
+   anchor is. The spec recorded this; the implementation had substituted the
+   warmup buffer, and the substitution was invisible while the anchor happened
+   to fall inside it.
+3. Decision: `LiveRunner::ensure_trailing_candles` runs each cycle before the
+   snapshot is built and backfills 1m candles from the anchor for every side
+   that needs trailing (`is_trailing` and a non-zero position), widening that
+   symbol's buffer via `trailing_floor_ms` / `m1_keep` so later refreshes do
+   not trim the history away again, capped by
+   `live.max_memory_candles_per_symbol`. A failed or short backfill is
+   non-fatal: the side stays unavailable exactly as before, and now says so in
+   the log.
+4. Not ported: Python's coarse-resolution prefix for very old anchors
+   (`approximate old candle prefix`, pb:9637-9660). Exact 1m is fetched for as
+   far back as 40 pages reach (~200k candles); beyond that the side degrades to
+   unavailable with a warning instead of silently.
+5. Why the harness missed it: plancheck / snapcheck / mockrun replay recorded
+   inputs, so they pin computation, not input acquisition, and every recording
+   started flat -- `tools/record_fake_v8.py` stamped each seeded entry fill at
+   `boot_ts - 60_000`, one minute before boot, so the anchor was always inside
+   the warmup window. `--seed-fill-age-minutes` (default 1, unchanged) now sets
+   that age, and fixture `grid_v7_old_anchor` records the case.
+6. Observability, which is what made a 20-minute live idle undiagnosable: the
+   cycle line logged only the warning COUNT, and balance, positions,
+   tradability and candle depth were never logged. Now the engine's warnings
+   are named, an empty plan dumps balance / positions / `tradable` /
+   `effective_min_cost` / `symbol_states` / `loss_gate_blocks`, warmup logs the
+   candle counts it actually got, and the missing-strategy-input fallback names
+   the symbol.

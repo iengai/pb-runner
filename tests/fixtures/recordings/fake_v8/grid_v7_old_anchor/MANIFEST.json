@@ -1,0 +1,59 @@
+{
+  "producer": "tools/record_fake_v8.py + passivbot src/tools/run_fake_live.py (fake exchange, replay)",
+  "passivbot_commit": "e808cfd33fcd2bc086619cd56131744549161826",
+  "passivbot_describe": "v8.1.0-1-ge808cfd33",
+  "extension_source_fingerprint": "0cf730b52c50b9b640ddaa1118911f63acd5b7334315ef0f4e2c819a154871f1",
+  "python": "E:/projects/passivbot/.venv/Scripts/python.exe",
+  "config_name": "grid_v7_old_anchor",
+  "config_source": "tests\\fixtures\\configs\\fake_v8\\grid_v7.json",
+  "config_source_sha256": "57490a30dfd7d0741eaebf0eac71f7f2c2dbab3458caf0e42f5a2d5b0672a3ce",
+  "config_overrides": {
+    "live.minimum_coin_age_days": 0,
+    "live.user": "fake_grid_v7_old_anchor"
+  },
+  "scenario": {
+    "coins": [
+      "ADA",
+      "BTC",
+      "DOGE",
+      "DOT",
+      "ETH",
+      "HBAR",
+      "SOL",
+      "TRX",
+      "XLM",
+      "XRP"
+    ],
+    "candle_dates": [
+      "2025-08-01",
+      "2025-10-28"
+    ],
+    "boot_index": 120960,
+    "balance": 1000.0,
+    "max_steps": 120,
+    "seeded_positions": [
+      {
+        "symbol": "ADA/USDT:USDT",
+        "position_side": "long",
+        "qty": 466.0,
+        "price": 0.655656
+      }
+    ]
+  },
+  "calls_recorded": 120,
+  "unique_inputs_kept": 120,
+  "duplicates_dropped": 0,
+  "hsl_trace_lines": 120,
+  "harness_seconds": 239.8,
+  "recorded_utc": "2026-09-08T08:35:04Z",
+  "selection": {
+    "source_recordings": 120,
+    "transitions_available": 115,
+    "stride": 20,
+    "max": 30,
+    "kept": 30,
+    "kept_transitions": 30,
+    "hsl_trace_lines": 120,
+    "fills": 1
+  }
+}

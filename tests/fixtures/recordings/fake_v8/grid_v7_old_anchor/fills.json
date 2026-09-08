@@ -1,0 +1,28 @@
+[
+  {
+    "amount": 466.0,
+    "clientOrderId": "",
+    "datetime": "2025-10-19T20:00:00",
+    "fee": {
+      "cost": 0.0,
+      "currency": "USDT"
+    },
+    "id": "1",
+    "info": {
+      "contractMultiplier": 1.0,
+      "fee": 0.0,
+      "liquidity": "historical",
+      "positionSide": "LONG",
+      "realizedPnl": 0.0,
+      "reduceOnly": false
+    },
+    "order": "1000",
+    "pnl": 0.0,
+    "position_side": "long",
+    "price": 0.655656,
+    "reduceOnly": false,
+    "side": "buy",
+    "symbol": "ADA/USDT:USDT",
+    "timestamp": 1760904000000
+  }
+]

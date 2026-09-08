@@ -117,13 +117,20 @@ def boot_candle(candles_dir: Path, coin: str, dates: list[str], boot_index: int)
 
 
 def seed_positions(coins: list[str], candles_dir: Path, dates: list[str], boot_index: int,
-                   balance: float, n: int, wallet_exposure: float, entry_offset: float) -> tuple[list[dict], list[dict]]:
+                   balance: float, n: int, wallet_exposure: float, entry_offset: float,
+                   fill_age_minutes: float = 1.0) -> tuple[list[dict], list[dict]]:
     """Long positions on the first `n` coins, sized to `wallet_exposure` of the
     balance at the boot price, with the entry price `entry_offset` above it so the
     position starts under water (exercises closes/grid/unstuck paths at once).
-    Each position also gets one boot fill one minute before boot, otherwise the
-    bot keeps the position in `position_fill_confirmation_pending` and marks its
-    strategy inputs unavailable (no closes or grid entries are planned)."""
+    Each position also gets one fill `fill_age_minutes` before boot, otherwise
+    the bot keeps the position in `position_fill_confirmation_pending` and marks
+    its strategy inputs unavailable (no closes or grid entries are planned).
+
+    The fill timestamp is the trailing anchor, and everything downstream of it
+    (how far back the trailing candles must reach) depends on how old it is. A
+    fill age larger than the warmup window is the case the default of one
+    minute never produced: the bot has to fetch candles from before its own
+    warmup to fold the bundle (SNAPSHOT_SPEC 4.1 step 3, D21)."""
     out, fills = [], []
     for coin in coins[:n]:
         step = BYBIT_MARKETS[coin]["qty_step"]
@@ -144,7 +151,7 @@ def seed_positions(coins: list[str], candles_dir: Path, dates: list[str], boot_i
             "position_side": "long",
             "amount": round(qty, 10),
             "price": round(price * (1.0 + entry_offset), 10),
-            "timestamp": boot_ts - 60_000,
+            "timestamp": boot_ts - int(fill_age_minutes * 60_000),
         })
     return out, fills
 
@@ -233,7 +240,8 @@ def run_one(args, name: str, config_path: Path) -> dict:
     positions, fills = [], []
     if args.seed_positions > 0:
         positions, fills = seed_positions(coins, candles_dir, dates, args.boot_index, args.balance,
-                                          args.seed_positions, args.seed_we, args.seed_entry_offset)
+                                          args.seed_positions, args.seed_we, args.seed_entry_offset,
+                                          args.seed_fill_age_minutes)
     scenario = build_scenario(name, coins, candles_dir, dates,
                               args.boot_index, args.balance, positions, fills)
     scn_out = out_dir / "scenario.json"
@@ -328,6 +336,9 @@ def main() -> int:
     ap.add_argument("--seed-we", type=float, default=0.15, help="wallet exposure per seeded position")
     ap.add_argument("--seed-entry-offset", type=float, default=0.02,
                     help="seeded entry price relative to boot close (0.02 = 2%% above, under water)")
+    ap.add_argument("--seed-fill-age-minutes", type=float, default=1.0,
+                    help="age of the seeded entry fill before boot; the trailing anchor. "
+                         "Larger than the warmup window exercises the anchor backfill (D21)")
     ap.add_argument("--log-level", type=int, default=1)
     ap.add_argument("--out", default=".local/fake_v8")
     args = ap.parse_args()
