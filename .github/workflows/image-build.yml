@@ -190,12 +190,16 @@ jobs:
         run: |
           set -euo pipefail
           SRC='${{ needs.check.outputs.tag }}'
-          Q='images[0].[imageManifestMediaType,imageManifest]'
-          read -r MEDIA MANIFEST <<<"$(aws ecr batch-get-image --repository-name "$ECR_REPO" --image-ids imageTag="$SRC" --query "$Q" --output text)"
-          [ -n "$MANIFEST" ] && [ "$MANIFEST" != "None" ] || { echo "no image tagged $SRC to promote" >&2; exit 1; }
+          # The manifest is pretty-printed JSON: it contains newlines, so it
+          # cannot travel through a shell variable (`read` takes the first
+          # line and put-image answers "Invalid JSON syntax"). Write it to a
+          # file and pass file://, and fetch the media type separately.
+          aws ecr batch-get-image --repository-name "$ECR_REPO" --image-ids imageTag="$SRC" --query 'images[0].imageManifest' --output text > manifest.json
+          MEDIA=$(aws ecr batch-get-image --repository-name "$ECR_REPO" --image-ids imageTag="$SRC" --query 'images[0].imageManifestMediaType' --output text)
+          [ -s manifest.json ] && [ "$(head -c 4 manifest.json)" != "None" ] || { echo "no image tagged $SRC to promote" >&2; exit 1; }
           # Already on this manifest -> ECR answers ImageAlreadyExists, which
           # is the desired end state, not a failure.
-          if OUT=$(aws ecr put-image --repository-name "$ECR_REPO" --image-tag "$LINE_TAG" --image-manifest "$MANIFEST" --image-manifest-media-type "$MEDIA" 2>&1); then
+          if OUT=$(aws ecr put-image --repository-name "$ECR_REPO" --image-tag "$LINE_TAG" --image-manifest "file://manifest.json" --image-manifest-media-type "$MEDIA" 2>&1); then
             echo "$LINE_TAG -> $SRC"
           elif echo "$OUT" | grep -q ImageAlreadyExists; then
             echo "$LINE_TAG already points at $SRC"
