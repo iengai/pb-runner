@@ -1109,7 +1109,37 @@ fixes -- and the pin turned every fix into an infrastructure change.
      margin mode and leverage per symbol on every startup and hourly; we call
      `configure_symbol` far less often).
 
-6. **Two shortcuts declined.** The user offered to have the order placed by
+   **CONFIRMED, 15:34:55 UTC**, on the first branch. Same account, still
+   flat, `build=b8af7e9a…`, thirteen minutes after the run that failed:
+
+   ```
+   planned cycle=1 ideal=1 cancels=0 creates=1
+   [order] post XRP/USDT:USDT Buy Long qty=1.6 price=1.4152 entry_initial_normal_long
+   wave done cancels_ok=0 creates_ok=1 failures=0
+   ```
+
+   Accepted and filled -- the next cycles carry `long=1.6@1.4152`. Zero
+   `110094` and zero unacknowledged creates in the whole task. The only
+   thing that changed between the rejected order and this one is the
+   `Referer` header.
+
+6. **The mechanism, stated plainly.** Bybit enforces the per-symbol
+   `minNotionalValue` (5 USDT for XRPUSDT) on orders that arrive without
+   passivbot's broker `Referer`, and does not enforce it on orders that carry
+   it. The broker code is therefore not a fee-rebate cosmetic: it changes the
+   trading limits of the account. A pb-runner that does not send it cannot
+   place an entry on any account small enough for its initial entry to fall
+   under the symbol's minimum -- which is exactly the situation that produced
+   this whole investigation, and which never appeared on the larger account
+   because every order it plans is already above 5 USDT.
+
+   The corollary for anyone reading this later: the four offline harnesses
+   plus the request-parity test now cover computation and the wire format,
+   and this is the third finding in a row (D21, D24/D25) that lived outside
+   computation. The Python bot is the specification, and the specification
+   includes how it identifies itself.
+
+7. **Two shortcuts declined.** The user offered to have the order placed by
    hand at 0.1 XRP, or to use the per-bot S3 key locally for the test.
    Neither is taken: placing an order is executing a trade, which is not
    mine to do, and the per-bot keys are IP-whitelisted trading keys that

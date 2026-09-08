@@ -28,11 +28,29 @@ and neither have our >5 USDT orders.
 deliberately. The assertion was calibrated first -- removed the header, watched
 it fail, put it back.
 
-**Next action:** build, then with paper2 flat run rs and watch one sub-5-USDT
-`entry_initial`. Accepted -> confirmed. Rejected -> the request is now
-identical byte for byte and header for header, so the cause is not in the
-request, and the next step is a same-moment state comparison between the two
-runtimes (leverage, margin mode, position mode, UTA tier), not another guess.
+**CONFIRMED at 15:34:55 UTC.** Built `b8af7e9a…`, promoted `v810` to it,
+stopped the old task and ran a new one on the same account, still flat:
+
+```
+planned cycle=1 ideal=1 cancels=0 creates=1
+[order] post XRP/USDT:USDT Buy Long qty=1.6 price=1.4152 entry_initial_normal_long
+wave done cancels_ok=0 creates_ok=1 failures=0
+```
+
+Accepted and filled (`long=1.6@1.4152` in the cycles after). Zero `110094`
+and zero unacknowledged creates in the task. Thirteen minutes earlier the same
+account rejected the same size; the only difference is the header.
+
+**So:** Bybit enforces the per-symbol `minNotionalValue` on orders without
+passivbot's broker `Referer` and waives it on orders with it. The broker code
+is not a fee-rebate cosmetic -- it changes the account's trading limits. This
+never showed on the larger `8rs` account because every order it plans is
+already above 5 USDT.
+
+**Next action:** the other live rs bot (`452425891`) is still on the old build
+and still sends no `Referer`. It is unaffected today (all its orders clear 5
+USDT), but it should be restarted onto `v810` at a convenient moment. paper2
+is running the new build and healthy (`ideal=3 matched=3`).
 
 ## 2026-09-08 -- a Bybit order field we send and the Python bot never has (D24)
 
