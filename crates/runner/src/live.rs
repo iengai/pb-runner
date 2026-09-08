@@ -475,6 +475,19 @@ impl LiveRunner {
         let now = (self.wall)();
         for s in &symbols {
             self.refresh_candles(s, now).await?;
+            // What warmup asked for is already logged; what it actually got was
+            // not, and a short history silently disables the symbol's strategy
+            // inputs for the rest of the run.
+            if let Some(buf) = self.candles.get(s) {
+                tracing::info!(
+                    symbol = %s,
+                    m1 = buf.m1.len(),
+                    h1 = buf.h1.len(),
+                    m1_first_ms = buf.m1.first().map(|c| c[0]),
+                    m1_last_ms = buf.m1.last().map(|c| c[0]),
+                    "candles warmed"
+                );
+            }
         }
         // Fill history over `pnls_max_lookback_days`: the client walks the
         // whole range in 7-day windows (exchanges/bybit.py::fetch_fills /

@@ -1146,6 +1146,17 @@ impl<'a> SnapshotBuilder<'a> {
                     if can_mark_nontradable {
                         unavailable = true;
                     } else {
+                        // The engine turns this into `StrategyInputUnavailable`
+                        // and plans NOTHING for the side -- a position keeps its
+                        // exposure with no close order. Silent until now: the
+                        // only trace was the warning count on the cycle line.
+                        tracing::warn!(
+                            symbol = %symbol,
+                            m1_candles = c.len(),
+                            h1_candles = h.len(),
+                            has_position = s.has_position(),
+                            "required strategy EMA input missing; the engine will skip this symbol"
+                        );
                         allow_missing = true;
                     }
                 }
