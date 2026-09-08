@@ -883,3 +883,22 @@ fixes -- and the pin turned every fix into an infrastructure change.
    EARLIER image, so `build=<sha>` names that build, not the commit the
    workflow ran on. That is accurate -- the binary really is the earlier
    build -- but it is not the head commit.
+6. One drift check is now VOID, and it is one people were using. Comparing
+   the tfvars `image_tag` against the digest running in ECS used to detect a
+   build that had been deployed without a matching commit; today both sides
+   read `v810` no matter what is running, so the comparison is an identity
+   and proves nothing. A second agent had already reached for it on this
+   line, correctly refusing to apply because ITS checkout was behind -- the
+   right call then, but the criterion it used will now report "aligned"
+   forever. What replaces it:
+   - Is the deployed build the intended one? The container's first log line,
+     `build=<git sha>`, compared with what the last `image-build` run
+     promoted. Nothing else can answer this.
+   - Has the terraform config drifted from state? `terraform plan` on the
+     targets, as for anything else. Note that
+     `-target=aws_ssm_parameter.telebot_base_env` always drags
+     `module.passivbot_task` in with it, because
+     `local.telebot_base_env` embeds `local.passivbot_families`, which is
+     derived from that module -- so the smallest honest scope for this line
+     is the three targets the RUNBOOK already lists, not the SSM parameter
+     alone.

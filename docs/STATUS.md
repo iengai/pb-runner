@@ -30,9 +30,30 @@ bot that dies right after a build comes back on the new build. Rollback is
 re-pointing `v810` at one of the immutable `<git sha>` tags (pbtb-rust
 RUNBOOK, "Shipping a pb-runner fix"), bounded by `keep_last_images = 20`.
 
-**Needs the user:** one last terraform apply to move `8rs` onto `v810`
-(scoped, `module.passivbot_task["8rs"]` + lambda + telebot base env), and it
-is also the apply that ships D22 -- after it, neither needs terraform again.
+**Rolled out:** the apply landed `passivbot-v8-rs:4` (image
+`pb-runner:v810`, memory 64), the lambda's engine table reads
+`8rs=…-v8-rs:4`, and telebot-deploy 34221161471 wrote the same revision into
+`/etc/telebot/telebot.env`. pbtb-rust PR #40 is merged (`9197e13`), so `main`
+and the dev state agree again; a targeted plan on the line reports no
+changes. `v810` points at commit `4750ce5` -- D22 and the startup log
+included -- and shares its digest with the `src-…` and `<git sha>` tags.
+
+**Two things went wrong on the way, both now fixed in the workflow:**
+`aws ecr put-image` was handed the manifest through a shell variable and
+rejected it ("Invalid JSON syntax") because ECR returns it pretty-printed;
+the retry then succeeded but put `v810` on a SECOND image index, since the
+manifest ECR returns is not byte-identical to what was pushed. Retagging is
+now `docker buildx imagetools create`, and the step asserts the two raw
+manifests match before reporting success (D23 item 5). The stray index is
+untagged and expires under the 7-day rule.
+
+**A drift check people were using is now void** (D23 item 6): tfvars
+`image_tag` versus the running digest is an identity today. The build a
+container is running is answerable only from its first log line,
+`build=<git sha>`.
+
+**Needs the user:** restart both `rs` bots from telebot (Stop, then Run) --
+they are still on `:3`.
 
 ## 2026-09-08 — D21 verified live; exchange clock alignment (D22)
 
