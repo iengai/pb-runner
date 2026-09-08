@@ -224,6 +224,14 @@ pub type OrderResult<T> = Result<T, ExchangeError>;
 
 #[async_trait]
 pub trait ExchangeClient: Send + Sync {
+    /// Align the client's request timestamps with the exchange clock and
+    /// return the new `server - local` offset in ms (ccxt
+    /// `load_time_difference`, which the Python bot asks for once via
+    /// `adjustForTimeDifference`, passivbot.py:2512). Default: a client
+    /// whose requests carry no signed timestamp has nothing to align.
+    async fn sync_time(&self) -> Result<i64, ExchangeError> {
+        Ok(0)
+    }
     async fn load_markets(&self) -> Result<Vec<MarketSpec>, ExchangeError>;
     async fn fetch_balance(&self) -> Result<Balance, ExchangeError>;
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;

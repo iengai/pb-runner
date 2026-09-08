@@ -2,6 +2,50 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 — D21 verified live; exchange clock alignment (D22)
+
+**D21 verified on the live bots.** Both `8rs` bots restarted on task
+definition `passivbot-v8-rs:3` (image `pb-runner:ca832b6`, built on the new
+GitHub arm64 runner) and healed immediately:
+
+- `452425891`, 3 symbols: `[trailing] backfilled the candles the position
+  anchor needs symbol=XRP anchor_ms=1788513720000 m1=5801` (the buffer grew
+  from 2341 to 5801 minutes), then `cycle=1 ideal=4 creates=3` -- including
+  the `close_grid_long` the position had been sitting without -- and
+  `ideal=4 warnings=0` on every cycle since.
+- `467146583`: same backfill line (anchor 3263 minutes back), `ideal=3`,
+  three entries posted, one of which filled at 10:05:11.
+
+**One expected-looking gap, checked and not a bug:** right after that fill,
+`467146583` logged `StrategyInputUnavailable` for 109 s and cancelled its two
+entries before reposting them. That is D17's rule, and Python's: the bundle
+needs one COMPLETE minute after the anchor (`missing_exact_trailing_candles`,
+pb:9651), so a side is unavailable from a fill until the following minute
+closes. Not a regression -- but the log did not say so, and it reads exactly
+like the D21 symptom.
+
+**Changed (D22):** the Bybit client now carries a `time_offset_ms`
+(`server - local`, from the public `/v5/market/time`, measured at the round
+trip's midpoint) and adds it to every signed timestamp; a `10002` rejection
+triggers one re-sync and one retry, and nothing else does. `LiveRunner`
+syncs at startup and on the hourly maintenance cycle, warns above 500 ms, and
+treats a failed sync as non-fatal. Bybit rejects a timestamp more than 1 s
+AHEAD of its clock -- `recv_window` bounds only lateness -- so a fast host
+clock fails every private call; that is what killed the D21 soak
+(`exit=30` after 11 restarts) and what ended the local dry-run against
+paper2 (+1021 ms).
+
+**Verified:** `cargo test --workspace --all-features` 141 (new:
+`timestamp_errors_are_the_only_resync_trigger`,
+`signed_timestamps_carry_the_synced_offset`,
+`the_hourly_cycle_resyncs_the_exchange_clock`); clippy clean; mockrun
+`old_anchor` 120/120 and `public` 600/600 requests, account state and engine
+inputs identical.
+
+**Next:** build the image with D22 and roll it onto `8rs`; merge
+`iengai/pbtb-rust` PR #40 (the OIDC build role, the ECR lifecycle policy and
+the `8rs` image tag are applied in dev but not on `main`); restart the soak.
+
 ## 2026-09-08 — live incident: the `8rs` bots planned nothing for a position older than their warmup window (D21)
 
 **What happened:** the two bots moved to the Rust runtime (paper2

@@ -109,6 +109,10 @@ pub struct CyclePlan {
     pub skipped_symbols: Vec<String>,
 }
 
+/// Above this the host clock, not the round trip, is what the offset
+/// measures. Bybit's own tolerance is 1 s ahead; half of it leaves room to
+/// act before signed calls start failing.
+pub const EXCHANGE_TIME_OFFSET_WARN_MS: i64 = 500;
 /// `init_markets` cadence: "update markets dict once every hour"
 /// (passivbot.py:21665-21675, `maintain_hourly_cycle`).
 pub const MARKETS_RELOAD_INTERVAL_MS: u64 = 60 * 60 * 1000;
@@ -287,10 +291,53 @@ impl LiveRunner {
         Ok(())
     }
 
+    /// Align the exchange client's request timestamps with the exchange
+    /// clock (ccxt `load_time_difference`; Python asks ccxt for it once via
+    /// `adjustForTimeDifference`, passivbot.py:2512, and again whenever a
+    /// timestamp error comes back).
+    ///
+    /// Bybit rejects a signed request whose timestamp is more than 1 s AHEAD
+    /// of its own clock -- `recv_window` widens only the late side -- so a
+    /// host clock a second fast fails EVERY private call. That is not a
+    /// degraded mode: each cycle counts as an error, and the runner walks
+    /// through its restart budget and exits (the D21 soak died exactly this
+    /// way, `exit=30` after 11 restarts).
+    ///
+    /// Non-fatal and not charged to the error budget: a failed sync leaves
+    /// the previous offset in place, and the ECS host's clock is normally
+    /// fine -- this is a guard, not a dependency.
+    async fn sync_exchange_time(&self, phase: &str) {
+        match self.client.sync_time().await {
+            Ok(offset) => {
+                // Only the runner's *requests* are corrected; `self.wall`
+                // still reads the host clock, which is what candle bucketing
+                // and cycle timing use. Sub-second skew is immaterial there,
+                // but a large offset says the host clock itself is wrong.
+                if offset.abs() >= EXCHANGE_TIME_OFFSET_WARN_MS {
+                    tracing::warn!(
+                        phase,
+                        offset_ms = offset,
+                        "[time] host clock is far from the exchange; requests are corrected but candle bucketing is not | action=check_host_ntp"
+                    );
+                } else {
+                    tracing::info!(phase, offset_ms = offset, "[time] exchange clock synced");
+                }
+            }
+            Err(e) => tracing::warn!(
+                phase,
+                error = %e,
+                "[time] exchange clock sync failed; keeping the previous offset"
+            ),
+        }
+    }
+
     async fn maybe_reload_markets(&mut self, now: u64) {
         if now.saturating_sub(self.markets_loaded_ms) <= MARKETS_RELOAD_INTERVAL_MS {
             return;
         }
+        // Before the hedge-mode re-assert below, which is itself a signed
+        // call: an hour of drift is enough to push the timestamp out.
+        self.sync_exchange_time("hourly").await;
         // `init_markets` re-asserts hedge mode before reloading the markets.
         if self.hedge_mode_on_reload {
             if let Err(e) = self.set_hedge_mode_with_retries().await {
@@ -547,7 +594,11 @@ impl LiveRunner {
             // `fetch_ohlcv` walks at most 5 pages of 1000 candles per call, so
             // an anchor further back than that needs several calls.
             for _ in 0..40 {
-                match self.client.fetch_ohlcv(&symbol, "1m", Some(since), 1000).await {
+                match self
+                    .client
+                    .fetch_ohlcv(&symbol, "1m", Some(since), 1000)
+                    .await
+                {
                     Ok(page) if page.is_empty() => break,
                     Ok(page) => {
                         let last = page[page.len() - 1][0] as u64;
@@ -586,6 +637,7 @@ impl LiveRunner {
     /// Startup: markets, warmup lengths, candle history, fill history.
     pub async fn warmup(&mut self) -> Result<Vec<String>> {
         let now = (self.wall)();
+        self.sync_exchange_time("startup").await;
         self.reload_markets(now).await?;
         let (symbols, m, h) = {
             let builder = SnapshotBuilder::new(&self.cfg)?;
@@ -1780,10 +1832,16 @@ mod tests {
     #[derive(Default)]
     struct Klines {
         starts: std::sync::Mutex<Vec<u64>>,
+        time_syncs: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl pb_exchange_bybit::ExchangeClient for Klines {
+        async fn sync_time(&self) -> Result<i64, ExchangeError> {
+            self.time_syncs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
         async fn load_markets(&self) -> Result<Vec<pb_exchange_bybit::MarketSpec>, ExchangeError> {
             Ok(vec![])
         }
@@ -1925,6 +1983,27 @@ mod tests {
         );
         // The widened buffer survives the next refresh trim.
         assert!(r.m1_keep(symbol, now) >= 500);
+    }
+
+    /// D22: the hourly maintenance re-syncs the exchange clock before the
+    /// signed calls it makes, and only when the hour is actually up -- a
+    /// sync on every 2.5 s cycle would be one wasted request per cycle.
+    #[tokio::test]
+    async fn the_hourly_cycle_resyncs_the_exchange_clock() {
+        let client = Arc::new(Klines::default());
+        let mut r = LiveRunner::new(trailing_cfg(), client.clone()).unwrap();
+        let syncs = || client.time_syncs.load(std::sync::atomic::Ordering::Relaxed);
+        let now = 1_800_000_000_000;
+        r.markets_loaded_ms = now;
+
+        r.maybe_reload_markets(now + MARKETS_RELOAD_INTERVAL_MS)
+            .await;
+        assert_eq!(syncs(), 0, "not due yet: no sync, no reload");
+
+        r.maybe_reload_markets(now + MARKETS_RELOAD_INTERVAL_MS + 1)
+            .await;
+        assert_eq!(syncs(), 1);
+        assert_eq!(r.markets_loaded_ms, now + MARKETS_RELOAD_INTERVAL_MS + 1);
     }
 
     #[test]

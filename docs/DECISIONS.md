@@ -794,3 +794,44 @@ no close order.
    `effective_min_cost` / `symbol_states` / `loss_gate_blocks`, warmup logs the
    candle counts it actually got, and the missing-strategy-input fallback names
    the symbol.
+
+## D22 (2026-09-08) The exchange clock is synced at startup and hourly, and once more after any timestamp rejection
+
+The D21 soak did not survive the night: `pbr-soak` exited `exit=30` at 04:08
+UTC after `10002` rejections exhausted its 10/h error budget across 11
+restarts. The same error ended the local dry-run against paper2 -- the dev
+host's clock was +1021 ms.
+
+1. Cause. Bybit rejects a signed request whose timestamp is more than 1 s
+   AHEAD of its server clock; `recv_window` widens only the LATE side, so
+   raising it fixes nothing. The runner signed with the raw host clock, so a
+   host running a second fast fails EVERY private call -- balance, positions,
+   orders. That is not a degraded mode: every cycle becomes an error and the
+   runner restarts itself out of its budget and exits.
+2. Python never had the problem because ccxt does it: `_build_ccxt_options`
+   sets `adjustForTimeDifference` (passivbot.py:2512), which makes ccxt call
+   `load_time_difference` and add `options.timeDifference` to every signed
+   timestamp; `_maybe_recover_exchange_time_sync` (2580-2615) re-runs it
+   whenever `_is_exchange_time_sync_error` recognises the failure. This is the
+   fourth gap of the same shape as D21: a behaviour that lived in the library
+   Python leaned on, so no spec line ever named it.
+3. Decision. `BybitClient` keeps a `time_offset_ms` (`server - local`),
+   measured by `sync_time()` against the PUBLIC `/v5/market/time` -- public so
+   it still works while the clock is too skewed for a signed call -- taken at
+   the midpoint of the round trip so latency does not land in the offset.
+   Every signed timestamp, and every `now_ms()` the client uses for request
+   windows, goes through it.
+4. Retry, once, and only for this error: `signed_with_time_resync` re-syncs
+   and repeats the attempt when `is_timestamp_error` matches (`10002`, which
+   ccxt maps to `InvalidNonce` and Python matches by type, plus the
+   recv-window wordings). Any other rejection must NOT be retried -- a create
+   would be sent twice.
+5. Cadence: `LiveRunner::sync_exchange_time` runs at startup before the first
+   signed call and on the hourly maintenance cycle before the hedge-mode
+   re-assert, not per cycle (that would be one wasted request every 2.5 s).
+   Failure is non-fatal and not charged to the error budget: the previous
+   offset stays.
+6. `|offset| >= 500 ms` logs a warning naming the host clock, because only the
+   client's REQUESTS are corrected -- `LiveRunner`'s own `wall` clock, which
+   decides candle bucketing and cycle timing, still reads the host. The offset
+   is a guard against rejection, not a substitute for NTP on the host.

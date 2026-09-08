@@ -14,6 +14,7 @@ use crate::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -120,9 +121,18 @@ pub struct BybitClient {
     /// ccxt `options.enableUnifiedMargin || options.enableUnifiedAccount`
     /// (`is_unified_enabled`), resolved once from `/v5/user/query-api`.
     unified: RwLock<Option<bool>>,
+    /// `server_time - local_time`, added to every signed request's timestamp.
+    /// ccxt's `options.adjustForTimeDifference`, which the Python bot enables
+    /// (`_build_ccxt_options`, passivbot.py:2511-2512) and re-loads whenever a
+    /// timestamp error comes back (`_maybe_recover_exchange_time_sync`).
+    /// Bybit rejects a request whose timestamp is more than 1 s AHEAD of its
+    /// server (`recv_window` only bounds lateness), so a host clock running a
+    /// second fast fails every signed call — and each failure is a cycle
+    /// error, which walks the runner straight into its restart budget.
+    time_offset_ms: AtomicI64,
 }
 
-fn now_ms() -> u64 {
+fn system_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -187,6 +197,7 @@ impl BybitClient {
             ids: RwLock::new(HashMap::new()),
             markets: RwLock::new(HashMap::new()),
             unified: RwLock::new(None),
+            time_offset_ms: AtomicI64::new(0),
         })
     }
 
@@ -292,13 +303,107 @@ impl BybitClient {
         self.send(self.http.get(url)).await
     }
 
+    /// Local clock corrected by the last `sync_time` (0 until it first runs).
+    pub fn now_ms(&self) -> u64 {
+        let local = system_now_ms() as i64;
+        (local + self.time_offset_ms.load(Ordering::Relaxed)).max(0) as u64
+    }
+
+    pub fn time_offset_ms(&self) -> i64 {
+        self.time_offset_ms.load(Ordering::Relaxed)
+    }
+
+    /// ccxt `load_time_difference`: read the exchange clock and store
+    /// `server - local`, measured at the midpoint of the request so the
+    /// round trip does not land in the offset. Public endpoint, no signing —
+    /// it works even while the clock is too skewed for a signed call.
+    pub async fn sync_time(&self) -> Result<i64, ExchangeError> {
+        let t0 = system_now_ms() as i64;
+        let result = self.public_get("/v5/market/time", &[]).await?;
+        let t1 = system_now_ms() as i64;
+        let server = result
+            .get("timeNano")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<i128>().ok())
+            .map(|nano| (nano / 1_000_000) as i64)
+            .or_else(|| {
+                result
+                    .get("timeSecond")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(|sec| sec * 1000)
+            })
+            .ok_or_else(|| ExchangeError::Other("/v5/market/time: no timeNano".into()))?;
+        let offset = server - (t0 + t1) / 2;
+        self.time_offset_ms.store(offset, Ordering::Relaxed);
+        Ok(offset)
+    }
+
+    /// Bybit's answer to a timestamp outside its window (`10002`), the one
+    /// error a clock re-sync can fix. Python reaches the same verdict by
+    /// type: ccxt maps `10002` to `InvalidNonce`, which
+    /// `_is_exchange_time_sync_error` matches (passivbot.py:2527-2578).
+    /// Matching the code directly is the equivalent here; the text needles
+    /// only cover a differently-worded body.
+    fn is_timestamp_error(err: &ExchangeError) -> bool {
+        match err {
+            ExchangeError::Rejected { code, msg } => {
+                let m = msg.to_ascii_lowercase();
+                code == "10002"
+                    || m.contains("recv_window")
+                    || m.contains("recvwindow")
+                    || m.contains("server timestamp")
+                    || m.contains("timestamp for this request")
+            }
+            _ => false,
+        }
+    }
+
+    /// One signed attempt, then — only for a timestamp error — a clock
+    /// re-sync and a single retry (`_maybe_recover_exchange_time_sync`).
+    /// Without it a drifting host clock turns every cycle into an error and
+    /// the runner restarts itself out of its daily budget.
+    async fn signed_with_time_resync<F, Fut>(&self, attempt: F) -> Result<Value, ExchangeError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<Value, ExchangeError>>,
+    {
+        match attempt().await {
+            Err(e) if Self::is_timestamp_error(&e) => {
+                let before = self.time_offset_ms();
+                match self.sync_time().await {
+                    Ok(after) => tracing::warn!(
+                        before_ms = before,
+                        after_ms = after,
+                        "[time] exchange rejected the request timestamp; clock re-synced, retrying"
+                    ),
+                    Err(sync_err) => {
+                        tracing::warn!(error = %sync_err, "[time] clock re-sync failed");
+                        return Err(e);
+                    }
+                }
+                attempt().await
+            }
+            other => other,
+        }
+    }
+
     pub async fn private_get(
         &self,
         path: &str,
         params: &[(&str, String)],
     ) -> Result<Value, ExchangeError> {
+        self.signed_with_time_resync(|| self.private_get_once(path, params))
+            .await
+    }
+
+    async fn private_get_once(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<Value, ExchangeError> {
         let qs = query_string(params);
-        let ts = now_ms();
+        let ts = self.now_ms();
         let sig = sign::signature(
             &self.cfg.secret,
             ts,
@@ -316,8 +421,13 @@ impl BybitClient {
     }
 
     pub async fn private_post(&self, path: &str, body: &Value) -> Result<Value, ExchangeError> {
+        self.signed_with_time_resync(|| self.private_post_once(path, body))
+            .await
+    }
+
+    async fn private_post_once(&self, path: &str, body: &Value) -> Result<Value, ExchangeError> {
         let raw = serde_json::to_string(body).map_err(|e| ExchangeError::Other(e.to_string()))?;
-        let ts = now_ms();
+        let ts = self.now_ms();
         let sig = sign::signature(
             &self.cfg.secret,
             ts,
@@ -428,7 +538,7 @@ impl BybitClient {
             qty: o.qty.abs(),
             price: o.price,
             reduce_only: o.reduce_only,
-            created_ms: Some(now_ms()),
+            created_ms: Some(self.now_ms()),
         })
     }
 
@@ -455,6 +565,10 @@ impl BybitClient {
 
 #[async_trait]
 impl ExchangeClient for BybitClient {
+    async fn sync_time(&self) -> Result<i64, ExchangeError> {
+        BybitClient::sync_time(self).await
+    }
+
     async fn load_markets(&self) -> Result<Vec<MarketSpec>, ExchangeError> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
@@ -610,7 +724,7 @@ impl ExchangeClient for BybitClient {
         let windows: Vec<(Option<u64>, Option<u64>)> = match start_ms {
             None => vec![(None, end_ms)],
             Some(start) => {
-                let end = end_ms.unwrap_or_else(|| now_ms() + FILLS_END_SLACK_MS);
+                let end = end_ms.unwrap_or_else(|| self.now_ms() + FILLS_END_SLACK_MS);
                 weekly_windows(start, end, FILLS_MAX_WINDOWS)
                     .into_iter()
                     .map(|(s, e)| (Some(s), Some(e)))
@@ -655,7 +769,7 @@ impl ExchangeClient for BybitClient {
         let windows: Vec<(Option<u64>, Option<u64>)> = match start_ms {
             None => vec![(None, end_ms)],
             Some(start) => {
-                let end = end_ms.unwrap_or_else(|| now_ms() + PNL_END_SLACK_MS);
+                let end = end_ms.unwrap_or_else(|| self.now_ms() + PNL_END_SLACK_MS);
                 weekly_windows(start, end, PNL_MAX_WINDOWS)
                     .into_iter()
                     .map(|(s, e)| (Some(s), Some(e)))
@@ -837,6 +951,51 @@ mod tests {
             code: "1".into(),
             msg: "leverage not modified".into()
         }));
+    }
+
+    #[test]
+    fn timestamp_errors_are_the_only_resync_trigger() {
+        // The real 10002 body, which carries `recv_window` with an
+        // underscore -- the code, not the wording, is what identifies it.
+        let ts = ExchangeError::Rejected {
+            code: "10002".into(),
+            msg: "invalid request, please check your server timestamp or                   recv_window param. req_timestamp[1788800000000]                   server_timestamp[1788799998000] recv_window[5000]"
+                .into(),
+        };
+        assert!(BybitClient::is_timestamp_error(&ts));
+        // A body worded differently but still about the window.
+        assert!(BybitClient::is_timestamp_error(&ExchangeError::Rejected {
+            code: "1".into(),
+            msg: "Timestamp for this request is outside of the recvWindow.".into(),
+        }));
+        // Everything else must NOT cost a re-sync + retry: a rejected order
+        // would be sent twice.
+        assert!(!BybitClient::is_timestamp_error(&ExchangeError::Rejected {
+            code: "110007".into(),
+            msg: "ab not enough for new order".into(),
+        }));
+        assert!(!BybitClient::is_timestamp_error(&ExchangeError::Auth(
+            "10010 Unmatched IP".into()
+        )));
+        assert!(!BybitClient::is_timestamp_error(&ExchangeError::Network(
+            "connection reset".into()
+        )));
+    }
+
+    #[test]
+    fn signed_timestamps_carry_the_synced_offset() {
+        let client = BybitClient::new(BybitConfig::mainnet("k", "s")).unwrap();
+        assert_eq!(client.time_offset_ms(), 0);
+        let before = client.now_ms();
+        client.time_offset_ms.store(-1_500, Ordering::Relaxed);
+        assert_eq!(client.time_offset_ms(), -1_500);
+        // A host clock 1.5 s fast is exactly what Bybit rejects; the signed
+        // timestamp must come back inside the window, not track the host.
+        let after = client.now_ms();
+        assert!(
+            after + 1_400 <= before + 50,
+            "expected the offset to move the timestamp back: {before} -> {after}"
+        );
     }
 
     #[test]
