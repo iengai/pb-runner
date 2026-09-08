@@ -1147,3 +1147,50 @@ fixes -- and the pin turned every fix into an infrastructure change.
    would not authenticate from here anyway. The test that answers this costs
    one bot restart on an account that is already flat, which is cheaper than
    either.
+
+## D26 (2026-09-08) The broker code is attribution AND a trading limit; it stays passivbot's by default, and is now overridable
+
+1. **What it pays.** Bybit's API Broker FAQ describes attribution as
+   per-ORDER, not per-account: a broker is "responsible for sending every
+   order request with a Broker ID attached", and Bybit "calculates the
+   trading volume based on the Broker ID and processes rebates accordingly",
+   up to 45% of the fee depending on tier. passivbot's README states the
+   partner relationship openly ("Signing up using these referrals is
+   appreciated", `partner.bybit.com/b/passivbot`), and its Bybit connector
+   refuses to start without a broker code at all.
+
+   So the `Referer` D25 added is not only what waives the minimum notional --
+   it is also what decides who earns from this volume. Every order these bots
+   place, Python and Rust alike, is attributed to passivbot. The Python bots
+   have always done this; pb-runner did not until today, and started because
+   the goal was to match the Python request byte for byte. That was a
+   defensible default and it was still a choice made without asking, which is
+   why it is written down here rather than left in a constant.
+
+2. **What it costs to change.** The waiver appears to travel with the code.
+   Removing it, or swapping in a different one, plausibly restores the 5 USDT
+   floor and with it the failure that started D24 -- an account whose initial
+   entry is 2.25 USDT simply cannot open a position. Whether the waiver
+   follows the passivbot code specifically or any valid broker code is
+   UNTESTED, and it is the question that decides whether attribution can be
+   moved at all. `tools/bybit_request_probe.py --broker-id <other>` answers
+   it in one run.
+
+3. **Changed:** `BybitConfig.broker_id`, defaulting to
+   `DEFAULT_BROKER_ID = "passivbotbybit"`, overridable by the
+   `PB_RUNNER_BROKER_ID` environment variable; empty means send no `Referer`,
+   which is what ccxt does with an unset `brokerId`. The runner logs
+   `[config] broker attribution broker_id=...` at startup, so which one a
+   container ran is answerable from its logs, like `build=<git sha>` (D23).
+
+   An environment variable, NOT a config key, because the config objects in
+   S3 are the same objects the Python bots read: a pb-runner-only field in
+   them is a field passivbot has to tolerate. passivbot overrides its own
+   registry by environment too (`PASSIVBOT_BROKER_CODES_PATH`).
+
+4. **Undocumented, and worth saying so.** Nothing in Bybit's broker material
+   that we could find mentions minimum-notional treatment. The waiver is an
+   empirical finding (D25), which means it could change without notice. The
+   parity test pins that we send the header; nothing can pin what Bybit does
+   with it. If sub-5-USDT entries start failing again on an account that was
+   working, this is the first thing to re-measure, and the probe is the tool.

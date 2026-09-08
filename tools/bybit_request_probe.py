@@ -55,7 +55,9 @@ def http(method: str, path: str, *, query=None, body=None, headers=None) -> dict
         return json.loads(resp.read())
 
 
-def signed_headers(key: str, secret: str, payload: str, *, referer: bool) -> dict:
+def signed_headers(
+    key: str, secret: str, payload: str, *, referer: bool, broker: str = BROKER_ID
+) -> dict:
     ts = str(int(time.time() * 1000))
     raw = ts + key + RECV_WINDOW + payload
     sign = hmac.new(secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
@@ -70,7 +72,7 @@ def signed_headers(key: str, secret: str, payload: str, *, referer: bool) -> dic
     if referer:
         # ccxt bybit.py:9424-9427 -- POST only, from options["brokerId"], which
         # exchanges/bybit.py::create_ccxt_sessions refuses to leave unset.
-        h["Referer"] = BROKER_ID
+        h["Referer"] = broker
     return h
 
 
@@ -124,6 +126,14 @@ def main() -> None:
         "outside any spread and inside any band; the order rests for about a "
         "second.",
     )
+    ap.add_argument(
+        "--broker-id",
+        default=BROKER_ID,
+        help="broker code to test in the `with` arm. Point it at your own to "
+        "find out whether the minimum-notional waiver follows the passivbot "
+        "code specifically or any valid broker code -- which is the question "
+        "that decides whether attribution can be moved without losing it.",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -133,7 +143,8 @@ def main() -> None:
     notional = float(price) * float(qty)
     print(
         f"{args.symbol}: mark={mark} -> probe {qty} @ {price} "
-        f"= {notional:.4f} USDT notional (minimum enforced without the header is 5)"
+        f"= {notional:.4f} USDT notional (minimum enforced without the header is 5); "
+        f"broker id under test: {args.broker_id}"
     )
 
     key, secret = load_key(args.bucket, args.user_id, args.bot_id)
@@ -154,7 +165,7 @@ def main() -> None:
             },
             separators=(",", ":"),
         )
-        headers = signed_headers(key, secret, body, referer=referer)
+        headers = signed_headers(key, secret, body, referer=referer, broker=args.broker_id)
         if args.dry_run:
             shown = {k: ("<redacted>" if k.startswith("X-BAPI") else v) for k, v in headers.items()}
             print(f"\n{label}\n  body    {body}\n  headers {shown}")

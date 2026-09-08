@@ -28,7 +28,14 @@ pub const TESTNET: &str = "https://api-testnet.bybit.com";
 /// code raises before the bot starts. We are running passivbot's engine on
 /// passivbot's configs, so we identify ourselves the same way; the Python
 /// bot on these same accounts always has.
-const BROKER_ID: &str = "passivbotbybit";
+///
+/// It is not only attribution. Bybit waives the per-symbol
+/// `minNotionalValue` for orders that carry it (D25, measured -- undocumented
+/// anywhere we could find), so dropping it costs the ability to open a
+/// position on any account whose initial entry falls under that minimum.
+/// Bybit's own broker FAQ says rebates are computed per tagged ORDER, so
+/// this string also decides who earns from the volume: see D26.
+pub const DEFAULT_BROKER_ID: &str = "passivbotbybit";
 
 /// Return codes the Python adapter treats as "already in the requested
 /// state" (`exchanges/bybit.py::update_exchange_config*`).
@@ -98,6 +105,9 @@ pub struct BybitConfig {
     pub api_key: String,
     pub secret: String,
     pub base_url: String,
+    /// Sent as `Referer` on every POST. Empty means send no header at all,
+    /// which is a deliberate choice with a cost -- see `DEFAULT_BROKER_ID`.
+    pub broker_id: String,
     pub recv_window_ms: u64,
     pub timeout: Duration,
     /// Passed as `timeInForce: PostOnly` when an order has `post_only`;
@@ -112,6 +122,7 @@ impl BybitConfig {
             api_key: api_key.into(),
             secret: secret.into(),
             base_url: MAINNET.to_string(),
+            broker_id: DEFAULT_BROKER_ID.to_string(),
             recv_window_ms: 5000,
             timeout: Duration::from_secs(30),
             maker_fee: DEFAULT_MAKER_FEE,
@@ -449,10 +460,15 @@ impl BybitClient {
             .post(format!("{}{}", self.cfg.base_url, path))
             .headers(self.auth_headers(ts, &sig))
             .header("Content-Type", "application/json")
-            // POST only, exactly as ccxt does it (bybit.py:9424-9427: the
-            // broker id becomes `Referer` on POST and on nothing else).
-            .header("Referer", BROKER_ID)
             .body(raw);
+        // POST only, exactly as ccxt does it (bybit.py:9424-9427: the broker
+        // id becomes `Referer` on POST and on nothing else). ccxt omits the
+        // header when `brokerId` is unset, so an empty string omits it here.
+        let req = if self.cfg.broker_id.is_empty() {
+            req
+        } else {
+            req.header("Referer", self.cfg.broker_id.clone())
+        };
         self.send(req).await
     }
 

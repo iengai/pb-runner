@@ -603,3 +603,30 @@ async fn every_request_matches_the_python_bots() {
         assert_matches(label, recorded, case);
     }
 }
+
+/// The broker code is overridable, and an empty one means "send nothing" --
+/// the same thing ccxt does when `options["brokerId"]` is unset. Worth a test
+/// of its own because the cost of getting it wrong is silent: Bybit then
+/// enforces the per-symbol minimum notional again (D25), and the bot simply
+/// stops being able to open small positions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_broker_id_sends_no_referer() {
+    let mock = MockBybit::start();
+    let mut cfg = BybitConfig::mainnet("test-key", "test-secret");
+    cfg.base_url = mock.base_url.clone();
+    cfg.broker_id = String::new();
+    let client = BybitClient::new(cfg).expect("client");
+    client.load_markets().await.expect("markets");
+    mock.drain();
+
+    let _ = client
+        .create_orders(&[order("0x0007pb-entry", Side::Buy, 1.4077, false, false)])
+        .await;
+    let sent = first_request("empty broker id", mock.drain());
+    assert_eq!(sent.path, "/v5/order/create");
+    assert!(
+        !sent.headers.contains_key("referer"),
+        "an empty broker id must send no Referer, got {:?}",
+        sent.headers.get("referer")
+    );
+}

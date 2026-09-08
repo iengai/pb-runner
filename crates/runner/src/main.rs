@@ -199,6 +199,19 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
     {
         bybit_cfg.recv_window_ms = ms;
     }
+    // The broker code is an environment override, not a config key: the
+    // config objects in S3 are the SAME objects the Python bots read, and a
+    // pb-runner-only field in them would be a field passivbot has to tolerate.
+    // passivbot overrides its own registry by env too
+    // (`PASSIVBOT_BROKER_CODES_PATH`). Empty value = send no `Referer`, which
+    // costs the sub-minimum-notional waiver (D25/D26).
+    if let Ok(id) = std::env::var("PB_RUNNER_BROKER_ID") {
+        bybit_cfg.broker_id = id;
+    }
+    tracing::info!(
+        broker_id = %if bybit_cfg.broker_id.is_empty() { "<none>" } else { &bybit_cfg.broker_id },
+        "[config] broker attribution"
+    );
     let client = Arc::new(BybitClient::new(bybit_cfg)?);
     let max_restarts = raw
         .pointer("/live/max_n_restarts_per_day")

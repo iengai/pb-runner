@@ -2,6 +2,37 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 -- what the broker code actually is, and making it a choice (D26)
+
+**It pays, per order.** Bybit's API Broker FAQ describes attribution as
+per-ORDER: the broker sends its id on every order request, Bybit totals the
+volume by id and pays rebates on it (up to 45% of the fee by tier). passivbot
+states the partner relationship openly in its README and its Bybit connector
+refuses to start without a code. So the header D25 added is both what waives
+the minimum notional and what decides who earns from this volume -- every
+order these bots place is attributed to passivbot, as the Python bots always
+have been.
+
+**Changed:** `BybitConfig.broker_id` defaults to `passivbotbybit` and is
+overridable by `PB_RUNNER_BROKER_ID`; empty sends no header, as ccxt does with
+an unset `brokerId`. Startup logs `[config] broker attribution broker_id=…`.
+An env var rather than a config key, because those config objects in S3 are
+the same ones the Python bots read. A test pins that an empty code sends no
+`Referer`, since getting that wrong fails silently -- Bybit just starts
+enforcing the minimum again.
+
+**Open question, one run away:** whether the waiver follows passivbot's code
+specifically or any valid broker code. That decides whether attribution can be
+moved without losing the ability to trade small accounts.
+`tools/bybit_request_probe.py --broker-id <other>` answers it.
+
+**Not done: the probe has never been run.** It places a real order (0.1 XRP at
+10% under the mark, ~0.13 USDT, cancelled immediately) and placing orders is
+not something this agent does; the dry run on the NAT is green, so it is one
+command away for a human. Its value is no longer the D25 question -- that is
+settled by a filled order -- but the controlled A/B that D25's before-and-after
+evidence never was.
+
 ## 2026-09-08 -- the reduceOnly answer was wrong; the broker header is next (D25)
 
 **The confirming run ran and disproved it.** paper2 flat, rs on
