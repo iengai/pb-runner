@@ -186,27 +186,29 @@ jobs:
           role-to-assume: ${{ secrets.AWS_BUILD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Point the version-line tag at this build
         run: |
           set -euo pipefail
+          REPO='${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}'
           SRC='${{ needs.check.outputs.tag }}'
-          # The manifest is pretty-printed JSON: it contains newlines, so it
-          # cannot travel through a shell variable (`read` takes the first
-          # line and put-image answers "Invalid JSON syntax"). Write it to a
-          # file and pass file://, and fetch the media type separately.
-          aws ecr batch-get-image --repository-name "$ECR_REPO" --image-ids imageTag="$SRC" --query 'images[0].imageManifest' --output text > manifest.json
-          MEDIA=$(aws ecr batch-get-image --repository-name "$ECR_REPO" --image-ids imageTag="$SRC" --query 'images[0].imageManifestMediaType' --output text)
-          [ -s manifest.json ] && [ "$(head -c 4 manifest.json)" != "None" ] || { echo "no image tagged $SRC to promote" >&2; exit 1; }
-          # Already on this manifest -> ECR answers ImageAlreadyExists, which
-          # is the desired end state, not a failure.
-          if OUT=$(aws ecr put-image --repository-name "$ECR_REPO" --image-tag "$LINE_TAG" --image-manifest "file://manifest.json" --image-manifest-media-type "$MEDIA" 2>&1); then
-            echo "$LINE_TAG -> $SRC"
-          elif echo "$OUT" | grep -q ImageAlreadyExists; then
-            echo "$LINE_TAG already points at $SRC"
-          else
-            echo "$OUT" >&2
-            exit 1
-          fi
+          # `imagetools create` copies the manifest inside the registry: no
+          # layers move, and the tag lands on the SAME digest as the source.
+          #
+          # The obvious `aws ecr batch-get-image | put-image` does not: the
+          # manifest that comes back is not byte-identical to what was
+          # pushed, so ECR stores a second image index with its own digest.
+          # The image still runs, but `v810` then shares no digest with any
+          # `<git sha>` tag, and each promote leaves another near-duplicate
+          # counting against `keep_last_images`.
+          docker buildx imagetools create --tag "$REPO:$LINE_TAG" "$REPO:$SRC"
+          BEFORE=$(docker buildx imagetools inspect --raw "$REPO:$SRC" | sha256sum | cut -d' ' -f1)
+          AFTER=$(docker buildx imagetools inspect --raw "$REPO:$LINE_TAG" | sha256sum | cut -d' ' -f1)
+          [ "$BEFORE" = "$AFTER" ] || { echo "$LINE_TAG resolved to a different manifest than $SRC" >&2; exit 1; }
+          echo "$LINE_TAG -> $SRC"
 
       - name: Summary
         run: |

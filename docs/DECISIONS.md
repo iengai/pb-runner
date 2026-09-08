@@ -870,8 +870,15 @@ fixes -- and the pin turned every fix into an infrastructure change.
    acceptable; `promote: false` builds without making the result deployable
    when it is not.
 5. The `promote` job is separate from `build` so it also runs when the build
-   was skipped as already-built (unchanged source), and it retags by copying
-   the manifest -- no pull, no push, no rebuild. Corollary: a commit that
+   was skipped as already-built (unchanged source), and it retags with
+   `docker buildx imagetools create` -- a manifest copy inside the registry,
+   no pull, no push, no rebuild. NOT `aws ecr batch-get-image | put-image`:
+   the manifest that comes back is not byte-identical to what was pushed, so
+   ECR stores a SECOND image index under its own digest. The image runs, but
+   the moving tag then shares no digest with any `<git sha>` tag, and every
+   promote leaves another near-duplicate counting against
+   `keep_last_images`. The job asserts the two manifests match before it
+   reports success. Corollary: a commit that
    changes nothing under `crates/`, `Cargo.*` or the Dockerfile promotes the
    EARLIER image, so `build=<sha>` names that build, not the commit the
    workflow ran on. That is accurate -- the binary really is the earlier
