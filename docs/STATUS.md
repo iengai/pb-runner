@@ -2,6 +2,38 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 — deploys stop going through terraform (D23)
+
+**Why:** rolling out a runner fix meant editing `image_tag` in the pbtb-rust
+tfvars, a scoped apply, `telebot-deploy`, then a restart -- a cadence
+inherited from the Python image, where one pin per upstream release records
+real history. pb-runner ships fixes far more often (D21 and D22 were both
+same-day), and the pin made every one of them an infrastructure change.
+
+**Changed:** the image now carries a moving tag named after the passivbot
+version line it serves, `v810`, and `passivbot_engines["8rs"]` points at that
+instead of a commit. `image-build` gained a `promote` job that re-points the
+tag after each build (manifest copy, no rebuild; runs even when the build was
+skipped as already-built) and a `promote: false` input for a build that
+should not become deployable. `docker/Dockerfile` bakes the commit into
+`PB_RUNNER_BUILD` and the binary logs
+`pb-runner starting version=… engine_line=… build=<git sha>` as its first
+line -- once the tag moves, that is the only record of which build a
+container ran.
+
+**So a fix is now:** run `image-build`, then Stop/Run the bot in telebot. ECS
+re-pulls the tag on every task start. Terraform is for adding a version line
+(a v8.2.0 or v7.1.2 runner: its own tag, its own engine entry).
+
+**Known cost:** an auto-restart after a crash resolves the tag afresh, so a
+bot that dies right after a build comes back on the new build. Rollback is
+re-pointing `v810` at one of the immutable `<git sha>` tags (pbtb-rust
+RUNBOOK, "Shipping a pb-runner fix"), bounded by `keep_last_images = 20`.
+
+**Needs the user:** one last terraform apply to move `8rs` onto `v810`
+(scoped, `module.passivbot_task["8rs"]` + lambda + telebot base env), and it
+is also the apply that ships D22 -- after it, neither needs terraform again.
+
 ## 2026-09-08 — D21 verified live; exchange clock alignment (D22)
 
 **D21 verified on the live bots.** Both `8rs` bots restarted on task

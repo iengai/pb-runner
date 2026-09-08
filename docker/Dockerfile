@@ -29,6 +29,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/pb-runner /pb-runner
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+# The commit this image was built from. The task definition points at a
+# moving tag (`v810`, D23), so this env var -- logged by the binary on its
+# first line -- is what says which build a container is actually running.
+ARG GIT_SHA=unknown
+ENV PB_RUNNER_BUILD=${GIT_SHA}
 WORKDIR /app
 COPY --from=builder /pb-runner /usr/local/bin/pb-runner
 # /app/configs is created by the binary; /app must be writable by nonroot.

@@ -97,6 +97,20 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // The task definition points at a MOVING tag (`v810`), so the image a
+    // container ran cannot be read back off the task definition or the ECS
+    // console -- the tag has usually moved on by the time anyone asks. This
+    // line is the only record of which build is running, so it is logged
+    // before anything that can fail. `PB_RUNNER_BUILD` is baked in by
+    // docker/Dockerfile from the workflow's `GIT_SHA`.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        engine_line = ENGINE_MAJOR,
+        build = std::env::var("PB_RUNNER_BUILD")
+            .as_deref()
+            .unwrap_or("unknown"),
+        "pb-runner starting"
+    );
     let mut args = Args::parse();
     // Container contract: fetch config + keys from S3 when BUCKET/USER_ID/BOT_ID are set.
     match startup::s3_inputs_from_env() {

@@ -1,9 +1,22 @@
 name: image-build
 
 # Build the pb-runner container image (linux/arm64) and push it to ECR.
-# Does NOT deploy: the `8rs` task definition pins an image tag in the
-# pbtb-rust terraform, so rolling a build out stays a deliberate apply +
-# telebot-deploy + bot restart (pbtb-rust RUNBOOK "pb-runner runtime").
+#
+# Three tags per build (D23):
+#   src-<hash>   the build-relevant source; drives the skip check below
+#   <git sha>    immutable, and what a rollback points back at
+#   v810         MOVING: the passivbot version line this image serves, and
+#                the tag the `8rs` task definition points at
+#
+# The moving tag is what keeps terraform out of the deploy path. Shipping a
+# runner fix is a build here plus a bot restart -- ECS re-pulls the tag on
+# every task start. Terraform is for adding a version LINE (a v8.2.0 or
+# v7.1.2 runner: its own moving tag here, its own engine entry in the
+# pbtb-rust tfvars), not for shipping a fix inside one.
+#
+# Because the tag moves, the image a container ran cannot be read back off
+# the task definition afterwards. The binary logs `build=<git sha>` on its
+# first line instead (GIT_SHA below -> PB_RUNNER_BUILD in the image).
 #
 # Why this exists: the first images were built by hand on a dev box with
 # `docker buildx --platform linux/arm64`, i.e. rustc under QEMU -- 65 minutes,
@@ -25,6 +38,10 @@ on:
         description: 'Force rebuild even if an image for this source already exists'
         type: boolean
         default: false
+      promote:
+        description: 'Move the version-line tag to this build (uncheck to build without making it deployable)'
+        type: boolean
+        default: true
 
 permissions:
   id-token: write # OIDC -> assume the AWS build role
@@ -34,6 +51,11 @@ env:
   AWS_REGION: ap-northeast-1
   ECR_REPO: pb-runner
   ENGINE: engine-v8
+  # The passivbot version line this image serves (Cargo.toml pins
+  # passivbot_rust to branch pb-runner/rlib-v8.1.0). A new line gets its own
+  # tag here and its own engine entry in the pbtb-rust tfvars; within a line
+  # the tag just moves.
+  LINE_TAG: v810
 
 jobs:
   # Cheap gate on a standard runner: hash the build-relevant files and skip the
@@ -129,9 +151,11 @@ jobs:
           platforms: linux/arm64
           build-args: |
             ENGINE=${{ env.ENGINE }}
+            GIT_SHA=${{ github.sha }}
           push: true
-          # source-hash tag (drives the skip check) + immutable :<sha>.
-          # No moving tag: the task definition pins one of these explicitly.
+          # Source-hash tag (drives the skip check) + immutable :<sha>. The
+          # moving tag is set by the promote job below, which also runs when
+          # this build was skipped as already-built.
           tags: |
             ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ needs.check.outputs.tag }}
             ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
@@ -144,8 +168,49 @@ jobs:
             echo "### Built & pushed"
             echo "- \`$ECR_REPO:${{ needs.check.outputs.tag }}\` (source hash)"
             echo "- \`$ECR_REPO:${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Move the version-line tag onto the image for this source. Separate from
+  # `build` so it still runs when the build was skipped (unchanged source,
+  # e.g. a docs-only commit), and so `promote: false` can build without
+  # making the result deployable. Retagging copies the manifest server-side;
+  # it never pulls or pushes layers.
+  promote:
+    needs: [check, build]
+    if: ${{ !cancelled() && needs.check.result == 'success' && needs.build.result != 'failure' && github.event.inputs.promote != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Point the version-line tag at this build
+        run: |
+          set -euo pipefail
+          SRC='${{ needs.check.outputs.tag }}'
+          Q='images[0].[imageManifestMediaType,imageManifest]'
+          read -r MEDIA MANIFEST <<<"$(aws ecr batch-get-image --repository-name "$ECR_REPO" --image-ids imageTag="$SRC" --query "$Q" --output text)"
+          [ -n "$MANIFEST" ] && [ "$MANIFEST" != "None" ] || { echo "no image tagged $SRC to promote" >&2; exit 1; }
+          # Already on this manifest -> ECR answers ImageAlreadyExists, which
+          # is the desired end state, not a failure.
+          if OUT=$(aws ecr put-image --repository-name "$ECR_REPO" --image-tag "$LINE_TAG" --image-manifest "$MANIFEST" --image-manifest-media-type "$MEDIA" 2>&1); then
+            echo "$LINE_TAG -> $SRC"
+          elif echo "$OUT" | grep -q ImageAlreadyExists; then
+            echo "$LINE_TAG already points at $SRC"
+          else
+            echo "$OUT" >&2
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployable"
+            echo "\`$ECR_REPO:$LINE_TAG\` now points at \`${{ needs.check.outputs.tag }}\` (commit \`${{ github.sha }}\`)."
             echo ""
-            echo "To roll it out: set that tag as \`image_tag\` of the \`8rs\`"
-            echo "entry in the pbtb-rust dev tfvars, scoped-apply, telebot-deploy,"
-            echo "then restart the bot (RUNBOOK \"pb-runner runtime\")."
+            echo "To roll it out: restart the bot from telebot (Stop, then Run)."
+            echo "No terraform apply, no telebot-deploy -- the task definition"
+            echo "already points at \`$LINE_TAG\` and ECS re-pulls it on every task start."
           } >> "$GITHUB_STEP_SUMMARY"

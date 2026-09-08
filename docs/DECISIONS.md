@@ -835,3 +835,44 @@ host's clock was +1021 ms.
    client's REQUESTS are corrected -- `LiveRunner`'s own `wall` clock, which
    decides candle bucketing and cycle timing, still reads the host. The offset
    is a guard against rejection, not a substitute for NTP on the host.
+
+## D23 (2026-09-08) The `8rs` task definition points at a moving version-line tag, so shipping a runner fix needs no terraform
+
+Every pb-runner build so far was rolled out by editing `image_tag` in the
+pbtb-rust tfvars, a scoped apply, `telebot-deploy`, and a restart. That
+cadence was inherited from the Python image, where it fits: passivbot images
+are cut once per upstream release, so pinning each one in terraform records
+real history. pb-runner is our own code -- D21 and D22 were both same-day
+fixes -- and the pin turned every fix into an infrastructure change.
+
+1. Decision: the image carries a MOVING tag named after the passivbot
+   version line it serves (`v810` for v8.1.0), and `passivbot_engines["8rs"]`
+   points at that tag. The `image-build` workflow re-points it after each
+   build (`promote` job, default on), and ECS re-pulls the tag on every task
+   start -- the agent's default `ECS_IMAGE_PULL_BEHAVIOR`, unset on the
+   cluster host -- so a fix ships as a build plus a bot restart. Terraform
+   keeps what it is actually good at: adding a version LINE (a v8.2.0 or
+   v7.1.2 runner gets its own tag and its own engine entry), and owning
+   memory, command and family.
+2. Provenance, which the pin used to provide for free: `docker/Dockerfile`
+   bakes the commit into `PB_RUNNER_BUILD`, and the binary logs
+   `pb-runner starting version=… engine_line=… build=<git sha>` before
+   anything that can fail. Once a tag moves, that log line is the ONLY record
+   of which build a container ran -- the task definition, the ECS console and
+   the ECR tag all describe the present, not the task's past.
+3. Rollback is re-pointing the tag, so every build also keeps an immutable
+   `<git sha>` tag to point back at (RUNBOOK "Shipping a pb-runner fix"). The
+   repo's `keep_last_images = 20` bounds how far back that reaches; older
+   than that, rebuild from the commit.
+4. Accepted cost: an auto-restart after a crash resolves the tag afresh, so a
+   bot that dies after a build comes back on the NEW build rather than the
+   one it was running. Builds are manual and deliberate, which makes that
+   acceptable; `promote: false` builds without making the result deployable
+   when it is not.
+5. The `promote` job is separate from `build` so it also runs when the build
+   was skipped as already-built (unchanged source), and it retags by copying
+   the manifest -- no pull, no push, no rebuild. Corollary: a commit that
+   changes nothing under `crates/`, `Cargo.*` or the Dockerfile promotes the
+   EARLIER image, so `build=<sha>` names that build, not the commit the
+   workflow ran on. That is accurate -- the binary really is the earlier
+   build -- but it is not the head commit.
