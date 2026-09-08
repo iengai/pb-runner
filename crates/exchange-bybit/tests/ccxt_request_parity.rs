@@ -42,6 +42,8 @@ struct Recorded {
     path: String,
     query: BTreeMap<String, String>,
     body: Option<Value>,
+    /// Lowercased header names, as they reached the socket.
+    headers: BTreeMap<String, String>,
 }
 
 /// Enough of an instruments-info response for `load_markets` to build the two
@@ -118,6 +120,7 @@ fn serve_one(mut stream: TcpStream) -> Option<Recorded> {
     let target = parts.next()?.to_string();
 
     let mut content_length = 0usize;
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).ok()? == 0 {
@@ -127,10 +130,12 @@ fn serve_one(mut stream: TcpStream) -> Option<Recorded> {
         if line.is_empty() {
             break;
         }
-        if let Some(v) = line.strip_prefix("content-length: ") {
-            content_length = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("Content-Length: ") {
-            content_length = v.trim().parse().unwrap_or(0);
+        if let Some((k, v)) = line.split_once(':') {
+            let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_string());
+            if k == "content-length" {
+                content_length = v.parse().unwrap_or(0);
+            }
+            headers.insert(k, v);
         }
     }
     let body = if content_length > 0 {
@@ -166,6 +171,7 @@ fn serve_one(mut stream: TcpStream) -> Option<Recorded> {
     Some(Recorded {
         method,
         path,
+        headers,
         query,
         body,
     })
@@ -336,6 +342,19 @@ fn fixture_request(label: &str, path_hint: &str) -> Recorded {
             Value::Null => None,
             v => Some(v.clone()),
         },
+        headers: hit["headers"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_ascii_lowercase(),
+                            v.as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -373,10 +392,40 @@ fn diff(ours: &Recorded, theirs: &Recorded) -> Vec<String> {
     out
 }
 
+/// Every header ccxt sets deliberately, we must set with the same value.
+/// Headers the HTTP stack adds on its own (host, accept, user-agent,
+/// content-length) are not ccxt's and are not compared.
+fn assert_headers(label: &str, ours: &Recorded, theirs: &Recorded) {
+    for (name, want) in &theirs.headers {
+        let key = name.to_ascii_lowercase();
+        // Signature, clock and key: presence is the claim, the value is not
+        // comparable between two clients.
+        let volatile = matches!(
+            key.as_str(),
+            "x-bapi-sign" | "x-bapi-timestamp" | "x-bapi-api-key"
+        );
+        // ccxt puts a Content-Type on private GETs too, where there is no
+        // body for it to describe and reqwest sends none.
+        if key == "content-type" && ours.method == "GET" {
+            continue;
+        }
+        let got = ours.headers.get(&key).unwrap_or_else(|| {
+            panic!(
+                "{label}: ccxt sends the header `{name}` to {} and we send none. On POST that includes `Referer`, which carries passivbot's broker code.",
+                ours.path
+            )
+        });
+        if !volatile {
+            assert_eq!(got, want, "{label}: header `{name}` on {}", ours.path);
+        }
+    }
+}
+
 fn assert_matches(label: &str, ours: &Recorded, case: &Case) {
     let theirs = fixture_request(case.ccxt, &ours.path);
     assert_eq!(ours.method, theirs.method, "{label}: HTTP method");
     assert_eq!(ours.path, theirs.path, "{label}: path");
+    assert_headers(label, ours, &theirs);
     let unexplained: Vec<String> = diff(ours, &theirs)
         .into_iter()
         .filter(|d| {

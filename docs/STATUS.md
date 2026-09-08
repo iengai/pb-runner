@@ -2,6 +2,38 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-08 -- the reduceOnly answer was wrong; the broker header is next (D25)
+
+**The confirming run ran and disproved it.** paper2 flat, rs on
+`build=cef25b8c…` (the merged build with all three D24 parity fixes), 15:21:27
+UTC: `qty=1.6 price=1.4148` -- 2.26 USDT -- rejected `110094` again, and again
+15 s later. Dropping `reduceOnly` changed nothing.
+
+**What went wrong in the reasoning:** "the only difference I could find" was
+treated as "the difference", when it was really a statement about where I had
+looked -- the harness compared method, path, query and body, and had not been
+extended to headers. The three fixes are all real divergences and all still
+correct; none was the fault. The cost was acting on a hypothesis (merge,
+build, swap the live bot) at the confidence of a proof.
+
+**What was left, and is now sent:** ccxt attaches the broker id as a `Referer`
+header on POST and only POST (`bybit.py:9424-9427`), from
+`options["brokerId"]`, which `exchanges/bybit.py::create_ccxt_sessions` sets
+to `passivbotbybit` and refuses to start without. We sent none. POST-only
+scope matches the failure surface exactly: our GETs have never been rejected,
+and neither have our >5 USDT orders.
+
+**Also changed:** the fixture records headers (sign/clock/key collapsed to
+`<volatile>`), and the parity test asserts every header ccxt sets
+deliberately. The assertion was calibrated first -- removed the header, watched
+it fail, put it back.
+
+**Next action:** build, then with paper2 flat run rs and watch one sub-5-USDT
+`entry_initial`. Accepted -> confirmed. Rejected -> the request is now
+identical byte for byte and header for header, so the cause is not in the
+request, and the next step is a same-moment state comparison between the two
+runtimes (leverage, margin mode, position mode, UTA tier), not another guess.
+
 ## 2026-09-08 -- a Bybit order field we send and the Python bot never has (D24)
 
 **What broke:** paper2 (`467146583`) closed its XRP long at 14:18:01 UTC and

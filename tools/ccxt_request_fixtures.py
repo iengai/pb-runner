@@ -52,6 +52,25 @@ CANNED = {
 }
 
 
+# Headers whose value is a signature, a clock or a credential: their presence
+# is worth recording, their content is not comparable and not committable.
+VOLATILE_HEADERS = {"x-bapi-sign", "x-bapi-timestamp", "x-bapi-api-key"}
+
+
+def stable_headers(headers) -> dict:
+    """Header names as sent, with volatile values replaced by a placeholder.
+
+    The `Referer` in here is not incidental: `exchanges/bybit.py` puts
+    passivbot's broker code in ccxt's `options["brokerId"]` and refuses to
+    start without it, and ccxt (bybit.py:9424-9427) turns that into a
+    `Referer` header on POST -- on POST only.
+    """
+    out = {}
+    for k, v in (headers or {}).items():
+        out[k] = "<volatile>" if k.lower() in VOLATILE_HEADERS else v
+    return out
+
+
 class Recorder:
     """Stands in for `Exchange.fetch` and keeps what each call would send."""
 
@@ -75,6 +94,7 @@ class Recorder:
                         "path": parsed.path,
                         "query": query,
                         "body": json.loads(body) if body else None,
+                        "headers": stable_headers(headers),
                     }
                 )
             # instruments-info is the only request allowed out: load_markets
@@ -103,7 +123,9 @@ def build_exchange() -> ccxt.bybit:
             "apiKey": "dummy-key-never-sent",
             "secret": "dummy-secret-never-sent",
             "enableRateLimit": False,
-            "options": {"defaultType": "swap"},
+            # exchanges/bybit.py::create_ccxt_sessions sets this from
+            # broker_codes.hjson and raises if it is missing.
+            "options": {"defaultType": "swap", "brokerId": "passivbotbybit"},
         }
     )
 

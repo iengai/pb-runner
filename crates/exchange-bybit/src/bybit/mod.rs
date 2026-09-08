@@ -21,6 +21,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const MAINNET: &str = "https://api.bybit.com";
 pub const TESTNET: &str = "https://api-testnet.bybit.com";
 
+/// passivbot's Bybit broker code (`broker_codes.hjson`), which
+/// `exchanges/bybit.py::create_ccxt_sessions` puts in ccxt's
+/// `options["brokerId"]` -- and ccxt then sends as the `Referer` header on
+/// every POST. passivbot treats it as mandatory: a missing or non-string
+/// code raises before the bot starts. We are running passivbot's engine on
+/// passivbot's configs, so we identify ourselves the same way; the Python
+/// bot on these same accounts always has.
+const BROKER_ID: &str = "passivbotbybit";
+
 /// Return codes the Python adapter treats as "already in the requested
 /// state" (`exchanges/bybit.py::update_exchange_config*`).
 const NOT_MODIFIED_CODES: &[&str] = &["110025", "110026", "110043"];
@@ -440,6 +449,9 @@ impl BybitClient {
             .post(format!("{}{}", self.cfg.base_url, path))
             .headers(self.auth_headers(ts, &sig))
             .header("Content-Type", "application/json")
+            // POST only, exactly as ccxt does it (bybit.py:9424-9427: the
+            // broker id becomes `Referer` on POST and on nothing else).
+            .header("Referer", BROKER_ID)
             .body(raw);
         self.send(req).await
     }

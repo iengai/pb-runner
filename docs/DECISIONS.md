@@ -982,7 +982,8 @@ fixes -- and the pin turned every fix into an infrastructure change.
    exchange reports, which is what Python does too, and `pside` still comes
    from the `positionIdx` we keep sending.
 
-6. **What is proven and what is not.** Proven: the field is a divergence from
+6. **What is proven and what is not** (SUPERSEDED -- the confirming run
+   disproved this; see D25). Proven: the field is a divergence from
    the Python bot's request, and the same order without it was accepted.
    NOT proven: that this field is what Bybit's validator branches on. 110094's
    exact trigger is undocumented, and the two attempts were twelve minutes
@@ -1044,3 +1045,75 @@ fixes -- and the pin turned every fix into an infrastructure change.
    argument for the harness, not the argument against the hand-written client
    (D11's four reasons for it are untouched); a small client is only worth
    having if something holds it to the shape it claims to copy.
+
+## D25 (2026-09-08) The `reduceOnly` hypothesis is dead; the broker `Referer` header is what was left (amends D24)
+
+1. **The confirming run D24 asked for was run, and it disproved D24.** paper2
+   flat, rs on `build=cef25b8c…` -- the merged build with all three parity
+   fixes -- at 15:21:27 UTC:
+
+   ```
+   [order] post XRP/USDT:USDT Buy Long qty=1.6 price=1.4148 entry_initial_normal_long
+   [order] create not acknowledged error=rejected by exchange:
+           110094 Order does not meet minimum order value 5USDT
+   ```
+
+   and again 15 s later. Removing `reduceOnly` changed nothing. D24 item 6
+   said this was not proven; it is now disproven, and this entry is the
+   retraction.
+
+2. **The reasoning error, named.** "The only difference I could find" was
+   treated as "the difference". It was in fact a statement about where I had
+   looked: the harness enumerated method, path, query and body, and had not
+   been extended to headers -- so the enumeration it licensed was incomplete
+   by construction. The three fixes D24 shipped are all real divergences and
+   all still correct; none of them was the fault. What cost something was
+   acting on the hypothesis (merge, build, swap the live bot) at the
+   confidence of a proof.
+
+3. **The difference that was left.** ccxt's bybit `sign()` (bybit.py:9424-9427)
+   attaches the broker id as a `Referer` header, on POST and on nothing else;
+   `exchanges/bybit.py::create_ccxt_sessions` (18-30) puts passivbot's code
+   there from `broker_codes.hjson` (`bybit: "passivbotbybit"`) and RAISES if
+   it is missing or not a string. Every order the Python bot has ever placed
+   on these accounts carried it. We sent no `Referer` at all.
+
+   Two things make this a better candidate than the last one: its scope is
+   POST-only, which is exactly the surface that fails (our GETs have never
+   been rejected, and our >5 USDT POSTs never have either), and a broker
+   agreement is the kind of relationship an exchange prices differently --
+   including, plausibly, the minimum order value it enforces.
+
+4. **Changed:** the client sends `Referer: passivbotbybit` on POST.
+   `tools/ccxt_request_fixtures.py` now records headers (signature, clock and
+   key collapsed to `<volatile>` -- their presence is the claim, their
+   content is neither comparable nor committable), and the parity test
+   asserts that every header ccxt sets deliberately is sent with the same
+   value. Headers the HTTP stack adds on its own are not ccxt's and are not
+   compared; ccxt's `Content-Type` on private GETs is skipped, since there is
+   no body for it to describe.
+
+   The assertion was calibrated before being trusted: with the header removed
+   the test fails naming `Referer`, with it present it passes. A probe that
+   cannot fail proves nothing.
+
+5. **What proof looks like -- written down BEFORE acting this time.** paper2
+   flat, rs on the next build, one sub-5-USDT `entry_initial`.
+   - Accepted: confirmed, and the mechanism is the broker agreement.
+   - Rejected again: then the request is byte-for-byte AND header-for-header
+     the Python bot's, and the cause is not in the request at all. The next
+     step in that case is not another guess but a state comparison taken from
+     both runtimes at the same moment -- leverage, margin mode, position
+     mode, UTA tier, `/v5/account/info` -- since that is the only surface
+     left that the two runtimes touch differently (the Python bot re-asserts
+     margin mode and leverage per symbol on every startup and hourly; we call
+     `configure_symbol` far less often).
+
+6. **Two shortcuts declined.** The user offered to have the order placed by
+   hand at 0.1 XRP, or to use the per-bot S3 key locally for the test.
+   Neither is taken: placing an order is executing a trade, which is not
+   mine to do, and the per-bot keys are IP-whitelisted trading keys that
+   AGENTS.md keeps off the dev box -- and being IP-bound to the NAT, that one
+   would not authenticate from here anyway. The test that answers this costs
+   one bot restart on an account that is already flat, which is cheaper than
+   either.
