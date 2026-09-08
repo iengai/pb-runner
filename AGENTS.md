@@ -43,13 +43,17 @@ Both lines expose `compute_ideal_orders_json` and `orchestrator::OrchestratorInp
   named `pb-runner/rlib-<tag>` in the `iengai/passivbot` fork.
 - Pin, do not track: passivbot by tag, ccxt Rust port by commit. Upgrades
   follow the procedure in `docs/PLAN.md` ("Upgrade procedure").
-- GitHub: use `gh auth switch --user iengai` for anything under `iengai/*` or
-  upstream PRs; switch back to the machine's default gh account afterwards.
+- GitHub: `iengai` is this machine's default gh account (2026-09-08). Leave it
+  active -- the old rule to switch back to the company account after each push
+  is retired. Merging your own PRs, pushing straight to `master` and running
+  the Actions workflows are all delegated; the quality gates below still hold,
+  and so does everything under "Never" above.
 - Git identity: this project and every sibling repo listed above are
   private. Commits must be authored as `kk <iamibe.kai@gmail.com>` (the
-  `iengai` identity), never with the machine's global git identity.
-  Set with `git config --local user.name kk` / `user.email
-  iamibe.kai@gmail.com` in any new clone or worktree before committing.
+  `iengai` identity). Since 2026-09-08 that is the machine's global git config
+  as well as every repo's local one, so a fresh clone needs no setup; still
+  worth `git log -1 --format='%an <%ae>'` after the first commit, which is the
+  check that caught four commits going in under the company account.
 - AWS: `AWS_PROFILE=dev`; in Git Bash set `MSYS_NO_PATHCONV=1` for `aws logs`.
 - Windows dev box: `cargo` 1.90 on host works for build/test. arm64 images are
   built through pbtb-rust's CodeBuild pipeline (user-triggered), or locally
