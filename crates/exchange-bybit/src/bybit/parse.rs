@@ -471,7 +471,19 @@ pub fn decimals_of_step(step: f64) -> usize {
 /// Format a value already rounded to `step` with exactly that many decimals
 /// (Bybit rejects excess precision).
 pub fn fmt_step(value: f64, step: f64) -> String {
-    format!("{:.*}", decimals_of_step(step), value)
+    let padded = format!("{:.*}", decimals_of_step(step), value);
+    if !padded.contains('.') {
+        return padded;
+    }
+    // ccxt's `paddingMode` is NO_PADDING, so `decimal_to_precision` rounds to
+    // the step and then drops trailing zeros: a price of 1.5 on a 0.0001 tick
+    // goes out as "1.5", not "1.5000". Bybit takes either, but "either" is how
+    // a client drifts (D24, and the parity test that caught this one).
+    let trimmed = padded.trim_end_matches('0').trim_end_matches('.');
+    match trimmed {
+        "" | "-" => "0".to_string(),
+        t => t.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -656,8 +668,12 @@ mod tests {
         assert_eq!(decimals_of_step(1.0), 0);
         assert_eq!(decimals_of_step(0.10), 1);
         assert_eq!(decimals_of_step(1e-5), 5);
-        assert_eq!(fmt_step(0.05, 0.001), "0.050");
+        // Rounded to the step, then trailing zeros dropped: ccxt NO_PADDING.
+        assert_eq!(fmt_step(0.05, 0.001), "0.05");
         assert_eq!(fmt_step(3814.26, 0.01), "3814.26");
         assert_eq!(fmt_step(233.0, 1.0), "233");
+        assert_eq!(fmt_step(1.5, 0.0001), "1.5");
+        assert_eq!(fmt_step(2.0, 0.1), "2");
+        assert_eq!(fmt_step(0.0, 0.001), "0");
     }
 }
