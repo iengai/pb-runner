@@ -54,6 +54,42 @@ struct Args {
     api_keys: PathBuf,
 }
 
+/// `idx:tradable:min_cost:long_size@price/short_size@price` per symbol that
+/// carries a position or is untradable — the two states that turn an idle
+/// cycle from "nothing to do" into a fault worth looking at.
+fn positions_summary(input: &serde_json::Value) -> String {
+    let f = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let mut out = Vec::new();
+    for s in input
+        .get("symbols")
+        .and_then(|s| s.as_array())
+        .unwrap_or(&Vec::new())
+    {
+        let tradable = s.get("tradable").and_then(|t| t.as_bool()).unwrap_or(true);
+        let side = |k: &str| {
+            s.get(k)
+                .and_then(|x| x.get("position"))
+                .map(|p| (f(p, "size"), f(p, "price")))
+                .unwrap_or((0.0, 0.0))
+        };
+        let (ls, lp) = side("long");
+        let (ss, sp) = side("short");
+        if tradable && ls == 0.0 && ss == 0.0 {
+            continue;
+        }
+        out.push(format!(
+            "{}:tradable={tradable}:min_cost={}:long={ls}@{lp}:short={ss}@{sp}",
+            f(s, "symbol_idx"),
+            f(s, "effective_min_cost"),
+        ));
+    }
+    if out.is_empty() {
+        "none".to_string()
+    } else {
+        out.join(" ")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -139,7 +175,17 @@ async fn run_live(args: &Args, config_text: &str) -> Result<()> {
         "only bybit is supported (got {})",
         key.exchange
     );
-    let client = Arc::new(BybitClient::new(BybitConfig::mainnet(key.key, key.secret))?);
+    // `live.recv_window_ms` is what the Python bot hands ccxt
+    // (`options.recvWindow`); without it every signed request carried the
+    // client default of 5 s regardless of the config.
+    let mut bybit_cfg = BybitConfig::mainnet(key.key, key.secret);
+    if let Some(ms) = raw
+        .pointer("/live/recv_window_ms")
+        .and_then(serde_json::Value::as_u64)
+    {
+        bybit_cfg.recv_window_ms = ms;
+    }
+    let client = Arc::new(BybitClient::new(bybit_cfg)?);
     let max_restarts = raw
         .pointer("/live/max_n_restarts_per_day")
         .and_then(serde_json::Value::as_u64)
@@ -268,6 +314,26 @@ async fn run_bot(
                     warnings = cycle.output.diagnostics.warnings.len(),
                     "planned"
                 );
+                // The count alone cannot be acted on: a bot that plans nothing
+                // looks identical to a bot with nothing to do. Name the engine's
+                // warnings and the per-symbol activity so an idle cycle is
+                // diagnosable from the log alone.
+                if !cycle.output.diagnostics.warnings.is_empty() {
+                    tracing::warn!(
+                        warnings = ?cycle.output.diagnostics.warnings,
+                        "engine warnings"
+                    );
+                }
+                if cycle.planned.is_empty() {
+                    tracing::warn!(
+                        balance = ?cycle.input.get("balance"),
+                        balance_raw = ?cycle.input.get("balance_raw"),
+                        positions = %positions_summary(&cycle.input),
+                        states = ?cycle.output.diagnostics.symbol_states,
+                        loss_gate_blocks = ?cycle.output.diagnostics.loss_gate_blocks,
+                        "no ideal orders this cycle"
+                    );
+                }
                 if dry_run {
                     for o in &p.cancels {
                         tracing::info!(symbol = %o.symbol, side = ?o.side, pside = ?o.pside, qty = o.qty, price = o.price, order_type = %o.pb_order_type, "dry-run cancel");
