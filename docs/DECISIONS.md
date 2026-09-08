@@ -835,6 +835,24 @@ host's clock was +1021 ms.
    client's REQUESTS are corrected -- `LiveRunner`'s own `wall` clock, which
    decides candle bucketing and cycle timing, still reads the host. The offset
    is a guard against rejection, not a substitute for NTP on the host.
+7. Scope, so this is not read as a live outage it was not: the LIVE bots have
+   never hit this. Three days of `10002` / `recv_window` across all three
+   passivbot log groups: zero. Every occurrence was on the dev box, where the
+   Windows Time service is not even running (`w32tm /query /status` ->
+   `0x80070426`, service not started), so nothing corrects the clock and it
+   free-runs; it was measured at +1021 ms during the paper2 dry-run and ~380
+   ms ahead again hours after a manual `w32tm /resync`. The ECS host is an
+   EC2 instance whose ECS-optimized AMI ships chrony against the Amazon Time
+   Sync Service, and a container shares the host kernel's clock, so the live
+   bots inherit a sub-millisecond clock. (That is how the AMI ships, not
+   something measured on this host -- `chronyc tracking` over SSM would
+   confirm it, and that is a command on the trading host.) D22 is therefore
+   insurance: it keeps signing correct if that clock ever does slip (NTP
+   down, instance migration, host resume), and it turns a `10002` into one
+   re-sync and one retry instead of a cycle error. The reason insurance is
+   worth it here is the failure SHAPE, not its likelihood -- a clock problem
+   fails every private call at once, so the 10/h error budget empties in
+   minutes and the bot exits rather than degrading.
 
 ## D23 (2026-09-08) The `8rs` task definition points at a moving version-line tag, so shipping a runner fix needs no terraform
 
