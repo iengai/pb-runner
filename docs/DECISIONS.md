@@ -994,11 +994,53 @@ fixes -- and the pin turned every fix into an infrastructure change.
 
 7. **Why four harnesses missed it.** diffcheck, snapcheck, plancheck and
    mockrun all replay recorded inputs and compare PLANS. A request body is
-   not a plan. Nothing in the suite has ever compared the bytes we POST with
+   not a plan. Nothing in the suite had ever compared the bytes we POST with
    the bytes ccxt would POST -- which is precisely the check D11 wrote down
    for itself ("record the Python bot's ccxt requests/responses for the
    read-only abot account and compare against this client's requests") and
    never ran. This is the second finding in two days whose hiding place was
    input/output acquisition rather than computation (D21 was the first), and
    the pattern is now explicit: the harnesses pin what the engine does with
-   an input, and nothing pins how the input or the order is carried.
+   an input, and nothing pinned how the input or the order is carried.
+
+8. **So that check now exists**, as a fifth harness, and it is the cheap
+   half of what D11 imagined -- no account and no key required:
+
+   - `tools/ccxt_request_fixtures.py` drives the pinned ccxt exactly as
+     passivbot drives it (every call site in `exchanges/bybit.py` and
+     `exchanges/ccxt_bot.py`), intercepts at `Exchange.fetch`, and writes
+     what would have gone on the wire to `tests/fixtures/ccxt_requests.json`.
+     Private responses are canned and the key is a dummy, so no order is
+     placed and no account is read; the one real call is the public
+     `instruments-info` that `load_markets` cannot do without.
+   - `crates/exchange-bybit/tests/ccxt_request_parity.rs` points the client
+     at a local socket that answers everything with a canned envelope, drives
+     the same seventeen call sites, and compares method, path, query and body
+     key by key. Values are compared as TEXT, so `10` and `"10"` are
+     different requests -- which is the point.
+   - Deliberate differences live in `CASES` with a reason each (today: the
+     7-day windows we walk for fills and closed-pnl, where ccxt uses its own
+     `paginate`). Anything else fails the test.
+
+   Re-run the generator after bumping ccxt and commit the diff: a change in
+   that fixture is a change in what the Python bot puts on the wire.
+
+9. **It immediately found two more divergences**, neither of which had done
+   visible damage, and both now fixed:
+
+   - **Price padding.** `fmt_step` formatted to the tick's decimal count, so
+     a price of 1.5 on a 0.0001 tick went out as `"1.5000"`. ccxt's
+     `paddingMode` is `NO_PADDING`, so `decimal_to_precision` rounds to the
+     step and then drops trailing zeros: `"1.5"`. Bybit accepts both, which
+     is exactly how a client drifts unnoticed.
+   - **Leverage spelling.** `set_leverage` stringifies its argument (ccxt
+     `number_to_string`), but the `leverage` that rides along on
+     `set_margin_mode` is whatever passivbot put in `params`, and
+     `_calc_leverage_for_symbol` returns an `int` -- so that one is a JSON
+     number, `10`, where we were sending `"10"`.
+
+   Three divergences in a surface of seventeen requests, from a client whose
+   inventory claimed the whole surface was reproduced verbatim. That is the
+   argument for the harness, not the argument against the hand-written client
+   (D11's four reasons for it are untouched); a small client is only worth
+   having if something holds it to the shape it claims to copy.

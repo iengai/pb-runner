@@ -37,11 +37,24 @@ change is not excluded by them alone. **Next action:** with paper2 flat, run
 the rs bot on the new build and watch whether a sub-5-USDT `entry_initial` is
 accepted. Until then that account cannot place an entry from the runner.
 
-**The gap this exposes:** all four harnesses replay recorded inputs and compare
-plans. A request body is not a plan, and nothing has ever compared the bytes we
-POST against the bytes ccxt would POST -- which is the parity check D11 wrote
-down for itself and never ran. Second finding in two days living in
-input/output acquisition rather than computation (D21 was the first).
+**The gap this exposed is now closed.** All four existing harnesses replay
+recorded inputs and compare plans; a request body is not a plan, and nothing
+had ever compared the bytes we POST against the bytes ccxt would POST -- the
+parity check D11 wrote down for itself and never ran. There is now a fifth
+harness: `tools/ccxt_request_fixtures.py` records what ccxt would send for all
+seventeen call sites passivbot uses (dummy key, canned private responses,
+nothing placed, nothing read), and
+`crates/exchange-bybit/tests/ccxt_request_parity.rs` drives our client against
+a local socket and compares method, path, query and body key by key, as TEXT,
+so `10` and `"10"` are different requests. Deliberate differences live in
+`CASES` with a reason.
+
+**It found two more divergences on its first run,** both fixed here:
+`fmt_step` padded prices to the tick's decimals (`"1.5000"` where ccxt's
+NO_PADDING gives `"1.5"`), and `set_margin_mode` carried `leverage` as a
+string where ccxt passes passivbot's `int` straight through. Three divergences
+in seventeen requests, in a client whose inventory claimed the surface was
+reproduced verbatim.
 
 ## 2026-09-08 — deploys stop going through terraform (D23)
 

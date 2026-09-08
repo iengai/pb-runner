@@ -850,7 +850,9 @@ impl ExchangeClient for BybitClient {
     /// `self.extend(request, params)`); a classic account gets the
     /// per-symbol `POST /v5/position/switch-isolated`. `set_leverage`
     /// (6762-6799) is `POST /v5/position/set-leverage` with
-    /// `buyLeverage = sellLeverage = number_to_string(leverage)`.
+    /// `buyLeverage = sellLeverage = number_to_string(leverage)`. The
+    /// `leverage` carried into `set_margin_mode` stays a JSON number, because
+    /// nothing stringifies it on that path.
     async fn configure_symbol(
         &self,
         symbol: &str,
@@ -858,7 +860,13 @@ impl ExchangeClient for BybitClient {
         margin_mode: MarginMode,
     ) -> Result<(), ExchangeError> {
         let id = self.id_of(symbol)?;
-        let lev = format!("{}", leverage as i64);
+        // `set_leverage` stringifies (ccxt `number_to_string`); the leverage
+        // that rides along on `set_margin_mode` does not -- it is whatever
+        // passivbot passed in `params`, and `_calc_leverage_for_symbol`
+        // returns an int. Two spellings of the same number, and the parity
+        // test holds us to both.
+        let lev_int = leverage as i64;
+        let lev = format!("{lev_int}");
         let unified = self.is_unified_account().await?;
         let (path, mode_body) = if unified {
             (
@@ -868,7 +876,7 @@ impl ExchangeClient for BybitClient {
                         MarginMode::Cross => "REGULAR_MARGIN",
                         MarginMode::Isolated => "ISOLATED_MARGIN",
                     },
-                    "leverage": lev,
+                    "leverage": lev_int,
                 }),
             )
         } else {
