@@ -122,6 +122,16 @@ sleep windows is swallowed (dev only).
 the next session start; nothing else in PLAN P1-P6 is doable without the
 user. If new fixtures are wanted: a fake run with a re-entry during an
 HSL cooldown (repanic path is unit-tested only).
+**Small-capital candidate config (user, 2026-09-08):** the v7-migrated
+`bybit-cap300-iter1-winner-v810.json` (private, strategy_lab; long
+`n_positions=1`, `twel=1.75`, short off, HSL off, unified mode). Verified:
+`--check-only` ok; read-only dry run vs abot (8 symbols, 1397 fills, plan
+0.75 s); a 400-step fake-exchange run with it (`.local/fake_v8_cap300`,
+balance 300, one seeded position): diffcheck 400/400, snapcheck 400/400,
+plancheck 400/400, mockrun engine inputs 400/400. Usable as the P5.3
+config. PR #35 review from the user received (1 must-fix: RUNBOOK deploy
+order lambda-before-`8rs`; 3 optional cleanups) — being applied.
+
 **Needs the user:** merge PR #35 and apply Terraform (ECR repo, later the
 `8rs` task definition); create the pb-runner CodeBuild project and run the
 first arm64 build (P6.2); approve the ECS shadow task (P5.2) and the
