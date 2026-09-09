@@ -43,12 +43,35 @@ Python's own replace thresholds tolerate while ours does not. The repeating
 holding the replacement create behind a cancel that a dry run never performs,
 so the state cannot advance and the same disagreement reprints forever.
 
+**A hypothesis with a number attached, written before the measurement.**
+Balance goes through `passivbot_rust::utils::hysteresis`: the snapped balance
+only moves when raw leaves a band around it (`balance_hysteresis_snap_pct`,
+2% by default), and `prev_hysteresis_balance == 0.0` on cycle 1 means a
+cold-started bot anchors on whatever raw was at startup. abot's Python bot
+reports `bal=264.47 USDT (snap 263.90)` -- its anchor is 0.216% below raw and
+has been for some time. The shadow started at 08:26:46 and anchored on raw.
+Two anchors 0.216% apart, and neither moves until raw travels 2%, which is why
+the disagreement is static rather than drifting.
+
+That predicts the signature exactly. Grid re-entry quantities come from the
+position, not the balance, so the two normal entries are identical -- as
+observed. The cropped entry is the residual against the wallet-exposure limit,
+so it absorbs the whole balance difference: 0.216% of ~1296.6 USDT of planned
+notional is ~2.80 USDT, or ~2.06 XRP at 1.3592. **The shadow's deferred create
+should be ~622.2-622.4 @ 1.3592 against Python's 620.2.** If it is, this is a
+cold-start artifact of shadowing and not a port defect. If the qty is 620.2
+and the PRICE differs, or the gap is not ~2, the hypothesis is dead and the
+crop arithmetic is the next place to look. Stated first, measured second --
+D25's evidence was the other way round.
+
 **Next action, and it is an observability fix first.** The dry-run path logs
 cancels and creates but not *deferred* creates, so the shadow can say it
 disagrees and cannot say what it wanted instead -- the disagreement is
 unreadable from the log alone. Log deferred creates with their bucket
-(`barrier`/`recent`/`churn`/`capacity`), redeploy the shadows, then compare
-the wanted order against `620.2@1.3592` and attribute from there.
+(`barrier`/`recent`/`churn`/`capacity`) -- done, `9566e89`, calibrated by
+removing the recording and watching the test fail. Redeploying the three
+shadows onto the new `v810` is blocked on permission for `ecs stop-task` /
+`ecs run-task`; until then the prediction above stands unmeasured.
 
 ## 2026-09-08 -- what the broker code actually is, and making it a choice (D26)
 
