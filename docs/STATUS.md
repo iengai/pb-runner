@@ -102,12 +102,41 @@ variable directly observable at both ends, against Python's own
 `bal=264.47 USDT (snap 263.90)`. It fires on change, which for a sticky anchor
 means once at startup and rarely after.
 
-**Next:** read both anchors directly -- the shadow's `[balance] hysteresis
-anchor moved` line at startup against the Python bot's `bal=X (snap Y)` --
-and if they differ as expected, decide what a shadow should do about it.
-Seeding the shadow from the live bot's anchor is not obviously right: it
-would make the comparison cleaner and the shadow less like the thing it is
-meant to stand in for.
+**Closed, by direct observation of the one variable.** Both ends, same minute:
+
+    py     09:05:49  bal=264.48 USDT (snap 263.90)
+    shadow 09:13:17  balance=264.48327615 balance_raw=264.48327615
+                     previous_anchor=0.0 snap_pct=0.01
+
+Identical raw balance; anchors 0.221% apart, because the shadow cold-started
+onto raw and Python has been holding an older anchor. Not inferred from the
+outputs this time -- read off both processes.
+
+The arithmetic closes too. By then Python had replaced its own order (09:00:16,
+`Δp=0.0221% Δq=0.0322%`) and the two runtimes' prices agreed exactly at 1.3589,
+leaving the entire residual in the balance-dependent quantity: 622.5 against
+620.4, a gap of 2.1 XRP against the 2.06 predicted from a 0.22% balance
+difference -- one qty step, which is the instrument's resolution.
+
+**Correction to the entry above:** the band is `snap_pct=0.01` in these configs,
+1%, not the 2% library default quoted before. It does not change the conclusion
+-- 0.22% is inside either -- but 2% was the wrong number to write down.
+
+**xxbot, meanwhile, disagreed and then stopped.** It showed `ideal=1 cancels=1
+matched=0` for a few minutes after its Python bot moved an order, and converged
+back to `matched=1 deferred=0` on its own. That is the shape a timing
+difference makes: transient. abot's is the other shape -- static, because
+neither anchor will move until raw travels 1%.
+
+**So: a property of shadowing, not a finding about the port.** Both runtimes
+seed the anchor identically on cold start, so the same gap opens whenever a
+Python bot is replaced by a Rust one mid-life; it is bounded by the band, it
+affects only balance-dependent orders, and it closes the next time raw leaves
+the band. Seeding a shadow from the live bot's anchor would make the comparison
+read cleaner and the shadow less faithful to the thing it stands in for, so it
+is not obviously worth doing. What was worth doing is being able to see it:
+before this, the shadow could report a disagreement and name neither the order
+nor the cause.
 
 ## 2026-09-08 -- what the broker code actually is, and making it a choice (D26)
 
