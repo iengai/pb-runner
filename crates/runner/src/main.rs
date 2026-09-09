@@ -361,6 +361,16 @@ async fn run_bot(
                         "no ideal orders this cycle"
                     );
                 }
+                // A count of deferrals is not diagnosable: it says the plan
+                // wanted something it did not send and never says what. That
+                // gap is what made the abot shadow's standing `deferred=1`
+                // unreadable -- a dry run cannot perform its own cancels, so
+                // the cancel-first barrier holds the replacement forever and
+                // the log repeats without ever naming the order. Python logs
+                // the same thing (`cancel-first barrier deferred N`).
+                for (o, why) in &p.deferred_orders {
+                    tracing::info!(symbol = %o.symbol, side = ?o.side, pside = ?o.pside, qty = o.qty, price = o.price, order_type = %o.pb_order_type, reason = why, "deferred");
+                }
                 if dry_run {
                     for o in &p.cancels {
                         tracing::info!(symbol = %o.symbol, side = ?o.side, pside = ?o.pside, qty = o.qty, price = o.price, order_type = %o.pb_order_type, "dry-run cancel");

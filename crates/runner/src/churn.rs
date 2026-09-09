@@ -536,34 +536,38 @@ impl ChurnGate {
     /// `market_dist` returns the signed `order_market_diff` of a create, or
     /// `None` when no market price is available (the create is then deferred,
     /// `market_distance_unavailable`). Returns the admitted creates and the
-    /// number deferred.
+    /// deferred ones -- the orders, not a count, because a deferral is only
+    /// diagnosable if you can see what was held back.
     pub fn admit(
         &mut self,
         creates: Vec<OrderRec>,
         market_dist: &dyn Fn(&OrderRec) -> Option<f64>,
         now: f64,
-    ) -> (Vec<OrderRec>, usize) {
+    ) -> (Vec<OrderRec>, Vec<OrderRec>) {
         if creates.is_empty() || !self.enabled() {
-            return (creates, 0);
+            return (creates, Vec::new());
         }
         let mut projected_usage = self.attempt_count(now) as i64;
         let mut selected = Vec::with_capacity(creates.len());
-        let mut deferred = 0usize;
+        let mut deferred = Vec::new();
         for o in creates {
             let always_allowed = !o.limit || o.risk_critical || !o.churn_evidenced;
             let exempt = if always_allowed {
                 true
             } else {
-                match market_dist(&o) {
+                // Bound before the match: the arm that defers moves `o`, and a
+                // borrow taken in the scrutinee would still be live there.
+                let dist = market_dist(&o);
+                match dist {
                     Some(d) if d.is_finite() => d <= self.params.market_dist_pct,
                     _ => {
-                        deferred += 1;
+                        deferred.push(o);
                         continue;
                     }
                 }
             };
             if o.churn_evidenced && !exempt && projected_usage + 1 > self.params.activation_count {
-                deferred += 1;
+                deferred.push(o);
                 continue;
             }
             selected.push(o);
@@ -924,7 +928,7 @@ mod tests {
         let mut far = order(90.0, 1.0);
         far.churn_evidenced = true;
         let (kept, deferred) = g.admit(vec![far], &|_| Some(0.1), 0.0);
-        assert_eq!((kept.len(), deferred), (1, 0));
+        assert_eq!((kept.len(), deferred.len()), (1, 0));
     }
 
     fn create(price: f64, evidenced: bool) -> OrderRec {
@@ -953,7 +957,7 @@ mod tests {
             create(96.0, true),  // deferred
         ];
         let (kept, deferred) = g.admit(creates, &dist, 10.0);
-        assert_eq!(deferred, 2);
+        assert_eq!(deferred.len(), 2);
         assert_eq!(
             kept.iter().map(|o| o.price).collect::<Vec<_>>(),
             vec![99.9, 97.0]
@@ -964,7 +968,7 @@ mod tests {
         assert_eq!(g.attempt_count(10.0), 4);
         // Once the first two attempts leave the window one far create fits again.
         let (kept, deferred) = g.admit(vec![create(98.0, true), create(96.0, true)], &dist, 601.0);
-        assert_eq!((kept.len(), deferred), (1, 1));
+        assert_eq!((kept.len(), deferred.len()), (1, 1));
         assert_eq!(kept[0].price, 98.0);
     }
 
@@ -984,10 +988,10 @@ mod tests {
             &dist,
             1.0,
         );
-        assert_eq!((kept.len(), deferred), (3, 1));
+        assert_eq!((kept.len(), deferred.len()), (3, 1));
         let (kept, deferred) = g.admit(vec![create(99.9, true)], &|_| None, 1.0);
-        assert_eq!((kept.len(), deferred), (0, 1));
+        assert_eq!((kept.len(), deferred.len()), (0, 1));
         let (kept, deferred) = g.admit(vec![create(99.9, true)], &|_| Some(f64::NAN), 1.0);
-        assert_eq!((kept.len(), deferred), (0, 1));
+        assert_eq!((kept.len(), deferred.len()), (0, 1));
     }
 }

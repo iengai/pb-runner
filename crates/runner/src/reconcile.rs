@@ -278,6 +278,13 @@ pub struct Plan {
     pub skipped_market_snapshot: usize,
     /// Limit creates dropped by the market-distance filter (SPEC 2.10).
     pub skipped_market_distance: usize,
+    /// Every order the plan wanted but did not submit, paired with the rule
+    /// that held it: `barrier`, `recent`, `churn`, `create_capacity`,
+    /// `cancel_capacity`. The counters above say how many; this says which,
+    /// which is the difference between a log that reports a disagreement and
+    /// one that can be acted on -- a dry run cannot advance its own state, so
+    /// a deferred create reprints every cycle with nothing naming it.
+    pub deferred_orders: Vec<(OrderRec, &'static str)>,
 }
 
 /// A create acknowledged less than 15 s ago (SPEC 2.8).
@@ -445,7 +452,9 @@ pub fn reconcile(
             to_cancel.into_iter().partition(|o| o.reduce_only);
         ro.extend(rest);
         plan.deferred_capacity += ro.len() - params.max_cancels_per_batch;
-        ro.truncate(params.max_cancels_per_batch);
+        let held = ro.split_off(params.max_cancels_per_batch);
+        plan.deferred_orders
+            .extend(held.into_iter().map(|o| (o, "cancel_capacity")));
         to_cancel = ro;
     }
     // 2.7 cancel-first barrier.
@@ -463,8 +472,7 @@ pub fn reconcile(
                 )
             })
             .collect();
-        let before = to_create.len();
-        to_create.retain(|o| {
+        let (kept, held): (Vec<OrderRec>, Vec<OrderRec>) = to_create.into_iter().partition(|o| {
             let scope = (
                 o.symbol.clone(),
                 if params.hedge_mode {
@@ -481,11 +489,13 @@ pub fn reconcile(
             // panic close waits for the scope's cancels like any create.
             !scopes.contains(&scope)
         });
-        plan.deferred_by_barrier += before - to_create.len();
+        plan.deferred_by_barrier += held.len();
+        plan.deferred_orders
+            .extend(held.into_iter().map(|o| (o, "barrier")));
+        to_create = kept;
     }
     // 2.8 recent-execution guard (15 s; qty 1 %, price 0.2 %).
-    let before = to_create.len();
-    to_create.retain(|o| {
+    let (kept, held): (Vec<OrderRec>, Vec<OrderRec>) = to_create.into_iter().partition(|o| {
         !recent.iter().any(|r| {
             now_ms.saturating_sub(r.timestamp_ms) < 15_000
                 && r.order.symbol == o.symbol
@@ -496,7 +506,10 @@ pub fn reconcile(
                 && (r.order.price - o.price).abs() <= o.price * 0.002
         })
     });
-    plan.deferred_recent += before - to_create.len();
+    plan.deferred_recent += held.len();
+    plan.deferred_orders
+        .extend(held.into_iter().map(|o| (o, "recent")));
+    to_create = kept;
     plan.cancels = to_cancel;
     plan.creates = to_create;
     plan
@@ -520,7 +533,9 @@ pub fn admit_and_cap(
     if let Some((gate, now_s)) = churn.as_mut() {
         let (admitted, deferred) = gate.admit(to_create, &|o| o.market_distance, *now_s);
         to_create = admitted;
-        plan.deferred_churn += deferred;
+        plan.deferred_churn += deferred.len();
+        plan.deferred_orders
+            .extend(deferred.into_iter().map(|o| (o, "churn")));
     }
     // 2.6 create capacity: risk-critical first (stable), then truncate.
     if to_create.len() > params.max_creates_per_batch {
@@ -528,7 +543,9 @@ pub fn admit_and_cap(
             to_create.into_iter().partition(|o| o.risk_critical);
         rc.extend(rest);
         plan.deferred_capacity += rc.len() - params.max_creates_per_batch;
-        rc.truncate(params.max_creates_per_batch);
+        let held = rc.split_off(params.max_creates_per_batch);
+        plan.deferred_orders
+            .extend(held.into_iter().map(|o| (o, "create_capacity")));
         to_create = rc;
     }
     // 2.9 every submitted create is an attempt, exempt ones included.
@@ -696,6 +713,11 @@ mod tests {
                                            // the 1.2 close is deferred by the cancel-first barrier (same symbol, one-way scope)
         assert!(plan.creates.is_empty());
         assert_eq!(plan.deferred_by_barrier, 1);
+        // The count says a create was held; this says which one, and it is the
+        // only thing that makes a standing deferral readable in a log.
+        assert_eq!(plan.deferred_orders.len(), 1);
+        assert_eq!(plan.deferred_orders[0].0.price, 1.2);
+        assert_eq!(plan.deferred_orders[0].1, "barrier");
         let hedged = ReconcileParams {
             hedge_mode: true,
             ..params()
@@ -797,6 +819,11 @@ mod tests {
         assert!(plan.creates[0].risk_critical);
         assert!(plan.creates[1].price > plan.creates[2].price); // closest to market first
         assert_eq!(plan.deferred_capacity, 3);
+        assert_eq!(plan.deferred_orders.len(), 3);
+        assert!(plan
+            .deferred_orders
+            .iter()
+            .all(|(_, why)| *why == "create_capacity"));
     }
 
     #[test]

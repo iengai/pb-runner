@@ -2,6 +2,54 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-09 -- PnL cannot measure the runtime; a shadow on abot can
+
+**The comparison that looked controlled is not.** abot and paper2 run
+byte-identical configs -- 232 keys, the only difference being `live.user` --
+and paper2 moved to the Rust runtime while abot stayed on Python. That reads
+like a runtime A/B and is not one. paper2 holds ~42 USDT against abot's ~264,
+so paper2's orders sit against the exchange minimum while abot's have room,
+and over the thirteen days when BOTH were still on Python paper2 returned
+0.13%/day against abot's 0.62%/day. Five to one, before any runtime changed.
+Whatever separates those two accounts was there first; no amount of waiting
+separates it from the runtime afterwards.
+
+**What can be measured instead.** A shadow on abot: the same account, the same
+moment, the same orders on the book, one runtime planning against the other's
+book. The metric is the reconciliation itself -- `cancels=0 creates=0
+matched=N` means the two runtimes wanted the same orders -- not a PnL
+difference that needs weeks to clear its own noise.
+`tools/bybit_account_report.py` (read-only, runs on the NAT) is still useful
+for balances and realized PnL; it just cannot answer this question.
+
+**Shadow up, and it disagrees.** `passivbot-v8-rs-shadow-abot`, dry-run,
+`build=8133c5c…`, started 08:26:46 UTC. Every cycle since: `ideal=3 cancels=1
+creates=0 matched=2 deferred=1`, wanting to cancel `Buy Long qty=620.2
+price=1.3592 entry_grid_cropped_long` -- which the Python bot posted at
+08:12:36 UTC, 14 minutes before the shadow started, and has held without
+replanning ever since. The two *normal* grid entries in the same wave
+(`47.2@1.4146`, `267.7@1.3908`) match exactly. Only the cropped one differs,
+by more than `order_match_tolerance_pct` (0.02%). The other two shadows are
+clean at the same moment: xxbot `ideal=1 … matched=1` at cycle 22633,
+dollardigger_v8ref `ideal=6 … matched=6` at cycle 22807 -- so this is abot's
+cropped entry, not a general shadow artifact.
+
+**Cause not determined.** Candidates, in no order: a port defect in
+cropped-entry sizing (the crop is the term most sensitive to balance, so a
+small input difference shows up there and nowhere else); an input difference
+the shadow inherits from starting cold; or drift that is real and that
+Python's own replace thresholds tolerate while ours does not. The repeating
+`deferred=1` is NOT a second symptom -- it is the 2.7 cancel-first barrier
+holding the replacement create behind a cancel that a dry run never performs,
+so the state cannot advance and the same disagreement reprints forever.
+
+**Next action, and it is an observability fix first.** The dry-run path logs
+cancels and creates but not *deferred* creates, so the shadow can say it
+disagrees and cannot say what it wanted instead -- the disagreement is
+unreadable from the log alone. Log deferred creates with their bucket
+(`barrier`/`recent`/`churn`/`capacity`), redeploy the shadows, then compare
+the wanted order against `620.2@1.3592` and attribute from there.
+
 ## 2026-09-08 -- what the broker code actually is, and making it a choice (D26)
 
 **It pays, per order.** Bybit's API Broker FAQ describes attribution as
