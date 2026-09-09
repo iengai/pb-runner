@@ -1072,6 +1072,24 @@ impl LiveRunner {
                 self.balance_hysteresis_pct,
             )
         };
+        // The anchor is per-process and sticky: it moves only when raw leaves
+        // a `balance_hysteresis_snap_pct` band (2% by default), and a cold
+        // start seeds it from whatever raw happened to be. Python does the
+        // same (`previous_hysteresis_balance is None -> balance_raw`,
+        // passivbot.py:16156), so this is parity-correct -- but it means two
+        // processes on the same account can size against balances that differ
+        // by up to the band, indefinitely, and every balance-dependent order
+        // then disagrees. That is invisible unless the anchor is logged, and
+        // it is exactly what a shadow comparison reads as a defect.
+        if snapped != self.prev_hysteresis_balance {
+            tracing::info!(
+                balance = snapped,
+                balance_raw = raw,
+                previous_anchor = self.prev_hysteresis_balance,
+                snap_pct = self.balance_hysteresis_pct,
+                "[balance] hysteresis anchor moved"
+            );
+        }
         self.prev_hysteresis_balance = snapped;
         let (cum_max, cum_last) = if builder.uses_realized_pnl()? {
             let markets = &self.markets;

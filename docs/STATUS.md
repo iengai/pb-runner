@@ -69,9 +69,45 @@ cancels and creates but not *deferred* creates, so the shadow can say it
 disagrees and cannot say what it wanted instead -- the disagreement is
 unreadable from the log alone. Log deferred creates with their bucket
 (`barrier`/`recent`/`churn`/`capacity`) -- done, `9566e89`, calibrated by
-removing the recording and watching the test fail. Redeploying the three
-shadows onto the new `v810` is blocked on permission for `ecs stop-task` /
-`ecs run-task`; until then the prediction above stands unmeasured.
+removing the recording and watching the test fail. The three shadows were
+redeployed onto that build and the measurement is above.
+
+**Measured: `qty=622.5 price=1.3589 reason=barrier`.** The prediction was
+622.2-622.4 @ 1.3592. The quantity landed one 0.1 step -- 0.04% -- above the
+band; the price moved by three ticks, 0.022%, just past the 0.02% match
+tolerance that makes this a replace at all.
+
+**The falsification clause was badly formed, and that matters more than the
+hit.** "If the price differs, the hypothesis is dead" was written without
+checking whether the grid price depends on balance. It does:
+`calc_entry_distance_multiplier` feeds `wallet_exposure /
+effective_wallet_exposure_limit` into the distance multiplier
+(`entries.rs:159-180`), and wallet exposure is position notional over balance.
+A balance difference moves the price as well as the quantity, so the clause
+would have discarded the hypothesis for confirming itself. Only the quantity
+half of the prediction carried information. It was right to within one step.
+
+**Parity-correct, not a port defect.** Python seeds the same anchor the same
+way -- `previous_hysteresis_balance is None -> balance_raw` (passivbot.py:16156)
+-- so both runtimes cold-start on whatever raw was at process start and hold it
+until raw travels 2%. Two processes on one account can therefore size against
+balances that differ by up to the band, indefinitely. For a shadow that is
+structural: it will read as a standing disagreement on every balance-dependent
+order for as long as the anchors differ, and it is not evidence about the port.
+
+**Still an inference, so the anchor is now logged.** Everything above reads the
+cause backwards out of the outputs. `[balance] hysteresis anchor moved`
+(`balance`, `balance_raw`, `previous_anchor`, `snap_pct`) makes the one
+variable directly observable at both ends, against Python's own
+`bal=264.47 USDT (snap 263.90)`. It fires on change, which for a sticky anchor
+means once at startup and rarely after.
+
+**Next:** read both anchors directly -- the shadow's `[balance] hysteresis
+anchor moved` line at startup against the Python bot's `bal=X (snap Y)` --
+and if they differ as expected, decide what a shadow should do about it.
+Seeding the shadow from the live bot's anchor is not obviously right: it
+would make the comparison cleaner and the shadow less like the thing it is
+meant to stand in for.
 
 ## 2026-09-08 -- what the broker code actually is, and making it a choice (D26)
 
