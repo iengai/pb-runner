@@ -2,6 +2,49 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-10 -- a second disagreement class: the hourly candle roll
+
+**Found by asking the census question instead of the snapshot question.** Every
+report so far read the shadows at a moment. Counting *which order types* ever
+disagreed over 06:00-12:00 UTC turned up something the snapshots had missed:
+besides the standing cropped-entry gap, all three shadows disagree on
+`entry_grid_normal_long` in short bursts -- and every burst starts within four
+seconds of the top of an hour.
+
+    abot                07:00:02  08:00:02  09:00:03  10:00:02  11:00:01
+                        spans 10-23 s
+    dollardigger_v8ref  08:00:04  11:00:03
+                        spans 26-33 s
+
+**The signature says timing, not arithmetic.** At 11:00:01 abot's shadow
+reprices its whole XRP ladder in one cycle -- 1.3678 -> 1.3669, 1.3458 ->
+1.3442, 1.3162 -> 1.3140 -- while the quantities do not move at all (48.6 and
+275.6 before and after). Prices shift, sizes do not: that is
+`volatility_ema_1h` rolling onto a new hourly bar and feeding
+`calc_entry_distance_multiplier`, not a different computation. Python crosses
+the same boundary seconds later and the two reconverge on their own.
+
+**This is the number that matters for "how well does the port reproduce
+Python".** dollardigger_v8ref is the shadow whose balance anchor sits inside
+`order_match_tolerance_pct`, so it is the one measuring the port rather than
+the anchor. Over those six hours it agreed on every order in every cycle
+except two windows of about half a minute each, both at an hour boundary --
+roughly 1% of cycles, and that 1% is a clock offset that heals itself.
+
+**Cost, on a live bot rather than a shadow.** A shadow only prints the
+disagreement; a live runner would cancel and repost the whole ladder each time
+it crossed the boundary first, five times in six hours on abot. The churn gate
+may absorb some of that, and the orders are far from market so nothing is
+likely to be missed, but it is real churn and it is worth knowing whether
+Python has the same skew against *its* own restart cohort or whether the
+runner rolls early.
+
+**Not established:** which side rolls first, and why. The shadow repricing at
+11:00:01 and Python still on old prices for ~15 s is consistent with the
+runner picking up the new bar promptly and Python lagging, and equally with
+Python's candle refresh simply landing on a different schedule. Nothing here
+measures the two fetches against each other.
+
 ## 2026-09-10 -- the anchor result replicates across three accounts
 
 **One account was a story; three are a measurement.** The shadows were
