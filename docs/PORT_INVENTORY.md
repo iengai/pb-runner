@@ -240,8 +240,14 @@ major and refuses the other line.
 Template key diff (`get_template_config()` at both tags, flattened):
 
 - `live`: 47 keys at v7 vs 62 at v8. v7-only:
-  `initial_entry_exec_max_market_dist_pct` (retired in v8, migrated to
-  `limit_order_create_max_market_dist_pct`, v8.1.0 changelog l.806). v8-only:
+  `initial_entry_exec_max_market_dist_pct` (retired in v8; a positive value
+  migrates to `order_replacement_churn_gate_market_dist_pct`, a null or
+  non-positive one to `order_replacement_churn_gate_activation_count = 0`
+  -- upstream `docs/configuration.md:520`, changelog l.806. NOT to
+  `limit_order_create_max_market_dist_pct`, which this line claimed until
+  2026-09-10; the live configs settle it, carrying the v7 value 0.005 in
+  `order_replacement_churn_gate_market_dist_pct` and the v8 default 0.8 in
+  `limit_order_create_max_market_dist_pct`). v8-only:
   `strategy_kind`, `limit_order_create_max_market_dist_pct`, the four
   `order_replacement_churn_gate_*`, `exchange_symbol_unavailable_cooldown_hours`,
   `enable_forager_ws_candles`, `forager_ws_candle_rest_audit_minutes`,
