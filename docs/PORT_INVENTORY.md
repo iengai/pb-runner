@@ -237,6 +237,25 @@ conversion is the explicit `passivbot tool migrate-config-v7`
 lines 27-71). `crates/runner/src/config.rs:23-47` already classifies by
 major and refuses the other line.
 
+**Which path the live bots actually took, settled 2026-09-10.** Upstream's
+tool, not a local script. `passivbot tool migrate-config-v7`
+(`src/passivbot_cli/main.py:190-193` -> `src/tools/migrate_config_v7.py` ->
+`src/config/migrations/trailing_grid_v7.py`) was run over the lab configs and
+left its own reports beside the outputs in `strategy_lab/configs/v81/`
+(`*.v8.json` + `*.migration-report.json`, nine pairs): `source_version
+"v7.12.0"`, `destination_strategy_kind "trailing_grid_v7"`,
+`canonical_validation {"status": "ok"}`, written with
+`--allow-manual-review-output`. The deployed S3 objects' `bot` and
+`coin_overrides` are byte-identical to those outputs, so no strategy parameter
+was hand-edited anywhere along the way. No hand-written schema migration exists
+in pb-runner, pbtb-rust or the passivbot checkout.
+
+The only local code in the pipeline is `strategy_lab/scripts/make_pbtb_template.py`
+(~29 lines, and `strategy_lab/` is git-excluded, which is why it appears in no
+history): it runs after the migration, adds the control-plane `pbtb` block plus
+the legacy flat `strategy_name`/`strategies` markers, overwrites `live.*`
+runtime settings, and drops `metrics`/`optimize`. It does not touch `bot`.
+
 Template key diff (`get_template_config()` at both tags, flattened):
 
 - `live`: 47 keys at v7 vs 62 at v8. v7-only:

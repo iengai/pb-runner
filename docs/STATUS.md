@@ -2,6 +2,58 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-10 -- the anchor result replicates across three accounts
+
+**One account was a story; three are a measurement.** The shadows were
+restarted onto the anchor-logging build at 09-09 09:13 UTC, which gave all
+three a fresh cold-start anchor at the same moment. Twenty-one hours and ~29k
+cycles later, at 06:10 UTC:
+
+    shadow              py snap    shadow anchor    gap       reconciliation
+    dollardigger_v8ref   330.43       330.4639    +0.010%    ideal=5 matched=5
+    xxbot               1003.33      1004.3246    +0.099%    ideal=5 matched=4 cancels=1
+    abot                 263.90       264.4833    +0.221%    ideal=3 matched=2 cancels=1
+
+`order_match_tolerance_pct` is 0.0002. The one shadow whose anchor sits inside
+that tolerance agrees on every order; the two outside it disagree on exactly
+one order each, and in both cases that order is `entry_grid_cropped_long` --
+the single balance-dependent order in the wave. xxbot: DOGE 9062.0 vs 9035.0
+(+0.30%), price one tick apart. abot: XRP 644.3 vs 642.1 (+0.34%), price
+identical.
+
+xxbot is the useful one. Before the restart it was clean at `ideal=1
+matched=1`; the restart handed it a new anchor and the same signature appeared
+on a different account, a different coin, and a different order count. That is
+the mechanism reproducing on demand rather than one account's coincidence.
+
+**What this does and does not license.** It closes the abot question: the
+standing shadow disagreement is a cold-start anchor artifact, parity-correct on
+both sides, and not a port defect. It does not make shadows useless -- five of
+five and four of five orders still match exactly, which is the actual parity
+result -- but it does put a floor under them: any balance-dependent order is
+uncomparable while the anchors differ by more than the match tolerance, and
+neither anchor moves until raw travels the configured 1% band. A shadow
+started at the same moment as the bot it shadows would not have this problem;
+one started 14 minutes later has it for as long as both processes live.
+
+**Unrelated, and open: paper2 plans nothing for minutes at a time.** In the 24
+hours to 06:00 UTC the live rs runner on `467146583` logged 518 warnings in
+five bursts (09-09 06, 07, 08, 15 and 20 UTC), each a minute or two long, every
+cycle in the burst pairing `StrategyInputUnavailable { pside: Long, scope:
+StrategyOrders }` with `no ideal orders this cycle` -- while holding a position
+(`long=1.7@1.4`, balance 42.16). No orders are planned at all during those
+windows. Python has a visibly similar state (`[trailing] trailing state
+unavailable reason=missing_exact_trailing_candles ... until_fresh`), so this
+may well be parity-correct, but the two have not been compared at the same
+moment and nothing here establishes that they enter and leave the state
+together. That comparison is the next thing to do. The other live rs runner
+(`452425891`, 3 coins) logged one warning in the same period, a rate-limited
+candle refresh that fell back to cached candles.
+
+**Also this period:** 0 ERROR, 0 write failures and 0 `110094` across both live
+rs runners in 24h. Memory, two-hour average: rs 17.0 MiB live and 18-20 MiB
+per shadow, against Python's 375.5 (v8) and 403.5 (v7).
+
 ## 2026-09-09 -- PnL cannot measure the runtime; a shadow on abot can
 
 **The comparison that looked controlled is not.** abot and paper2 run
@@ -50,8 +102,10 @@ only moves when raw leaves a band around it (`balance_hysteresis_snap_pct`,
 cold-started bot anchors on whatever raw was at startup. abot's Python bot
 reports `bal=264.47 USDT (snap 263.90)` -- its anchor is 0.216% below raw and
 has been for some time. The shadow started at 08:26:46 and anchored on raw.
-Two anchors 0.216% apart, and neither moves until raw travels 2%, which is why
-the disagreement is static rather than drifting.
+Two anchors 0.216% apart, and neither moves until raw travels the band, which
+is why the disagreement is static rather than drifting. (These bots configure
+`balance_hysteresis_snap_pct = 0.01`; 2% is upstream's default, not their
+setting -- corrected 2026-09-10, the shadow's own anchor line reports it.)
 
 That predicts the signature exactly. Grid re-entry quantities come from the
 position, not the balance, so the two normal entries are identical -- as
@@ -90,7 +144,8 @@ half of the prediction carried information. It was right to within one step.
 **Parity-correct, not a port defect.** Python seeds the same anchor the same
 way -- `previous_hysteresis_balance is None -> balance_raw` (passivbot.py:16156)
 -- so both runtimes cold-start on whatever raw was at process start and hold it
-until raw travels 2%. Two processes on one account can therefore size against
+until raw travels the configured band -- 1% on these bots. Two processes on
+one account can therefore size against
 balances that differ by up to the band, indefinitely. For a shadow that is
 structural: it will read as a standing disagreement on every balance-dependent
 order for as long as the anchors differ, and it is not evidence about the port.
