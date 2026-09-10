@@ -46,7 +46,27 @@ windows. Python has a visibly similar state (`[trailing] trailing state
 unavailable reason=missing_exact_trailing_candles ... until_fresh`), so this
 may well be parity-correct, but the two have not been compared at the same
 moment and nothing here establishes that they enter and leave the state
-together. That comparison is the next thing to do. The other live rs runner
+together.
+
+**That comparison arrived the same day, from the abot shadow.** At 14:04 UTC
+abot's Python bot closed its XRP position and immediately reopened it
+(`10.7 @ 1.3653`), then logged `[trailing] trailing state unavailable
+reason=missing_exact_trailing_candles symbols=XRP
+action=mark_trailing_branches_unavailable_until_fresh` at 14:04:27 and posted
+nothing after it. The rs shadow on the same account, holding that same
+`long=10.7@1.3653`, was logging `StrategyInputUnavailable { pside: Long, scope:
+StrategyOrders }` with `ideal=0` across the whole window. Same account, same
+minute, same position, both runtimes refusing to plan, and Python naming the
+reason: the trailing branches need candles anchored at the new position and
+they are not there yet.
+
+That is entry into the state matched directly rather than inferred. It is not
+yet exit -- as of 14:05:54 neither had recovered, so what the comparison shows
+is that they stop together, not that they resume together. The remaining
+question is whether one waits materially longer than the other, which needs a
+window that has closed on both sides.
+
+The other live rs runner
 (`452425891`, 3 coins) logged one warning in the same period, a rate-limited
 candle refresh that fell back to cached candles.
 
