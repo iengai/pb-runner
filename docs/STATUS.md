@@ -2,6 +2,71 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-11 -- exit timing closed; the short orders were configured; one shared blip
+
+**The `ideal=0` wait: the runner does not wait longer than Python.** The
+2026-09-10 entry matched *entry* into the trailing-candle wait and left exit
+open. Fourteen windows on abot since then; four read end to end, comparing
+when each runtime actually re-planned the grid -- the shadow's first
+`creates=3`, Python's `[order] post` of the same three entries:
+
+    fill        shadow wants grid    python posts grid
+    04:37:01    04:39:01             04:39:27   (+26 s)
+    07:15:31    07:17:01             after 07:17:10, not captured
+    12:35:19    12:37:01             12:37:02   (+1 s)
+    14:11:32    14:13:01             14:13:08   (+7 s)
+
+The runner resumes on the first cycle of the second minute after the fill,
+every time -- it needs the completed candle for the fill's own minute, which
+exists only once the next minute has begun. Python posts the same grid 1-26 s
+after that. Once Python has posted, the shadow matches two of three and
+disagrees only on the cropped entry, which is the balance anchor again.
+
+**Retraction of the proxy.** The comparison first used Python's `[trailing]
+succeeded ... entry/grid` line as its exit signal, which put Python ahead of
+the runner in three windows (+11, +13, +20 s). That line is not the exit.
+Python logs it seconds after the unavailability warning and still posts
+nothing until the minute boundary has passed. Order posts are the
+measurement; the trailing line measures nothing about resumption.
+
+**The short orders on paper2 were configured, not a defect.** paper2 posted
+`close_grid_short` / `entry_grid_normal_short` / `entry_grid_cropped_short` at
+14:12:01, its first short-side activity since the runner started (49 short
+order lines, all in hour 13-14 UTC). The config both runtimes read has a live
+short side -- `bot.short.risk.total_wallet_exposure_limit = 2.996`,
+`live.approved_coins.short = ["XRP"]`, identical in paper2 and abot -- and
+abot's Python bot went short in the same hour on the same config (entry 13:55:31,
+close fill 14:11:03, +0.026 USDT), retiring its short grid on close exactly as
+the runner did one cycle after its own close.
+
+What is wrong is the label. `pbtb.strategies` says `[{"side": "long"}]`, and
+`strategy_lab/scripts/make_pbtb_template.py` stamps that with the comment
+"long-only: short twel is 0". For this template short TWEL is 2.996. Anything
+that reads `pbtb` to decide which sides a bot trades is being told something
+the engine does not do. Not changed here: the objects live in the config
+bucket, and uploads need an explicit instruction.
+
+**2026-09-10 20:43:00 UTC: one network blip, every runtime.** Both live rs
+runners logged their only ERROR of the period in the same second, against
+different endpoints (`/v5/execution/list`, `/v5/account/wallet-balance`),
+`rate_limited=false`. Python v8 (`674faef8`, ticker `RequestTimeout`) and
+Python v7 (`36bfda56`, `/v5/position/list` `RequestTimeout`) errored in the
+same second. All four charged one unit to the hourly error budget and
+continued; no task restarted. Bybit or egress, not the runner.
+
+**Memory is steps, not a slope.** Six-hour maxima since 09-08: live rs 17 ->
+21 MiB at 09-10 04:00 and flat for 30 h since; shadows 16-19 -> 20-24 MiB in
+the same window and flat since. A one-time allocation, not a leak. Python v8
+373 / 384 MiB, v7 404 / 417 MiB.
+
+**Python-side, for the record.** v7 `36bfda56` placed no new orders for five
+hours while holding a DOGE long, then closed it on its resting close order
+(fills 8 -> 9, realized +2.16 -> +3.87 USDT); the `missing order ...
+close_grid_long` line at 13:55 was that order filling, not a lost order. Its
+candle health has degraded all day (`unhealthy_surfaces` 10 -> 14, BTC 1h
+missing=54) after rate-limited `fetch_ohlcv` calls. It is still trading;
+worth watching.
+
 ## 2026-09-10 -- a second disagreement class: the hourly candle roll
 
 **Found by asking the census question instead of the snapshot question.** Every
