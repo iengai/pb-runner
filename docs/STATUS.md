@@ -96,6 +96,21 @@ the anchor. Over those six hours it agreed on every order in every cycle
 except two windows of about half a minute each, both at an hour boundary --
 roughly 1% of cycles, and that 1% is a clock offset that heals itself.
 
+**Corrected 2026-09-13: dollardigger_v8ref does not measure the port alone.**
+Its live twin `436713564` runs `passivbot-live:v7.12.0-arm64` (task family
+`scalable-cluster-dev-passivbot:2`) on its v7 config; the shadow runs
+pb-runner on `436713564-v8ref`, the upstream-migrated v8 version. Its agreement
+therefore measures migration, engine line and runtime together -- not rs
+against py on one config. The number above is real, and says the migrated
+config on the Rust runtime reproduced a v7 Python bot's orders for hours at a
+time; it is not the port-fidelity figure it was offered as. Since about 09-11
+12:00 UTC this shadow has also held a standing disagreement on a DOT cropped
+entry (114.1 vs 114.0) that its anchors cannot explain -- both unchanged since
+09-09, 0.010% apart -- which, given the v7/v8 difference, is evidence about
+neither the port nor the anchor. The clean rs-against-py comparisons are the
+ones sharing a v8 config: xxbot throughout, and abot until the 2026-09-11
+15:00 UTC runtime swap.
+
 **Cost, on a live bot rather than a shadow.** A shadow only prints the
 disagreement; a live runner would cancel and repost the whole ladder each time
 it crossed the boundary first, five times in six hours on abot. The churn gate
