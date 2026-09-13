@@ -2,6 +2,42 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-13 -- shadows now sit beside Python bots only
+
+**Why they moved.** The runtime map changed under the shadows. Bot attributes
+(`scalable-cluster-dev-bots`, `runtime`): abot=rs, DollarDigger=rs,
+Low-Risk Trader=rs, PaperTrader=rs, xxbot=rs, **paper2=py**. abot has been on
+Rust since the 2026-09-11 swap, which made its shadow rs-against-rs.
+DollarDigger (`436713564`) and `516889601` restarted on Rust at 12:47-12:48
+UTC today with updated v8 configs, 10 coins each; both took their books over
+cleanly (DollarDigger re-gridded DOT and was `matched=5` by cycle 41,
+`516889601` re-gridded SOL and was `matched=6` by cycle 60). The old
+`dollardigger_v8ref` shadow was a copy of a superseded config beside what is
+now a Rust bot.
+
+**What changed.** On the user's decision: `abot` and `dollardigger_v8ref`
+shadows retired, `paper2` added. Applied from a worktree off `origin/main`
+(`terraform plan -target=module.passivbot_shadow`: 2 add, 0 change, 2
+destroy, task definitions only). The two retired log groups were taken out of
+state first rather than destroyed -- they hold the raw evidence for the anchor,
+trailing-wait and hourly-roll entries below -- and now age out on retention.
+The push to `main` was rejected: pbtb-rust `main` now requires a PR and the
+`gate` check. **PR iengai/pbtb-rust#140 carries the change; until it merges,
+dev is ahead of main**, and an apply from main would try to recreate the
+retired shadows and collide with the two log groups now outside state.
+
+**First reading from the paper2 shadow.** Config accepted (`exchange=467146583`,
+v8, `dry_run=true`), anchor 42.6972 against Python's snap 42.66: 0.087%, over
+the 0.02% match tolerance. Every cycle since: `ideal=2 matched=1 cancels=1`,
+the normal entry identical and the cropped entry 106.0 vs 105.8 at the same
+price 1.2958 -- the anchor signature, nothing new.
+
+**A trap on the one remaining long-running parity shadow.** xxbot's attribute
+is already `runtime=rs`, but its task has run the Python image since 09-05,
+because the attribute is read only at launch. Its next start -- a restart for
+any reason -- silently turns the xxbot shadow into rs-against-rs. After that
+paper2 is the only rs-against-py comparison left.
+
 ## 2026-09-11 -- exit timing closed; the short orders were configured; one shared blip
 
 **The `ideal=0` wait: the runner does not wait longer than Python.** The
