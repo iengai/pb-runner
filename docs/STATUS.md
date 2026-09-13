@@ -38,6 +38,13 @@ because the attribute is read only at launch. Its next start -- a restart for
 any reason -- silently turns the xxbot shadow into rs-against-rs. After that
 paper2 is the only rs-against-py comparison left.
 
+**Rejection census, completed.** Every wave on the three Rust bots from
+2026-09-11 00:00 UTC to the 09-13 restarts: abot 121 creates / 0 failures,
+`516889601` (the pre-restart task) 32 / 0, `452425891` 141 / 0. The only
+exchange error in the period is abot's `110001` at 08:44:03 -- a cancel that
+lost the race to its own fill (50.0 @ 1.346, position 10.7 -> 60.7), classified
+as already-gone with `failures=0`. No create was rejected on any of them.
+
 ## 2026-09-11 -- exit timing closed; the short orders were configured; one shared blip
 
 **The `ideal=0` wait: the runner does not wait longer than Python.** The
