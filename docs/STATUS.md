@@ -41,9 +41,39 @@ unstuck/trailing close pair within seconds of each other around 04:05.
 **What this does and does not show.** The Rust runtime took the same
 loss-realizing path Python took, on the same day, through the same order type
 -- the unstuck path had never been exercised live on Rust before, and it now
-has. It does not show the unstuck *sizing* matches: the two accounts' allowances
-differ, so the amounts are not comparable one-to-one. A shadow beside a Python
-bot through an unstuck episode would be.
+has. Across the two accounts the unstuck *sizing* is not comparable, because
+the allowances differ.
+
+**The sizing, settled by the shadow that was already there.** The paper2 shadow
+(Rust, dry-run) sat on paper2's account through the same episode, beside
+Python on the same config and allowance. Two windows read line by line:
+
+    04:05  python posts  close_unstuck_long 17.5 @ 1.3004 + close_trailing_long 143.4 @ 1.3362
+           shadow wants  close_unstuck_long 17.5 @ 1.3006/1.3000/1.3005 + close_trailing_long 143.4 @ 1.3362
+    07:46  python posts  close_unstuck_long 17.2 @ 1.2883
+           shadow        dry-run create 17.2 @ 1.2883, then matched=1 once Python's order was on the book
+
+Quantities identical in both, the trailing close identical, the unstuck price
+within ticks as the market moved (that order is priced off the current price;
+in the second window it is exact). The shadow's standing cancel of `150.9 @
+1.3362` in the first window is Python's previous trailing close, which Python
+itself replaced with 143.4 seconds later. Over 09-15 12:00 -> 09-17 00:00 the
+shadow logged 95 `close_unstuck_long` and 129 `close_trailing_long` lines of
+deferred/cancel activity; the two windows above were read, the rest were not
+individually.
+
+**Operations over period B (09-11 15:05 -> 09-17 07:30).** abot on Rust: one
+ERROR, 09-15 07:19:44, a single network failure on one request, cycle
+abandoned and charged to the budget -- this time *not* shared: no Python bot or
+shadow logged anything in that minute. One clock re-sync after a rejected
+request timestamp, handled. 9741 WARN lines: 6642 `no ideal orders`, 2848
+`StrategyInputUnavailable{Long}`, 238 `{Short}`, concentrated on the active days
+(09-14: 2902, 09-16: 4585). About 3.5k of the `no ideal orders` cycles carry no
+engine warning; the paper2 shadow shows cycles of that kind (07:45:50,
+`ideal=0 warnings=0`) at moments when Python also had nothing on the book,
+which fits a position over its exposure limit with no close due yet, but
+abot's were not checked one by one. paper2 on Python: 0 ERROR, 114 WARNING,
+14 websocket reconnects, RSS 341.6 MiB.
 
 ## 2026-09-13 -- shadows now sit beside Python bots only
 
