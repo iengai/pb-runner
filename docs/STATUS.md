@@ -2,6 +2,49 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-09-17 -- the abot/paper2 crossover, scored mark-to-market
+
+**Design.** Byte-identical configs. Period A, 09-08 16:01 -> 09-11 15:00 UTC
+(2.96 d): abot on Python, paper2 on Rust. Period B, 09-11 15:00 -> 09-17 07:27
+(5.69 d): swapped, neither task restarted since. Scored by
+`tools/bybit_crossover_report.py` on the NAT: equity (cash + unrealized)
+rebuilt at each boundary by walking backward from today's wallet and position.
+**Calibration held**: backward cash minus Bybit's own recorded `cashBalance`
+= +0.000000 at both boundaries on both accounts; no close with an unknown
+entry price; no transfers.
+
+    period   abot                          paper2
+    A        py  +3.04 USDT  +0.389 %/day  rs  +0.46 USDT  +0.371 %/day
+    B        rs -19.22 USDT  -1.264 %/day  py  -4.12 USDT  -1.699 %/day
+
+Crossover arithmetic, %/day: runtime effect (rs - py) = ((-1.264 - 0.389) +
+(0.371 + 1.699)) / 2 = **+0.21**; period effect (B - A) = **-1.86**. The period
+term is nine times the runtime term, and with two accounts and one swap there
+is no variance to test the runtime term against. **Not evidence that either
+runtime earns more.** Within each period the two runtimes landed close
+together (A: 0.389 vs 0.371), which is the more informative reading.
+
+**Where period B's loss came from: one day, one mechanism, both runtimes.**
+Every day was positive on both accounts except 09-16 (abot -26.43, paper2
+-5.21), the day after XRP fell from 1.4227 to 1.2826 (low 1.2636) on 09-15.
+All 188 closes over both periods were limit orders, none market. The 09-16
+losses are `close_unstuck_long` on both sides -- verified in both logs, not
+inferred from prices: the Rust runner posts `order_type=close_unstuck_long`
+(04:04:23, 06:39:48), Python logs `[unstuck] ... pos_pnl_dist=-2.6058%
+allowance=5.3357` and posts `close_unstuck_long` (04:05:11, 07:46:03). The
+first pair closed at the same levels on both accounts minutes apart (entry
+1.33612 / 1.33509, exit 1.3001 / 1.3002, quantities in the 6.3x ratio of the
+balances); later rounds differ in time (06:39 vs 07:46) because the unstuck
+allowance is per account. Both runtimes also posted and replaced the
+unstuck/trailing close pair within seconds of each other around 04:05.
+
+**What this does and does not show.** The Rust runtime took the same
+loss-realizing path Python took, on the same day, through the same order type
+-- the unstuck path had never been exercised live on Rust before, and it now
+has. It does not show the unstuck *sizing* matches: the two accounts' allowances
+differ, so the amounts are not comparable one-to-one. A shadow beside a Python
+bot through an unstuck episode would be.
+
 ## 2026-09-13 -- shadows now sit beside Python bots only
 
 **Why they moved.** The runtime map changed under the shadows. Bot attributes
