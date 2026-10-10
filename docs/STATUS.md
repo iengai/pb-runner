@@ -2,6 +2,64 @@
 
 Newest entry first. Each entry: what changed, what was verified, next action.
 
+## 2026-10-10 -- abot on Rust vs paper2 on Python, 29 days on
+
+**Layout.** paper2 (`467146583`) is the last Python bot; abot, DollarDigger,
+Low-Risk Trader, PaperTrader, CAP1K (ex-xxbot) and PositionExploder are all on
+Rust, and the v7 family has no running task at all. abot's Rust task has run
+since 2026-09-11 15:00 UTC: **29 days, zero restarts**. paper2's Python task is
+1.5 days old.
+
+**Why paper2 is 1.5 days old -- a two-stage failure, 2026-10-08.**
+
+    18:18:28  error_budget count=10 limit=10 window=1h action=restart_at_limit
+              the 10 errors: write failed | create entry_trailing_cropped_long
+              InsufficientFunds 110007 "ab not enough for new order"
+    18:18:29  in-process restart; [bot] failed reason=startup_error
+    18:20-28  memory 369 -> 389 -> 394 MiB against the task's 400 MiB cap
+    18:28:25  lambda: "Container exit: exitCode=137" -> started replacement
+    18:30:09  the new process posts the same order, and is rejected again
+
+Exit 137 is the single case the task-state-change lambda relaunches
+(CONTRACT.md); any other exit, including Rust's 30, leaves the bot stopped. So
+Python was rescued here *because* it ran out of memory. Since the relaunch it
+is at 232 -> 328 MiB and climbing, loop 0.9-4.0 s, lag up to 21 s, and
+`ord=+1/-0` with frozen fills and balance: one order placed in 1.5 days, the
+account wedged.
+
+**The same situation, a different consequence on Rust.** The paper2 shadow --
+Rust, dry-run, same account, same config -- plans the same unfundable order at
+the same price (`entry_trailing_cropped_long 81.4 @ 1.339` against Python's
+resting `80.3 @ 1.339`; the 1.4% is the anchor again). So the planning is not
+what differs. The handling is:
+
+- Python, in the current task, logs these as `WARNING [order] degraded` and
+  reports `err=0/10`: they are not charged, and it retries every ~17 s
+  indefinitely. In the task *before* the restart the same rejection was
+  `ERROR [order] write failed` and was charged -- that is what tripped the
+  budget. Why the classification differs between the two tasks is not
+  established here.
+- Rust charges a failed create to the same 10/h budget
+  (`execute.rs` create path -> `note_error`; `110007` is a plain `Rejected`,
+  not already-gone, not not-modified, not a timestamp error) and re-sends at
+  the 15 s recent-execution guard. Ten rejections in an hour trip the budget ->
+  in-process restart -> and past `live.max_n_restarts_per_day`, **exit 30,
+  which nothing relaunches**.
+
+**So: do not move paper2 back to the Rust runtime while its account is wedged.**
+It would trip the budget on these rejections and end up stopped. Fix the
+account first -- funds, or a smaller position, or `graceful_stop`/`tp_only`
+until the exposure is down.
+
+**Resource and error profile, 10-03 to 10-10.** abot on Rust: 2 ERRORs, both a
+single request failing with `network: error sending request`, cycle abandoned
+and charged, 10-05 16:07 and 10-09 16:10; 7165 WARN (the trailing-candle wait
+and zero-order cycles); 767 order posts. Memory: the whole Rust family's daily
+max is 32-33 MiB against a **64 MiB** task limit, flat all week; the paper2
+shadow holds 21 MiB. Python sits at 357-394 MiB against **400**, i.e. 90-98% of
+its cap, which is what makes the OOM above a recurring risk rather than an
+accident.
+
 ## 2026-09-17 -- the abot/paper2 crossover, scored mark-to-market
 
 **Design.** Byte-identical configs. Period A, 09-08 16:01 -> 09-11 15:00 UTC
