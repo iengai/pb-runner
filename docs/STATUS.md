@@ -60,6 +60,26 @@ shadow holds 21 MiB. Python sits at 357-394 MiB against **400**, i.e. 90-98% of
 its cap, which is what makes the OOM above a recurring risk rather than an
 accident.
 
+**Agreement on the one shared-config shadow, 10-03 to 10-10.** 247,402 planned
+cycles. Disagreement lines by order type: `entry_grid_normal_long` 3106,
+`entry_grid_cropped_long` 2630, `entry_initial_normal_long` 228,
+`close_trailing_long` 184, `close_unstuck_long` 18, plus 1108
+`StrategyInputUnavailable` (the trailing-candle wait). Each disagreeing order
+prints two lines per cycle, so that is roughly 3,100 cycles of about 247,000 --
+near 1% -- on those types.
+
+**That census omits the type that matters most right now**: it did not count
+`entry_trailing_cropped_long`, which is the wedged order, and which on its own
+logged 101,875 lines from 10-08 17:00. So read the ~1% as "agreement on the
+grid and close types", not as an overall figure.
+
+**The anchor moved four times this week** -- 39.75 -> 40.65 -> 39.82 -> 39.12
+-> 38.49 -- as the balance walked down through the 1% band. That is why the
+cropped-entry disagreements come and go rather than standing: each move
+re-aligns the shadow with Python for a while.
+
+Nothing here needed a code change; abot's Rust task was not touched.
+
 ## 2026-09-17 -- the abot/paper2 crossover, scored mark-to-market
 
 **Design.** Byte-identical configs. Period A, 09-08 16:01 -> 09-11 15:00 UTC
